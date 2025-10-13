@@ -267,6 +267,150 @@ def find_target_csvs_in_nested_zips(
     return results, matched, loaded
 
 
+def find_target_csvs_in_given_zips(
+    zip_paths: List[str],
+    pattern: str = "SCED_Gen_Resource_Data",
+    ignore_case: bool = True,
+    csv_read_kwargs: Optional[dict] = None,
+    max_depth: Optional[int] = None,
+    on_error: Optional[Callable[[Exception, str], None]] = None,
+    verbose: bool = True,
+) -> Tuple[Dict[str, pd.DataFrame], int, int]:
+    """
+    Scan ONLY the provided top-level zip files (and any nested zips within)
+    and return a dict of DataFrames keyed by composite zip path.
+    Returns (results, matched_count, loaded_count).
+    """
+    # Reuse the same inner logic by calling the original function on a temp folder-like iterator.
+    # We'll replicate the minimal outer loop but restrict to the provided zip paths.
+    results: Dict[str, pd.DataFrame] = {}
+    matched = 0
+    loaded = 0
+
+    def log_error_local(exc: Exception, context: str):
+        if on_error is not None:
+            try:
+                on_error(exc, context)
+            except Exception:
+                pass
+        elif verbose:
+            print(f"[WARN] {context} -> {exc}")
+
+    # Bring over helpers from the original function scope
+    def sanitize_encoding(enc: Optional[str]) -> Optional[str]:
+        if not enc:
+            return None
+        try:
+            import codecs
+            codecs.lookup(enc)
+            return enc
+        except Exception:
+            return None
+
+    base_kwargs = (csv_read_kwargs or {}).copy()
+    if "sep" not in base_kwargs:
+        base_kwargs["sep"] = None
+    if "engine" not in base_kwargs and base_kwargs.get("sep", None) is None:
+        base_kwargs["engine"] = "python"
+    if "dtype_backend" in base_kwargs and base_kwargs["dtype_backend"] is None:
+        base_kwargs.pop("dtype_backend")
+
+    if "encoding" in base_kwargs:
+        enc = sanitize_encoding(base_kwargs["encoding"])
+        if enc is None:
+            base_kwargs.pop("encoding", None)
+        else:
+            base_kwargs["encoding"] = enc
+
+    def matches(name: str) -> bool:
+        if ignore_case:
+            return (pattern.lower() in name.lower()) and name.lower().endswith(".csv")
+        return (pattern in name) and name.lower().endswith(".csv")
+
+    def unique_key(proposed_key: str) -> str:
+        if proposed_key not in results:
+            return proposed_key
+        i = 2
+        while f"{proposed_key} ({i})" in results:
+            i += 1
+        return f"{proposed_key} ({i})"
+
+    def read_csv_with_fallbacks(buf: bytes) -> pd.DataFrame:
+        try:
+            return pd.read_csv(io.BytesIO(buf), **base_kwargs)
+        except UnicodeDecodeError:
+            pass
+        except LookupError:
+            pass
+
+        for enc in ("utf-8", "utf-8-sig"):
+            try:
+                k = {k: v for k, v in base_kwargs.items() if k != "encoding"}
+                return pd.read_csv(io.BytesIO(buf), encoding=enc, **k)
+            except (UnicodeDecodeError, LookupError):
+                continue
+        k = {k: v for k, v in base_kwargs.items() if k != "encoding"}
+        return pd.read_csv(io.BytesIO(buf), encoding="latin-1", **k)
+
+    def process_zipfile_obj(zf: zipfile.ZipFile, composite_prefix: str, depth: int):
+        nonlocal matched, loaded
+        if max_depth is not None and depth > max_depth:
+            return
+        for info in zf.infolist():
+            if hasattr(info, "is_dir") and info.is_dir():
+                continue
+            inner_name = info.filename
+            inner_key = f"{composite_prefix}::{inner_name}"
+            try:
+                with zf.open(info, "r") as fh:
+                    data = fh.read()
+                is_nested = False
+                if inner_name.lower().endswith(".zip"):
+                    is_nested = True
+                else:
+                    try:
+                        is_nested = zipfile.is_zipfile(io.BytesIO(data))
+                    except Exception:
+                        is_nested = False
+                if is_nested:
+                    try:
+                        with zipfile.ZipFile(io.BytesIO(data)) as nested_zf:
+                            process_zipfile_obj(nested_zf, inner_key, depth + 1)
+                    except Exception as nested_exc:
+                        log_error_local(nested_exc, f"Opening nested zip: {inner_key}")
+                    continue
+                base = os.path.basename(inner_name)
+                if matches(base):
+                    matched += 1
+                    try:
+                        df = read_csv_with_fallbacks(data)
+                        try:
+                            df.rename(columns=lambda c: str(c).strip(), inplace=True)
+                        except Exception:
+                            pass
+                        results[unique_key(inner_key)] = df
+                        loaded += 1
+                    except Exception as read_exc:
+                        log_error_local(read_exc, f"Reading CSV: {inner_key}")
+            except Exception as e:
+                log_error_local(e, f"Reading member: {inner_key}")
+
+    for zp in zip_paths:
+        if not os.path.isfile(zp) or not zp.lower().endswith(".zip"):
+            continue
+        top_key = os.path.basename(zp)
+        try:
+            with zipfile.ZipFile(zp, "r") as zf:
+                process_zipfile_obj(zf, top_key, depth=1)
+        except Exception as e:
+            log_error_local(e, f"Opening top-level zip: {zp}")
+
+    return results, matched, loaded
+
+
+
+
+
 # =========================
 # Aggregator
 # =========================
@@ -461,103 +605,156 @@ def main():
         raise ValueError("ROOT_FOLDER is missing or not a directory (set it in .env).")
     if not save_agg_path:
         raise ValueError("SAVE_AGG_PATH is required in .env (must be a .csv path).")
+    
     if not save_agg_path.lower().endswith(".csv"):
         save_agg_path = save_agg_path + ".csv"
 
-    # Options
+    # Common env options
     pattern = env_get("FILENAME_PATTERN", "SCED_Gen_Resource_Data")
     ignore_case = env_get_bool("IGNORE_CASE", True)
-    max_depth = env_get_int("MAX_DEPTH", None)
     verbose = env_get_bool("VERBOSE", True)
+    max_depth = int(env_get("MAX_NESTED_DEPTH", "0") or "0") or None
 
-    # CSV reading
-    csv_engine = env_get("CSV_ENGINE", "python")   # engine='python' supports sep=None
-    csv_sep = env_get("CSV_SEP", "auto")           # 'auto' or actual delimiter ('\\t' or ',')
-    raw_encoding = env_get("CSV_ENCODING", None)   # may include comments -> sanitize
-    csv_encoding = sanitize_encoding(raw_encoding)
-
-    csv_kwargs: Dict[str, Any] = {"engine": csv_engine}
-    if csv_sep and csv_sep.lower() != "auto":
-        csv_kwargs["sep"] = "\t" if csv_sep.strip().lower() in {"\\t", "tab", "tsv"} else csv_sep
-    else:
-        csv_kwargs["sep"] = None  # autodetect
-    if csv_encoding:
-        csv_kwargs["encoding"] = csv_encoding
-    # NOTE: DO NOT pass dtype_backend=None; only pass if explicitly valid ('numpy_nullable'|'pyarrow')
-
-    # Aggregation options
-    on_conflict = env_get("ON_CONFLICT", "skip").lower()
-    if on_conflict not in {"skip", "overwrite"}:
-        on_conflict = "skip"
-
+    # Aggregation/env options
+    resource_col = env_get("RESOURCE_COL", "Resource Name")
+    timestamp_col = env_get("TIMESTAMP_COL", "SCED Time Stamp")
+    value_col = env_get("VALUE_COL", "Base Point")
     case_insensitive_cols = env_get_bool("CASE_INSENSITIVE_COLS", True)
     trim_resource = env_get_bool("TRIM_RESOURCE", True)
     coerce_value_numeric = env_get_bool("COERCE_VALUE_NUMERIC", True)
-    timestamp_format = env_get("TIMESTAMP_FORMAT", "%m/%d/%Y %H:%M")  # matches '11/2/2023 0:00'
-    output_ts_fmt = env_get("OUTPUT_TIMESTAMP_FORMAT", "%Y-%m-%d %H:%M")
-    agg_log_path = env_get("AGG_LOG_PATH", None)
+    timestamp_format = env_get("TIMESTAMP_FORMAT", "%m/%d/%Y %H:%M") or None
+    on_conflict = env_get("ON_CONFLICT", "skip").lower()  # 'skip' or 'overwrite'
+    max_messages = int(env_get("MAX_MESSAGES", "5000"))
+    csv_kwargs = {}
 
-    if verbose:
-        print(f"[INFO] Scanning '{root_folder}' for '{pattern}' (ignore_case={ignore_case})...")
+    # New: batching
+    batch_size = int(env_get("BATCH_SIZE", "0") or "0")  # 0/None => process all at once (legacy)
+    # Optional: sort order for zips: name or mtime
+    zip_sort = env_get("ZIP_SORT", "name").lower()  # 'name' or 'mtime'
 
-    def log_error(exc: Exception, ctx: str):
-        if verbose:
-            print(f"[WARN] {ctx} -> {exc}")
+    # Helper to merge two wide matrices according to on_conflict
+    def merge_wide(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame:
+        if existing is None or len(existing) == 0:
+            return incoming.copy()
+        # Union axes
+        idx = existing.index.union(incoming.index)
+        cols = existing.columns.union(incoming.columns)
+        a = existing.reindex(index=idx, columns=cols)
+        b = incoming.reindex(index=idx, columns=cols)
+        if on_conflict == "overwrite":
+            out = a.copy()
+            mask = b.notna()
+            out[mask] = b[mask]
+            return out
+        # default: skip -> keep existing; fill only where empty
+        return a.combine_first(b)
 
-    dfs, matched, loaded = find_target_csvs_in_nested_zips(
-        root_folder=root_folder,
-        pattern=pattern,
-        ignore_case=ignore_case,
-        csv_read_kwargs=csv_kwargs,
-        max_depth=max_depth,
-        on_error=log_error,
-        verbose=verbose,
-    )
+    # Enumerate top-level zips
+    all_zips = []
+    for entry in os.scandir(root_folder):
+        if entry.is_file() and entry.name.lower().endswith(".zip"):
+            all_zips.append(entry.path)
+    if zip_sort == "mtime":
+        all_zips.sort(key=lambda p: os.path.getmtime(p))
+    else:
+        all_zips.sort(key=lambda p: os.path.basename(p).lower())
 
-    if verbose:
-        print(f"[INFO] Matched {matched} CSV filename(s); successfully loaded {loaded}.")
+    agg_df = None
+    msgs: List[str] = []
+    total_matched = 0
+    total_loaded = 0
 
-    agg_df, msgs = aggregate_base_point_matrix(
-        dfs,
-        case_insensitive_cols=case_insensitive_cols,
-        trim_resource=trim_resource,
-        coerce_value_numeric=coerce_value_numeric,
-        timestamp_format=timestamp_format,
-        on_conflict=on_conflict,
-        verbose=verbose,
-    )
-    if verbose:
-        print(f"[INFO] Aggregated matrix shape: {agg_df.shape}")
+    if not batch_size:
+        # Legacy single-shot path
+        dfs, matched, loaded = find_target_csvs_in_nested_zips(
+            root_folder=root_folder,
+            pattern=pattern,
+            ignore_case=ignore_case,
+            csv_read_kwargs=csv_kwargs,
+            max_depth=max_depth,
+            on_error=None,
+            verbose=verbose,
+        )
+        total_matched += matched
+        total_loaded += loaded
+        batch_agg, batch_msgs = aggregate_base_point_matrix(
+            dfs,
+            resource_col=resource_col,
+            timestamp_col=timestamp_col,
+            value_col=value_col,
+            case_insensitive_cols=case_insensitive_cols,
+            trim_resource=trim_resource,
+            coerce_value_numeric=coerce_value_numeric,
+            timestamp_format=timestamp_format,
+            on_conflict=on_conflict,
+            max_messages=max_messages,
+            verbose=verbose,
+        )
+        agg_df = merge_wide(agg_df, batch_agg)
+        msgs.extend(batch_msgs)
+    else:
+        # Batch through the zip list
+        for i in range(0, len(all_zips), batch_size):
+            batch_paths = all_zips[i:i+batch_size]
+            if verbose:
+                print(f"[INFO] Processing batch {i//batch_size + 1} with {len(batch_paths)} zip(s)")
+            dfs, matched, loaded = find_target_csvs_in_given_zips(
+                batch_paths,
+                pattern=pattern,
+                ignore_case=ignore_case,
+                csv_read_kwargs=csv_kwargs,
+                max_depth=max_depth,
+                on_error=None,
+                verbose=verbose,
+            )
+            total_matched += matched
+            total_loaded += loaded
+            if not dfs:
+                continue
+            batch_agg, batch_msgs = aggregate_base_point_matrix(
+                dfs,
+                resource_col=resource_col,
+                timestamp_col=timestamp_col,
+                value_col=value_col,
+                case_insensitive_cols=case_insensitive_cols,
+                trim_resource=trim_resource,
+                coerce_value_numeric=coerce_value_numeric,
+                timestamp_format=timestamp_format,
+                on_conflict=on_conflict,
+                max_messages=max_messages,
+                verbose=verbose,
+            )
+            agg_df = merge_wide(agg_df, batch_agg)
+            msgs.extend(batch_msgs)
+            # Proactively free memory
+            del dfs, batch_agg, batch_msgs
 
-    # Save aggregated matrix as CSV
+    # Save CSV
     ensure_parent_dir(save_agg_path)
     try:
-        # Convert DatetimeIndex columns to a clean string for CSV headers
-        cols = agg_df.columns
-        if isinstance(cols, pd.DatetimeIndex):
-            try:
-                agg_df.columns = cols.strftime(output_ts_fmt)
-            except Exception:
-                # Fallback to ISO if formatting fails
-                agg_df.columns = cols.strftime("%Y-%m-%d %H:%M:%S")
         agg_df.to_csv(save_agg_path, index=True)
         if verbose:
             print(f"[INFO] Saved aggregated matrix to '{save_agg_path}'")
     except Exception as e:
         raise RuntimeError(f"Failed to save CSV to '{save_agg_path}': {e}")
 
-    # Optionally save a log file
+    # Optional aggregation log
+    agg_log_path = env_get("AGG_LOG_PATH", None)
     if agg_log_path:
+        ensure_parent_dir(agg_log_path)
         try:
-            ensure_parent_dir(agg_log_path)
-            with open(agg_log_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(msgs))
+            with open(agg_log_path, "w", encoding="utf-8") as fh:
+                fh.write("=== Aggregation summary ===\n")
+                fh.write(f"Matched CSVs: {total_matched}\nLoaded CSVs: {total_loaded}\n")
+                if msgs:
+                    fh.write("\n=== Messages ===\n")
+                    for m in msgs:
+                        fh.write(m + "\n")
             if verbose:
                 print(f"[INFO] Saved aggregation log to '{agg_log_path}'")
         except Exception as e:
             print(f"[WARN] Failed to save log '{agg_log_path}': {e}")
-
-    # Console preview of messages (capped)
+# Console preview of messages (capped)
     if verbose and msgs:
         to_show = min(30, len(msgs))
         print(f"\n--- Sample messages (showing {to_show} of {len(msgs)}) ---")

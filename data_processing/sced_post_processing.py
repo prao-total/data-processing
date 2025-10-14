@@ -6,7 +6,6 @@ from typing import Dict, Tuple, Optional
 
 # -------- Config / ENV --------
 def load_env():
-    """Load paths from environment variables (fall back to sensible defaults)."""
     from dotenv import load_dotenv
     load_dotenv()
     return {
@@ -14,11 +13,10 @@ def load_env():
         "agg_file": os.getenv("AGGREGATED_MATRIX_FILE", "aggregated_base_point_matrix.csv"),
         "output_file": os.getenv("OUTPUT_FILE", "aggregated_base_point_matrix_RELABELED.csv"),
         "tracker_file": os.getenv("TRACKER_FILE", "resource_name_tracker.csv"),
-        # Optional: manual overrides applied FIRST, e.g. two columns: Resource Name,ERCOT_UnitCode
         "manual_crosswalk_file": os.getenv("MANUAL_CROSSWALK_FILE", "manual_crosswalk.csv"),
-        # Optional: where to dump review/ borderline fuzzy candidates
-        "review_file": os.getenv("REVIEW_FILE", "resource_name_review_candidates.csv"),
-        # Fuzzy thresholds
+        "review_file": os.getenv("REVIEW_FILE", "resource_name_uncertain_review.csv"),
+        "coverage_file": os.getenv("COVERAGE_FILE", "resource_name_gas_coverage_summary.csv"),
+        "missing_gas_file": os.getenv("MISSING_GAS_FILE", "resource_name_missing_gas_units.csv"),
         "high_thresh": int(os.getenv("FUZZY_HIGH_THRESH", "90")),
         "review_thresh": int(os.getenv("FUZZY_REVIEW_THRESH", "70")),
     }
@@ -46,7 +44,7 @@ def normalize(s: str) -> str:
     s = str(s).upper()
     for k, v in ABBREV_MAP.items():
         s = s.replace(k, v)
-    s = re.sub(r"[^A-Z0-9\s]", " ", s)  # strip punctuation
+    s = re.sub(r"[^A-Z0-9\s]", " ", s)
     for pat in GENERIC_SUFFIXES + UNIT_PATTERNS:
         s = re.sub(pat, " ", s)
     s = re.sub(r"\s+", " ", s).strip()
@@ -62,25 +60,19 @@ except Exception:
 def token_score(a: str, b: str) -> int:
     if RF_AVAILABLE:
         return fuzz.token_set_ratio(a, b)
+    import difflib
     return int(difflib.SequenceMatcher(a=a, b=b).ratio() * 100)
 
 # -------- Gas corpus builders --------
 GAS_FIELDS = ["ERCOT_UnitCode", "Name", "CDR Name", "ERCOT_INR Code"]
 
 def load_gas_resources(excel_path: str) -> pd.DataFrame:
-    """Load gas resources (subset of ERCOT units you want to map to)."""
     gas = pd.read_excel(excel_path, sheet_name=0)
-    # Ensure required columns present
-    missing = [c for c in ["ERCOT_UnitCode"] if c not in gas.columns]
-    if missing:
-        raise ValueError(f"gas_resources missing required columns: {missing}")
+    if "ERCOT_UnitCode" not in gas.columns:
+        raise ValueError("gas_resources missing required column: ERCOT_UnitCode")
     return gas
 
 def build_gas_corpus(gas_df: pd.DataFrame):
-    """
-    Returns a list of tuples:
-    (ercot_unit, source_field, raw_value, normalized_value)
-    """
     corpus = []
     for _, r in gas_df.iterrows():
         unit = str(r.get("ERCOT_UnitCode", "")).strip()
@@ -99,13 +91,8 @@ def build_gas_corpus(gas_df: pd.DataFrame):
     return corpus
 
 def build_fast_indexes(gas_df: pd.DataFrame) -> Tuple[Dict[str, str], Dict[str, set]]:
-    """
-    exact_id_map: exact (upper) ERCOT_UnitCode -> ERCOT_UnitCode
-    normalized_to_units: normalized string -> set of ERCOT_UnitCodes
-    """
     exact_id_map = {}
     normalized_to_units = {}
-
     for _, r in gas_df.iterrows():
         unit = str(r.get("ERCOT_UnitCode", "")).strip()
         if not unit:
@@ -121,7 +108,6 @@ def build_fast_indexes(gas_df: pd.DataFrame) -> Tuple[Dict[str, str], Dict[str, 
             if not norm:
                 continue
             normalized_to_units.setdefault(norm, set()).add(unit)
-
     return exact_id_map, normalized_to_units
 
 def best_fuzzy_match(q_norm: str, corpus, k=5):
@@ -134,22 +120,18 @@ def best_fuzzy_match(q_norm: str, corpus, k=5):
     scored.sort(reverse=True, key=lambda x: x[0])
     return scored[:k]
 
-# -------- Mapping logic --------
+# -------- Manual crosswalk --------
 def apply_manual_crosswalk(names: pd.Series, manual_path: str) -> Dict[str, str]:
-    """
-    Returns a dict mapping original Resource Name -> ERCOT_UnitCode based on manual CSV.
-    CSV format: Resource Name,ERCOT_UnitCode
-    """
     try:
         if os.path.exists(manual_path):
             xw = pd.read_csv(manual_path)
             xw = xw.dropna(subset=["Resource Name", "ERCOT_UnitCode"])
-            # Use the *raw* Resource Name as key (no normalization) for deterministic overrides.
             return dict(zip(xw["Resource Name"].astype(str), xw["ERCOT_UnitCode"].astype(str)))
     except Exception as e:
         print(f"⚠️ Manual crosswalk load failed: {e}")
     return {}
 
+# -------- Mapping logic (subset-safe + coverage reporting) --------
 def map_resource_names(
     resource_series: pd.Series,
     gas_df: pd.DataFrame,
@@ -157,22 +139,15 @@ def map_resource_names(
     high_thresh: int = 90,
     review_thresh: int = 70
 ):
-    """
-    Only relabel rows that map to gas resources (subset); otherwise leave untouched.
-    Returns:
-      - new_values: pd.Series with replacements applied where confident
-      - tracker_df: audit log
-      - review_df: borderline/unknown cases for manual review
-    """
     corpus = build_gas_corpus(gas_df)
     exact_id_map, norm_index = build_fast_indexes(gas_df)
 
     out_values = []
     tracker_rows = []
-    review_rows = []
+    uncertain_rows = []
 
     for original in resource_series.astype(str).tolist():
-        # 0) Manual crosswalk first (explicit overrides)
+        # Manual override
         if original in manual_map and manual_map[original]:
             chosen = str(manual_map[original]).strip()
             out_values.append(chosen)
@@ -196,17 +171,17 @@ def map_resource_names(
         method = None
         aux = {}
 
-        # 1) If original is already an ERCOT_UnitCode for a gas unit (subset), keep it as-is
+        # exact ERCOT_UnitCode (gas subset)
         if original_up in exact_id_map:
             chosen = exact_id_map[original_up]
-            method = "exact_id"  # subset by definition
+            method = "exact_id"
         else:
-            # 2) normalized exact -> unique gas unit
+            # normalized exact → unique gas unit
             if norm_q in norm_index and len(norm_index[norm_q]) == 1:
                 chosen = next(iter(norm_index[norm_q]))
                 method = "normalized_exact"
             else:
-                # 3) fuzzy match against GAS CORPUS ONLY (subset)
+                # fuzzy (subset only)
                 if norm_q:
                     top = best_fuzzy_match(norm_q, corpus, k=5)
                     if top:
@@ -223,7 +198,6 @@ def map_resource_names(
                         elif best_score >= review_thresh:
                             method = "fuzzy_review"
 
-        # Output + tracking
         if chosen:
             out_values.append(chosen)
             tracker_rows.append({
@@ -238,7 +212,6 @@ def map_resource_names(
                 "Alternatives (json)": json.dumps(aux.get("alternatives", []))
             })
         else:
-            # Not a confident gas match: leave as original and, if fuzzy_review/no_match, queue to review
             out_values.append(original)
             row = {
                 "Resource Name": original,
@@ -253,9 +226,23 @@ def map_resource_names(
             }
             tracker_rows.append(row)
             if row["Method"] in ("fuzzy_review", "no_match"):
-                review_rows.append(row)
+                uncertain_rows.append(row)
 
-    return pd.Series(out_values), pd.DataFrame(tracker_rows), pd.DataFrame(review_rows)
+    return pd.Series(out_values), pd.DataFrame(tracker_rows), pd.DataFrame(uncertain_rows)
+
+def coverage_report(gas_df: pd.DataFrame, tracker_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reports coverage of gas units by confident matches.
+    """
+    gas_units = set(gas_df["ERCOT_UnitCode"].astype(str))
+    matched_units = set(tracker_df.loc[tracker_df["Was Replaced"] == True, "Matched Name"].astype(str))
+    missing = sorted(gas_units - matched_units)
+    summary = pd.DataFrame({
+        "Total gas units": [len(gas_units)],
+        "Covered (confident)": [len(matched_units)],
+        "Missing (need review or mapping)": [len(missing)]
+    })
+    return summary, gas_df[gas_df["ERCOT_UnitCode"].astype(str).isin(missing)].copy()
 
 # -------- I/O glue --------
 def update_resource_names(
@@ -265,6 +252,8 @@ def update_resource_names(
     tracker_path: str,
     manual_crosswalk_path: str,
     review_path: str,
+    coverage_path: str,
+    missing_gas_path: str,
     high_thresh: int,
     review_thresh: int
 ):
@@ -274,35 +263,38 @@ def update_resource_names(
 
     manual_map = apply_manual_crosswalk(df["Resource Name"], manual_crosswalk_path)
 
-    new_values, tracker_df, review_df = map_resource_names(
+    new_values, tracker_df, uncertain_df = map_resource_names(
         df["Resource Name"], gas_df, manual_map,
         high_thresh=high_thresh, review_thresh=review_thresh
     )
 
-    # Replace ONLY where a gas mapping was found
+    # Replace names only where matched to gas subset
     df["Resource Name"] = new_values
+
+    # Coverage
+    cov_df, missing_df = coverage_report(gas_df, tracker_df)
 
     # Write outputs
     df.to_csv(output_path, index=False)
     tracker_df.to_csv(tracker_path, index=False)
-    if not review_df.empty:
-        review_df.to_csv(review_path, index=False)
+    uncertain_df.to_csv(review_path, index=False)
+    cov_df.to_csv(coverage_path, index=False)
+    missing_df[["ERCOT_UnitCode","Name","CDR Name","ERCOT_INR Code","County","CDR Zone"]].to_csv(missing_gas_path, index=False)
 
     print(f"✅ Updated aggregated file: {output_path}")
     print(f"📊 Tracker file: {tracker_path}")
-    if not review_df.empty:
-        print(f"📝 Review candidates: {review_path} ({len(review_df)} rows)")
-    else:
-        print("📝 No review candidates — all confident or unchanged.")
+    print(f"📝 Uncertain matches: {review_path} ({len(uncertain_df)} rows)")
+    print(f"📈 Gas coverage: {coverage_path}")
+    print(f"❗ Missing gas units (not matched confidently): {missing_gas_path} ({len(missing_df)} units)")
 
 # -------- Main --------
 def main():
     cfg = load_env()
-    print("🔄 Loading gas resources (subset)...")
+    print("🔄 Loading gas subset...")
     gas = load_gas_resources(cfg["gas_file"])
-    print(f"   Gas subset count: {len(gas)}")
+    print(f"   Gas units: {len(gas)}")
 
-    print("🔄 Relabeling aggregated matrix where confidently matched to gas subset...")
+    print("🔄 Relabeling aggregated matrix (subset-safe) + generating coverage...")
     update_resource_names(
         agg_path=cfg["agg_file"],
         gas_df=gas,
@@ -310,6 +302,8 @@ def main():
         tracker_path=cfg["tracker_file"],
         manual_crosswalk_path=cfg["manual_crosswalk_file"],
         review_path=cfg["review_file"],
+        coverage_path=cfg["coverage_file"],
+        missing_gas_path=cfg["missing_gas_file"],
         high_thresh=cfg["high_thresh"],
         review_thresh=cfg["review_thresh"],
     )

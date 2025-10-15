@@ -20,7 +20,7 @@ def load_env():
         "missing_gas_file": os.getenv("MISSING_GAS_FILE", "resource_name_missing_gas_units.csv"),
         "high_thresh": int(os.getenv("FUZZY_HIGH_THRESH", "90")),
         "review_thresh": int(os.getenv("FUZZY_REVIEW_THRESH", "70")),
-        "enable_fuzzy": os.getenv("ENABLE_FUZZY", "true").lower() in ("1","true","yes","y"),
+        "enable_fuzzy": os.getenv("ENABLE_FUZZY", "true").lower() in ("1", "true", "yes", "y"),
         "other_fuel_veto_thresh": int(os.getenv("OTHER_FUEL_VETO_THRESH", "88")),
     }
 
@@ -80,6 +80,13 @@ def load_gas_resources(excel_path: str) -> pd.DataFrame:
     return gas
 
 def load_cdr_list(cdr_path: str) -> pd.DataFrame:
+    """
+    Required columns (case/whitespace insensitive):
+    - UNIT CODE  -> ERCOT Unit Code
+    - UNIT NAME  -> CDR unit name
+    - FUEL       -> fuel family
+    This loader returns ONLY Natural Gas rows (strict NG universe for matching).
+    """
     cdr = pd.read_csv(cdr_path)
     cols = {c.upper().strip(): c for c in cdr.columns}
     need = ["UNIT CODE", "UNIT NAME", "FUEL"]
@@ -93,7 +100,8 @@ def load_cdr_list(cdr_path: str) -> pd.DataFrame:
     })
     cdr["CDR_UNIT_CODE"] = cdr["CDR_UNIT_CODE"].astype(str).str.strip()
     cdr["CDR_UNIT_NAME"] = cdr["CDR_UNIT_NAME"].astype(str).str.strip()
-    cdr["CDR_FUEL"] = cdr["CDR_FUEL"].astype(str).str.strip().upper()
+    cdr["CDR_FUEL"] = cdr["CDR_FUEL"].astype(str).str.strip().str.upper()
+    # Keep Natural Gas variants only (strict gas universe for matching)
     cdr = cdr[cdr["CDR_FUEL"].isin(["GAS", "NATURAL GAS"])].copy()
     cdr["CDR_UNIT_NAME_N"] = cdr["CDR_UNIT_NAME"].map(normalize)
     cdr["CDR_UNIT_CODE_UP"] = cdr["CDR_UNIT_CODE"].str.upper()
@@ -111,8 +119,15 @@ def apply_manual_crosswalk(names: pd.Series, manual_path: str) -> Dict[str, str]
 
 # -------- Build 1:1 alias maps (gas vs other fuels) --------
 def build_alias_maps(gas_df: pd.DataFrame, cdr_df_all: pd.DataFrame, cdr_full: pd.DataFrame):
+    """
+    Returns:
+      alias_map_gas:   normalized alias -> ERCOT_UnitCode (Natural Gas ∩ gas_resources, 1:1 only)
+      alias_map_other: normalized alias -> ERCOT_UnitCode (all NON-gas units from the full CDR, 1:1 only)
+      gas_units: set of ERCOT_UnitCode in gas_df
+    """
     gas_units = set(gas_df["ERCOT_UnitCode"].astype(str))
 
+    # Build NON-gas from full CDR by excluding NG rows (for veto)
     cols = {c.upper().strip(): c for c in cdr_full.columns}
     if not {"UNIT CODE", "UNIT NAME", "FUEL"}.issubset(set(cols.keys())):
         raise ValueError("Full CDR (for veto) must have UNIT CODE/UNIT NAME/FUEL columns.")
@@ -121,11 +136,12 @@ def build_alias_maps(gas_df: pd.DataFrame, cdr_df_all: pd.DataFrame, cdr_full: p
         cols["UNIT NAME"]: "UNIT_NAME",
         cols["FUEL"]: "FUEL",
     }).copy()
-    cdr_full_std["FUEL"] = cdr_full_std["FUEL"].astype(str).str.strip().upper()
+    cdr_full_std["FUEL"] = cdr_full_std["FUEL"].astype(str).str.strip().str.upper()
     cdr_other = cdr_full_std[~cdr_full_std["FUEL"].isin(["GAS", "NATURAL GAS"])].copy()
     cdr_other["UNIT_CODE"] = cdr_other["UNIT_CODE"].astype(str).str.strip()
     cdr_other["UNIT_NAME"] = cdr_other["UNIT_NAME"].astype(str).str.strip()
 
+    # NG subset intersected with gas units (authoritative)
     cdr_gas = cdr_df_all[cdr_df_all["CDR_UNIT_CODE"].isin(gas_units)].copy()
 
     def collect_aliases(rows, code_col, name_col, extra_fields_df=None):
@@ -137,21 +153,24 @@ def build_alias_maps(gas_df: pd.DataFrame, cdr_df_all: pd.DataFrame, cdr_full: p
             if not k:
                 return
             alias_to_units.setdefault(k, set()).add(unit)
+        # Authoritative names
         for _, r in rows.iterrows():
             u = str(r[code_col]).strip()
             add(str(r[name_col]).strip(), u)
+        # Optionally add fields from gas_df (for gas map)
         if extra_fields_df is not None:
             for _, r in extra_fields_df.iterrows():
                 u = str(r.get("ERCOT_UnitCode", "")).strip()
                 if not u:
                     continue
-                add(u, u)
+                add(u, u)  # code itself
                 for f in ["Name", "CDR Name", "ERCOT_INR Code"]:
                     if f in extra_fields_df.columns:
                         val = r.get(f)
                         if pd.isna(val):
                             continue
                         add(str(val), u)
+        # Keep only 1:1
         alias_map = {k: list(v)[0] for k, v in alias_to_units.items() if len(v) == 1}
         return alias_map
 
@@ -171,7 +190,7 @@ def build_fuzzy_corpora(gas_df: pd.DataFrame, cdr_df_all: pd.DataFrame, cdr_full
         cols["UNIT NAME"]: "UNIT_NAME",
         cols["FUEL"]: "FUEL",
     }).copy()
-    cdr_full_std["FUEL"] = cdr_full_std["FUEL"].astype(str).str.strip().upper()
+    cdr_full_std["FUEL"] = cdr_full_std["FUEL"].astype(str).str.strip().str.upper()
     cdr_other = cdr_full_std[~cdr_full_std["FUEL"].isin(["GAS", "NATURAL GAS"])].copy()
 
     def corpus_from(cdr_part, code_col, name_col, include_gas_fields: bool):
@@ -220,12 +239,14 @@ def map_resource_names(
     other_fuel_veto_thresh: int = 88
 ):
     alias_map_gas, alias_map_other, gas_units = build_alias_maps(gas_df, cdr_df_all, cdr_full)
-    exact_id_map = {u.upper(): u for u in gas_units}
+    exact_id_map = {str(u).upper(): str(u) for u in gas_units}
     corpus_gas, corpus_other = build_fuzzy_corpora(gas_df, cdr_df_all, cdr_full) if enable_fuzzy else ([], [])
 
     out_values, tracker_rows, uncertain_rows = [], [], []
 
-    for original in resource_series.astype(str).tolist():
+    # Ensure safe string series
+    resource_series = resource_series.astype(str).fillna("")
+    for original in resource_series.tolist():
         # 0) Manual override
         if original in manual_map and manual_map[original]:
             chosen = str(manual_map[original]).strip()
@@ -238,11 +259,11 @@ def map_resource_names(
             })
             continue
 
-        q_up = original.upper()
+        q_up = str(original).upper()
         q_norm = normalize(original)
 
-        chosen = None
-        method = None
+        chosen: Optional[str] = None
+        method: Optional[str] = None
         aux = {}
 
         # 1) exact ERCOT_UnitCode (gas-only)

@@ -21,6 +21,7 @@ def load_env():
         "high_thresh": int(os.getenv("FUZZY_HIGH_THRESH", "90")),
         "review_thresh": int(os.getenv("FUZZY_REVIEW_THRESH", "70")),
         "enable_fuzzy": os.getenv("ENABLE_FUZZY", "true").lower() in ("1","true","yes","y"),
+        "other_fuel_veto_thresh": int(os.getenv("OTHER_FUEL_VETO_THRESH", "88")),
     }
 
 # ================= NORMALIZATION =================
@@ -72,6 +73,10 @@ def load_gas_resources(excel_path: str) -> pd.DataFrame:
     gas = pd.read_excel(excel_path, sheet_name=0)
     if "ERCOT_UnitCode" not in gas.columns:
         raise ValueError("gas_resources missing required column: ERCOT_UnitCode")
+    gas["ERCOT_UnitCode"] = gas["ERCOT_UnitCode"].astype(str).str.strip()
+    for f in GAS_FIELDS:
+        if f in gas.columns:
+            gas[f] = gas[f].astype(str)
     return gas
 
 def load_cdr_list(cdr_path: str) -> pd.DataFrame:
@@ -88,9 +93,8 @@ def load_cdr_list(cdr_path: str) -> pd.DataFrame:
     })
     cdr["CDR_UNIT_CODE"] = cdr["CDR_UNIT_CODE"].astype(str).str.strip()
     cdr["CDR_UNIT_NAME"] = cdr["CDR_UNIT_NAME"].astype(str).str.strip()
-    cdr["CDR_FUEL"] = cdr["CDR_FUEL"].astype(str).str.strip().str.upper()
-    # Natural Gas filter (strict)
-    cdr = cdr[cdr["CDR_FUEL"].isin(["GAS", "NATURAL GAS"])]
+    cdr["CDR_FUEL"] = cdr["CDR_FUEL"].astype(str).str.strip().upper()
+    cdr = cdr[cdr["CDR_FUEL"].isin(["GAS", "NATURAL GAS"])].copy()
     cdr["CDR_UNIT_NAME_N"] = cdr["CDR_UNIT_NAME"].map(normalize)
     cdr["CDR_UNIT_CODE_UP"] = cdr["CDR_UNIT_CODE"].str.upper()
     return cdr
@@ -105,69 +109,94 @@ def apply_manual_crosswalk(names: pd.Series, manual_path: str) -> Dict[str, str]
         print(f"⚠️ Manual crosswalk load failed: {e}")
     return {}
 
-# ========== BUILD 1:1 ALIAS MAP (deterministic) ==========
-def build_deterministic_alias_map(gas_df: pd.DataFrame, cdr_df: pd.DataFrame) -> Tuple[Dict[str, str], set]:
-    """
-    Returns:
-      alias_map: normalized alias -> ERCOT_UnitCode (only aliases mapping to exactly ONE unit kept)
-      gas_units: set of ERCOT_UnitCode in gas (for coverage)
-    """
+# -------- Build 1:1 alias maps (gas vs other fuels) --------
+def build_alias_maps(gas_df: pd.DataFrame, cdr_df_all: pd.DataFrame, cdr_full: pd.DataFrame):
     gas_units = set(gas_df["ERCOT_UnitCode"].astype(str))
-    # Restrict CDR to gas units AND Natural Gas
-    cdr_gas = cdr_df[cdr_df["CDR_UNIT_CODE"].isin(gas_units)].copy()
 
-    # Collect aliases per unit
-    alias_to_units = {}
-    def add_alias(alias_raw: str, unit: str):
-        if not alias_raw:
-            return
-        key = normalize(alias_raw)
-        if not key:
-            return
-        alias_to_units.setdefault(key, set()).add(unit)
+    cols = {c.upper().strip(): c for c in cdr_full.columns}
+    if not {"UNIT CODE", "UNIT NAME", "FUEL"}.issubset(set(cols.keys())):
+        raise ValueError("Full CDR (for veto) must have UNIT CODE/UNIT NAME/FUEL columns.")
+    cdr_full_std = cdr_full.rename(columns={
+        cols["UNIT CODE"]: "UNIT_CODE",
+        cols["UNIT NAME"]: "UNIT_NAME",
+        cols["FUEL"]: "FUEL",
+    }).copy()
+    cdr_full_std["FUEL"] = cdr_full_std["FUEL"].astype(str).str.strip().upper()
+    cdr_other = cdr_full_std[~cdr_full_std["FUEL"].isin(["GAS", "NATURAL GAS"])].copy()
+    cdr_other["UNIT_CODE"] = cdr_other["UNIT_CODE"].astype(str).str.strip()
+    cdr_other["UNIT_NAME"] = cdr_other["UNIT_NAME"].astype(str).str.strip()
 
-    # CDR authoritative names
-    for _, r in cdr_gas.iterrows():
-        u = r["CDR_UNIT_CODE"]
-        add_alias(r["CDR_UNIT_NAME"], u)
+    cdr_gas = cdr_df_all[cdr_df_all["CDR_UNIT_CODE"].isin(gas_units)].copy()
 
-    # Gas dataframe fields
-    for _, r in gas_df.iterrows():
-        u = str(r.get("ERCOT_UnitCode", "")).strip()
-        if not u:
-            continue
-        add_alias(u, u)  # the code itself
-        for f in ["Name", "CDR Name", "ERCOT_INR Code"]:
-            if f in gas_df.columns:
-                val = r.get(f)
-                if pd.isna(val):
+    def collect_aliases(rows, code_col, name_col, extra_fields_df=None):
+        alias_to_units = {}
+        def add(alias_raw, unit):
+            if not alias_raw:
+                return
+            k = normalize(alias_raw)
+            if not k:
+                return
+            alias_to_units.setdefault(k, set()).add(unit)
+        for _, r in rows.iterrows():
+            u = str(r[code_col]).strip()
+            add(str(r[name_col]).strip(), u)
+        if extra_fields_df is not None:
+            for _, r in extra_fields_df.iterrows():
+                u = str(r.get("ERCOT_UnitCode", "")).strip()
+                if not u:
                     continue
-                add_alias(str(val), u)
+                add(u, u)
+                for f in ["Name", "CDR Name", "ERCOT_INR Code"]:
+                    if f in extra_fields_df.columns:
+                        val = r.get(f)
+                        if pd.isna(val):
+                            continue
+                        add(str(val), u)
+        alias_map = {k: list(v)[0] for k, v in alias_to_units.items() if len(v) == 1}
+        return alias_map
 
-    # Keep only 1:1 aliases (drop ambiguous)
-    alias_map = {alias: list(units)[0] for alias, units in alias_to_units.items() if len(units) == 1}
-    return alias_map, gas_units
+    alias_map_gas = collect_aliases(cdr_gas, "CDR_UNIT_CODE", "CDR_UNIT_NAME", extra_fields_df=gas_df)
+    alias_map_other = collect_aliases(cdr_other, "UNIT_CODE", "UNIT_NAME", extra_fields_df=None)
 
-# ====== OPTIONAL: constrained fuzzy (gas∩CDR-NG only) ======
-def build_constrained_fuzzy_corpus(gas_df: pd.DataFrame, cdr_df: pd.DataFrame):
+    return alias_map_gas, alias_map_other, gas_units
+
+# -------- Fuzzy corpora (gas vs other) --------
+def build_fuzzy_corpora(gas_df: pd.DataFrame, cdr_df_all: pd.DataFrame, cdr_full: pd.DataFrame):
     gas_units = set(gas_df["ERCOT_UnitCode"].astype(str))
-    cdr_gas = cdr_df[cdr_df["CDR_UNIT_CODE"].isin(gas_units)].copy()
-    corpus = []
-    # Use CDR UNIT NAME + gas fields
-    for _, r in cdr_gas.iterrows():
-        unit = r["CDR_UNIT_CODE"]
-        raw = r["CDR_UNIT_NAME"]
-        corpus.append((unit, "CDR_UNIT_NAME", raw, normalize(raw)))
-    for _, r in gas_df.iterrows():
-        unit = str(r.get("ERCOT_UnitCode", "")).strip()
-        for f in ["ERCOT_UnitCode", "Name", "CDR Name", "ERCOT_INR Code"]:
-            if f in gas_df.columns:
-                val = r.get(f)
-                if pd.isna(val):
+    cdr_gas = cdr_df_all[cdr_df_all["CDR_UNIT_CODE"].isin(gas_units)].copy()
+
+    cols = {c.upper().strip(): c for c in cdr_full.columns}
+    cdr_full_std = cdr_full.rename(columns={
+        cols["UNIT CODE"]: "UNIT_CODE",
+        cols["UNIT NAME"]: "UNIT_NAME",
+        cols["FUEL"]: "FUEL",
+    }).copy()
+    cdr_full_std["FUEL"] = cdr_full_std["FUEL"].astype(str).str.strip().upper()
+    cdr_other = cdr_full_std[~cdr_full_std["FUEL"].isin(["GAS", "NATURAL GAS"])].copy()
+
+    def corpus_from(cdr_part, code_col, name_col, include_gas_fields: bool):
+        corpus = []
+        for _, r in cdr_part.iterrows():
+            unit = str(r[code_col]).strip()
+            raw = str(r[name_col]).strip()
+            corpus.append((unit, name_col, raw, normalize(raw)))
+        if include_gas_fields:
+            for _, r in gas_df.iterrows():
+                unit = str(r.get("ERCOT_UnitCode", "")).strip()
+                if not unit:
                     continue
-                raw = str(val).strip()
-                corpus.append((unit, f, raw, normalize(raw)))
-    return corpus
+                for f in ["ERCOT_UnitCode", "Name", "CDR Name", "ERCOT_INR Code"]:
+                    if f in gas_df.columns:
+                        val = r.get(f)
+                        if pd.isna(val):
+                            continue
+                        raw = str(val).strip()
+                        corpus.append((unit, f, raw, normalize(raw)))
+        return corpus
+
+    corpus_gas = corpus_from(cdr_gas, "CDR_UNIT_CODE", "CDR_UNIT_NAME", include_gas_fields=True)
+    corpus_other = corpus_from(cdr_other, "UNIT_CODE", "UNIT_NAME", include_gas_fields=False)
+    return corpus_gas, corpus_other
 
 def best_fuzzy_match(q_norm: str, corpus, k=5):
     if not q_norm:
@@ -182,19 +211,19 @@ def best_fuzzy_match(q_norm: str, corpus, k=5):
 def map_resource_names(
     resource_series: pd.Series,
     gas_df: pd.DataFrame,
-    cdr_df: pd.DataFrame,
+    cdr_df_all: pd.DataFrame,   # NG-only subset of CDR
+    cdr_full: pd.DataFrame,     # full CDR (all fuels) for veto
     manual_map: Dict[str, str],
     high_thresh: int = 90,
     review_thresh: int = 70,
-    enable_fuzzy: bool = True
+    enable_fuzzy: bool = True,
+    other_fuel_veto_thresh: int = 88
 ):
-    alias_map, gas_units = build_deterministic_alias_map(gas_df, cdr_df)
+    alias_map_gas, alias_map_other, gas_units = build_alias_maps(gas_df, cdr_df_all, cdr_full)
     exact_id_map = {u.upper(): u for u in gas_units}
-    fuzzy_corpus = build_constrained_fuzzy_corpus(gas_df, cdr_df) if enable_fuzzy else []
+    corpus_gas, corpus_other = build_fuzzy_corpora(gas_df, cdr_df_all, cdr_full) if enable_fuzzy else ([], [])
 
-    out_values = []
-    tracker_rows = []
-    uncertain_rows = []
+    out_values, tracker_rows, uncertain_rows = [], [], []
 
     for original in resource_series.astype(str).tolist():
         # 0) Manual override
@@ -212,7 +241,7 @@ def map_resource_names(
         q_up = original.upper()
         q_norm = normalize(original)
 
-        chosen: Optional[str] = None
+        chosen = None
         method = None
         aux = {}
 
@@ -221,20 +250,50 @@ def map_resource_names(
             chosen = exact_id_map[q_up]
             method = "exact_id"
         else:
-            # 2) deterministic alias exact (normalized)
-            if q_norm in alias_map:
-                chosen = alias_map[q_norm]
+            # 2) exact alias (gas-only)
+            if q_norm in alias_map_gas:
+                chosen = alias_map_gas[q_norm]
                 method = "alias_exact"
             elif enable_fuzzy and q_norm:
-                # 3) constrained fuzzy (gas∩CDR-NG)
-                top = best_fuzzy_match(q_norm, fuzzy_corpus, k=5)
-                if top:
-                    best_score, best_unit, best_field, best_raw = top[0]
+                # -------- other-fuel VETO (exact alias) --------
+                if q_norm in alias_map_other:
+                    out_values.append(original)
+                    row = {
+                        "Resource Name": original, "Matched Name": "",
+                        "Was Replaced": False, "Method": "blocked_by_other_fuel_exact",
+                        "Normalized Query": q_norm, "Best Score": None,
+                        "Best Field": None, "Best Raw": None,
+                        "Alternatives (json)": "[]"
+                    }
+                    tracker_rows.append(row)
+                    uncertain_rows.append(row)
+                    continue
+
+                # -------- other-fuel VETO (fuzzy) --------
+                other_top = best_fuzzy_match(q_norm, corpus_other, k=1)
+                other_best = other_top[0] if other_top else None
+                if other_best and other_best[0] >= other_fuel_veto_thresh:
+                    out_values.append(original)
+                    row = {
+                        "Resource Name": original, "Matched Name": "",
+                        "Was Replaced": False, "Method": "blocked_by_other_fuel_fuzzy",
+                        "Normalized Query": q_norm, "Best Score": int(other_best[0]),
+                        "Best Field": other_best[2], "Best Raw": other_best[3],
+                        "Alternatives (json)": "[]"
+                    }
+                    tracker_rows.append(row)
+                    uncertain_rows.append(row)
+                    continue
+
+                # -------- gas fuzzy (since not vetoed) --------
+                gas_top = best_fuzzy_match(q_norm, corpus_gas, k=5)
+                if gas_top:
+                    best_score, best_unit, best_field, best_raw = gas_top[0]
                     aux = {
                         "best_score": best_score,
                         "best_field": best_field,
                         "best_raw": best_raw,
-                        "alternatives": [{"score": s, "unit": u, "field": f, "raw": r} for s, u, f, r in top]
+                        "alternatives": [{"score": s, "unit": u, "field": f, "raw": r} for s, u, f, r in gas_top]
                     }
                     if best_score >= high_thresh:
                         chosen = best_unit
@@ -254,13 +313,13 @@ def map_resource_names(
             out_values.append(original)
             row = {
                 "Resource Name": original, "Matched Name": "", "Was Replaced": False,
-                "Method": "fuzzy_review" if method == "fuzzy_review" else "no_match",
+                "Method": "fuzzy_review" if method == "fuzzy_review" else (method or "no_match"),
                 "Normalized Query": q_norm, "Best Score": aux.get("best_score"),
                 "Best Field": aux.get("best_field"), "Best Raw": aux.get("best_raw"),
                 "Alternatives (json)": json.dumps(aux.get("alternatives", []))
             }
             tracker_rows.append(row)
-            if row["Method"] in ("fuzzy_review", "no_match"):
+            if row["Method"] in ("fuzzy_review", "no_match", "blocked_by_other_fuel_exact", "blocked_by_other_fuel_fuzzy"):
                 uncertain_rows.append(row)
 
     return pd.Series(out_values), pd.DataFrame(tracker_rows), pd.DataFrame(uncertain_rows)
@@ -281,7 +340,8 @@ def coverage_report(gas_df: pd.DataFrame, tracker_df: pd.DataFrame) -> pd.DataFr
 def update_resource_names(
     agg_path: str,
     gas_df: pd.DataFrame,
-    cdr_df: pd.DataFrame,
+    cdr_df_ng_only: pd.DataFrame,
+    cdr_df_full: pd.DataFrame,
     output_path: str,
     tracker_path: str,
     manual_crosswalk_path: str,
@@ -290,7 +350,8 @@ def update_resource_names(
     missing_gas_path: str,
     high_thresh: int,
     review_thresh: int,
-    enable_fuzzy: bool
+    enable_fuzzy: bool,
+    other_fuel_veto_thresh: int
 ):
     df = pd.read_csv(agg_path)
     if "Resource Name" not in df.columns:
@@ -299,8 +360,15 @@ def update_resource_names(
     manual_map = apply_manual_crosswalk(df["Resource Name"], manual_crosswalk_path)
 
     new_values, tracker_df, uncertain_df = map_resource_names(
-        df["Resource Name"], gas_df, cdr_df, manual_map,
-        high_thresh=high_thresh, review_thresh=review_thresh, enable_fuzzy=enable_fuzzy
+        df["Resource Name"],
+        gas_df,
+        cdr_df_ng_only,
+        cdr_df_full,
+        manual_map,
+        high_thresh=high_thresh,
+        review_thresh=review_thresh,
+        enable_fuzzy=enable_fuzzy,
+        other_fuel_veto_thresh=other_fuel_veto_thresh,
     )
 
     # Replace only when matched to gas subset
@@ -323,19 +391,25 @@ def update_resource_names(
 
 def main():
     cfg = load_env()
+
     print("🔄 Loading gas subset...")
     gas = load_gas_resources(cfg["gas_file"])
     print(f"   Gas units: {len(gas)}")
 
-    print("🔄 Loading CDR list (Natural Gas only) and intersecting with gas subset...")
-    cdr = load_cdr_list(cfg["cdr_file"])
-    print(f"   CDR (NG) rows: {len(cdr)}")
+    print("🔄 Loading CDR list (Natural Gas only) for matching...")
+    cdr_ng = load_cdr_list(cfg["cdr_file"])
+    print(f"   CDR (NG) rows: {len(cdr_ng)}")
 
-    print("🔄 Deterministic matching (alias 1:1) + optional constrained fuzzy...")
+    print("🔄 Loading full CDR (all fuels) for other-fuel veto...")
+    cdr_full = pd.read_csv(cfg["cdr_file"])  # same file; use all fuels for veto
+    print(f"   CDR (full) rows: {len(cdr_full)}")
+
+    print("🔄 Deterministic alias matching + optional constrained fuzzy with other-fuel veto...")
     update_resource_names(
         agg_path=cfg["agg_file"],
         gas_df=gas,
-        cdr_df=cdr,
+        cdr_df_ng_only=cdr_ng,
+        cdr_df_full=cdr_full,
         output_path=cfg["output_file"],
         tracker_path=cfg["tracker_file"],
         manual_crosswalk_path=cfg["manual_crosswalk_file"],
@@ -345,6 +419,7 @@ def main():
         high_thresh=cfg["high_thresh"],
         review_thresh=cfg["review_thresh"],
         enable_fuzzy=cfg["enable_fuzzy"],
+        other_fuel_veto_thresh=cfg["other_fuel_veto_thresh"],
     )
 
 if __name__ == "__main__":

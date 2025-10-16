@@ -592,6 +592,7 @@ def ensure_parent_dir(path: str) -> None:
         os.makedirs(parent, exist_ok=True)
 
 
+
 def main():
     # Load env file
     env_file = env_get("ENV_FILE", ".env")
@@ -600,13 +601,14 @@ def main():
     # Required
     root_folder = env_get("ROOT_FOLDER")
     save_agg_path = env_get("SAVE_AGG_PATH")
+    save_agg_dir = env_get("SAVE_AGG_DIR", None)
+    save_agg_basename = env_get("SAVE_AGG_BASENAME", "aggregation")
 
     if not root_folder or not os.path.isdir(root_folder):
         raise ValueError("ROOT_FOLDER is missing or not a directory (set it in .env).")
-    if not save_agg_path:
-        raise ValueError("SAVE_AGG_PATH is required in .env (must be a .csv path).")
-    
-    if not save_agg_path.lower().endswith(".csv"):
+    if not save_agg_path and not save_agg_dir:
+        raise ValueError("Provide SAVE_AGG_PATH (single output) or SAVE_AGG_DIR (multiple outputs) in .env.")
+    if save_agg_path and not save_agg_path.lower().endswith(".csv"):
         save_agg_path = save_agg_path + ".csv"
 
     # Common env options
@@ -618,7 +620,12 @@ def main():
     # Aggregation/env options
     resource_col = env_get("RESOURCE_COL", "Resource Name")
     timestamp_col = env_get("TIMESTAMP_COL", "SCED Time Stamp")
-    value_col = env_get("VALUE_COL", "Base Point")
+    # Value columns: allow multiple via VALUE_COLS; fallback to VALUE_COL
+    value_cols_raw = env_get("VALUE_COLS", "").strip()
+    if value_cols_raw:
+        value_cols = [c.strip() for c in value_cols_raw.split(",") if c.strip()]
+    else:
+        value_cols = [env_get("VALUE_COL", "Base Point")]
     case_insensitive_cols = env_get_bool("CASE_INSENSITIVE_COLS", True)
     trim_resource = env_get_bool("TRIM_RESOURCE", True)
     coerce_value_numeric = env_get_bool("COERCE_VALUE_NUMERIC", True)
@@ -627,16 +634,14 @@ def main():
     max_messages = int(env_get("MAX_MESSAGES", "5000"))
     csv_kwargs = {}
 
-    # New: batching
+    # Batching (optional)
     batch_size = int(env_get("BATCH_SIZE", "0") or "0")  # 0/None => process all at once (legacy)
-    # Optional: sort order for zips: name or mtime
     zip_sort = env_get("ZIP_SORT", "name").lower()  # 'name' or 'mtime'
 
     # Helper to merge two wide matrices according to on_conflict
     def merge_wide(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame:
         if existing is None or len(existing) == 0:
             return incoming.copy()
-        # Union axes
         idx = existing.index.union(incoming.index)
         cols = existing.columns.union(incoming.columns)
         a = existing.reindex(index=idx, columns=cols)
@@ -646,8 +651,11 @@ def main():
             mask = b.notna()
             out[mask] = b[mask]
             return out
-        # default: skip -> keep existing; fill only where empty
         return a.combine_first(b)
+
+    def safe_name(s: str) -> str:
+        out = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(s))
+        return re.sub(r"_+", "_", out).strip("_")
 
     # Enumerate top-level zips
     all_zips = []
@@ -659,13 +667,46 @@ def main():
     else:
         all_zips.sort(key=lambda p: os.path.basename(p).lower())
 
-    agg_df = None
-    msgs: List[str] = []
+    # Prepare per-column aggregation structures
+    agg_by_col = {vc: None for vc in value_cols}
+    msgs_by_col = {vc: [] for vc in value_cols}
     total_matched = 0
     total_loaded = 0
 
+    def process_batch_paths(batch_paths):
+        nonlocal total_matched, total_loaded, agg_by_col
+        dfs, matched, loaded = find_target_csvs_in_given_zips(
+            batch_paths,
+            pattern=pattern,
+            ignore_case=ignore_case,
+            csv_read_kwargs=csv_kwargs,
+            max_depth=max_depth,
+            on_error=None,
+            verbose=verbose,
+        )
+        total_matched += matched
+        total_loaded += loaded
+        if not dfs:
+            return
+        for vc in value_cols:
+            batch_agg, batch_msgs = aggregate_base_point_matrix(
+                dfs,
+                resource_col=resource_col,
+                timestamp_col=timestamp_col,
+                value_col=vc,
+                case_insensitive_cols=case_insensitive_cols,
+                trim_resource=trim_resource,
+                coerce_value_numeric=coerce_value_numeric,
+                timestamp_format=timestamp_format,
+                on_conflict=on_conflict,
+                max_messages=max_messages,
+                verbose=verbose,
+            )
+            prev = agg_by_col.get(vc)
+            agg_by_col[vc] = merge_wide(prev, batch_agg) if prev is not None else batch_agg
+            msgs_by_col[vc].extend(batch_msgs)
+
     if not batch_size:
-        # Legacy single-shot path
         dfs, matched, loaded = find_target_csvs_in_nested_zips(
             root_folder=root_folder,
             pattern=pattern,
@@ -677,45 +718,12 @@ def main():
         )
         total_matched += matched
         total_loaded += loaded
-        batch_agg, batch_msgs = aggregate_base_point_matrix(
-            dfs,
-            resource_col=resource_col,
-            timestamp_col=timestamp_col,
-            value_col=value_col,
-            case_insensitive_cols=case_insensitive_cols,
-            trim_resource=trim_resource,
-            coerce_value_numeric=coerce_value_numeric,
-            timestamp_format=timestamp_format,
-            on_conflict=on_conflict,
-            max_messages=max_messages,
-            verbose=verbose,
-        )
-        agg_df = merge_wide(agg_df, batch_agg)
-        msgs.extend(batch_msgs)
-    else:
-        # Batch through the zip list
-        for i in range(0, len(all_zips), batch_size):
-            batch_paths = all_zips[i:i+batch_size]
-            if verbose:
-                print(f"[INFO] Processing batch {i//batch_size + 1} with {len(batch_paths)} zip(s)")
-            dfs, matched, loaded = find_target_csvs_in_given_zips(
-                batch_paths,
-                pattern=pattern,
-                ignore_case=ignore_case,
-                csv_read_kwargs=csv_kwargs,
-                max_depth=max_depth,
-                on_error=None,
-                verbose=verbose,
-            )
-            total_matched += matched
-            total_loaded += loaded
-            if not dfs:
-                continue
+        for vc in value_cols:
             batch_agg, batch_msgs = aggregate_base_point_matrix(
                 dfs,
                 resource_col=resource_col,
                 timestamp_col=timestamp_col,
-                value_col=value_col,
+                value_col=vc,
                 case_insensitive_cols=case_insensitive_cols,
                 trim_resource=trim_resource,
                 coerce_value_numeric=coerce_value_numeric,
@@ -724,21 +732,42 @@ def main():
                 max_messages=max_messages,
                 verbose=verbose,
             )
-            agg_df = merge_wide(agg_df, batch_agg)
-            msgs.extend(batch_msgs)
-            # Proactively free memory
-            del dfs, batch_agg, batch_msgs
+            prev = agg_by_col.get(vc)
+            agg_by_col[vc] = merge_wide(prev, batch_agg) if prev is not None else batch_agg
+            msgs_by_col[vc].extend(batch_msgs)
+    else:
+        for i in range(0, len(all_zips), batch_size):
+            batch_paths = all_zips[i:i+batch_size]
+            if verbose:
+                print(f"[INFO] Processing batch {i//batch_size + 1} with {len(batch_paths)} zip(s)")
+            process_batch_paths(batch_paths)
 
-    # Save CSV
-    ensure_parent_dir(save_agg_path)
-    try:
-        agg_df.to_csv(save_agg_path, index=True)
-        if verbose:
-            print(f"[INFO] Saved aggregated matrix to '{save_agg_path}'")
-    except Exception as e:
-        raise RuntimeError(f"Failed to save CSV to '{save_agg_path}': {e}")
+    # Saving
+    if len(value_cols) == 1 and save_agg_path:
+        vc = value_cols[0]
+        ensure_parent_dir(save_agg_path)
+        try:
+            agg_by_col[vc].to_csv(save_agg_path, index=True)
+            if verbose:
+                print(f"[INFO] Saved aggregated matrix to '{save_agg_path}'")
+        except Exception as e:
+            raise RuntimeError(f"Failed to save CSV to '{save_agg_path}': {e}")
+    else:
+        if not save_agg_dir:
+            raise ValueError("Multiple value columns detected. Please set SAVE_AGG_DIR for per-column outputs.")
+        os.makedirs(save_agg_dir, exist_ok=True)
+        for vc in value_cols:
+            fname = f"{save_agg_basename}_{safe_name(vc)}.csv"
+            out_path = os.path.join(save_agg_dir, fname)
+            ensure_parent_dir(out_path)
+            try:
+                agg_by_col[vc].to_csv(out_path, index=True)
+                if verbose:
+                    print(f"[INFO] Saved aggregated matrix for '{vc}' to '{out_path}'")
+            except Exception as e:
+                raise RuntimeError(f"Failed to save CSV to '{out_path}': {e}")
 
-    # Optional aggregation log
+    # Optional aggregation log (combined)
     agg_log_path = env_get("AGG_LOG_PATH", None)
     if agg_log_path:
         ensure_parent_dir(agg_log_path)
@@ -746,22 +775,15 @@ def main():
             with open(agg_log_path, "w", encoding="utf-8") as fh:
                 fh.write("=== Aggregation summary ===\n")
                 fh.write(f"Matched CSVs: {total_matched}\nLoaded CSVs: {total_loaded}\n")
-                if msgs:
-                    fh.write("\n=== Messages ===\n")
-                    for m in msgs:
+                fh.write(f"Value columns: {', '.join(value_cols)}\n")
+                for vc in value_cols:
+                    fh.write(f"\n--- Messages for '{vc}' ---\n")
+                    for m in msgs_by_col[vc]:
                         fh.write(m + "\n")
             if verbose:
                 print(f"[INFO] Saved aggregation log to '{agg_log_path}'")
         except Exception as e:
             print(f"[WARN] Failed to save log '{agg_log_path}': {e}")
-# Console preview of messages (capped)
-    if verbose and msgs:
-        to_show = min(30, len(msgs))
-        print(f"\n--- Sample messages (showing {to_show} of {len(msgs)}) ---")
-        for m in msgs[:to_show]:
-            print(m)
-        if len(msgs) > to_show:
-            print(f"... ({len(msgs) - to_show} more)")
 
 
 if __name__ == "__main__":

@@ -44,6 +44,7 @@ MAKE_STEP_BARS_BY_MONTH_HOUR = True
 MAKE_PRICE_HEATMAPS          = True
 MAKE_PRICE_VIOLINS           = True
 MAKE_AVG_MWFRAC_LINE         = True
+MAKE_AVG_PRICE_LINE          = True
 # ================================================================ #
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -437,6 +438,75 @@ def plot_avg_mwfrac_by_step_all_types(
     return out_path
 
 
+# ---------- Chart: Average Price by Step (line per Resource Type) ---------- #
+def plot_avg_price_by_step_one_figure_all_types(
+    bids_long: pd.DataFrame,
+    out_dir: Path,
+    steps: list[int] | None = None,
+    min_points_per_step: int = 1,
+    legend_ncol: int = 4,
+    filename: str = "avg_price_by_step_all_types.png",
+):
+    """
+    Single figure:
+      - x = SCED Step (1..N)
+      - y = average Price ($/MWh)
+      - one line per Resource Type
+    Averages are computed across ALL plants and ALL timestamps for each (Resource Type, Step).
+    """
+    # Keep needed cols and sanitize types
+    df = bids_long.dropna(subset=["Resource Type", "Step", "Price"]).copy()
+    df["Step"] = df["Step"].astype(int)
+
+    # Steps to include
+    all_steps = sorted(df["Step"].unique().tolist())
+    if steps is None:
+        steps = all_steps
+    else:
+        steps = [s for s in steps if s in all_steps]
+        if not steps:
+            print("No requested steps found; skipping avg price by step plot.")
+            return None
+
+    # Mean price per (Resource Type, Step), filter sparse
+    stats = (df.groupby(["Resource Type", "Step"], observed=True)
+               .agg(n=("Price", "size"), avg_price=("Price", "mean"))
+               .reset_index())
+    stats = stats[stats["n"] >= min_points_per_step]
+
+    # Pivot so we can draw one line per resource type
+    wide = stats.pivot(index="Resource Type", columns="Step", values="avg_price").reindex(columns=steps)
+
+    # order legend by overall average price (optional)
+    wide["__order"] = wide.mean(axis=1, skipna=True)
+    wide = wide.sort_values("__order", ascending=False).drop(columns="__order")
+
+    if wide.empty:
+        print("No data available for the combined avg price-by-step plot.")
+        return None
+
+    # Plot
+    fig = plt.figure(figsize=(12, 6))
+    x = np.arange(len(steps))
+    for rtype, row in wide.iterrows():
+        y = row.to_numpy(dtype=float)
+        if np.all(np.isnan(y)):
+            continue
+        plt.plot(x, y, marker="o", label=str(rtype))
+
+    plt.xticks(x, steps)
+    plt.xlabel("SCED Step")
+    plt.ylabel("Average bid Price ($/MWh)")
+    plt.title("Average Price by SCED Step — one line per Resource Type")
+    plt.grid(True, linestyle="--", alpha=0.3)
+    plt.legend(ncol=legend_ncol, fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.15))
+    plt.tight_layout(rect=[0, 0.05, 1, 1])
+
+    out_path = out_dir / filename
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
 
 # ============================ Main ============================ #
 def main():
@@ -479,6 +549,18 @@ def main():
         )
         print("✅ Saved:", avg_line_path)
 
+    if MAKE_AVG_PRICE_LINE:
+        print("Generating single plot: Average Price vs SCED Step (one line per Resource Type)...")
+        avg_price_plot_path = plot_avg_price_by_step_one_figure_all_types(
+            bids_long,
+            out_dir=OUTPUT_DIR,
+            steps=None,             # or e.g. list(range(1, 21)) to limit steps
+            min_points_per_step=5,  # bump this to suppress very sparse points
+            legend_ncol=4,
+            filename="avg_price_by_step_all_types.png",
+        )
+        print("✅ Saved:", avg_price_plot_path)
+    
     print("Done.")
 
 if __name__ == "__main__":

@@ -43,6 +43,7 @@ TIMESTAMP_TZ = None  # e.g., "America/Chicago" or None to keep naive
 MAKE_STEP_BARS_BY_MONTH_HOUR = True
 MAKE_PRICE_HEATMAPS          = True
 MAKE_PRICE_VIOLINS           = True
+MAKE_AVG_MWFRAC_LINE         = True
 # ================================================================ #
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -358,6 +359,85 @@ def plot_price_violins_by_step_per_type(
         plt.close(fig)
 
 
+# ---------- Chart: Average MW_frac by Step (line per Resource Type) ---------- #
+def plot_avg_mwfrac_by_step_all_types(
+    bids_long: pd.DataFrame,
+    out_dir: Path,
+    steps: list[int] | None = None,
+    min_points_per_step: int = 1,
+    legend_ncol: int = 3,
+):
+    """
+    Single plot:
+      - x-axis: SCED Step (1..N)
+      - y-axis: Average MW_frac (normalized MW/HSL)
+      - One line per Resource Type (averaged across the whole time range)
+
+    Parameters
+    ----------
+    bids_long : DataFrame with columns ["Resource Type","Step","MW_frac"]
+    out_dir   : base output directory (PNG saved here)
+    steps     : optional subset of steps to plot; default = all present (sorted)
+    min_points_per_step : require at least this many observations to include a (type, step) mean
+    legend_ncol : number of columns for legend layout
+    """
+    df = bids_long.dropna(subset=["Resource Type", "Step", "MW_frac"]).copy()
+    df["Step"] = df["Step"].astype(int)
+
+    # Decide steps to show
+    all_steps = sorted(df["Step"].unique().tolist())
+    if steps is None:
+        steps = all_steps
+    else:
+        steps = [s for s in steps if s in all_steps]
+        if not steps:
+            raise ValueError("No requested steps found in data.")
+
+    # Compute mean MW_frac per (Resource Type, Step), with a min sample filter
+    stats = (df.groupby(["Resource Type", "Step"], observed=True)
+               .agg(n=("MW_frac", "size"),
+                    avg=("MW_frac", "mean"))
+               .reset_index())
+    stats = stats[stats["n"] >= min_points_per_step]
+
+    # Pivot to step columns so we can plot lines per resource type
+    wide = stats.pivot(index="Resource Type", columns="Step", values="avg")
+    # Restrict to selected steps and keep order
+    wide = wide.reindex(columns=steps)
+    # Sort resource types by overall average (descending) to reduce legend clutter
+    wide["__order"] = wide.mean(axis=1, skipna=True)
+    wide = wide.sort_values("__order", ascending=False).drop(columns="__order")
+
+    if wide.empty:
+        print("No data available for average MW_frac by step plot.")
+        return None
+
+    # Plot
+    fig = plt.figure(figsize=(12, 6))
+    x = np.arange(len(steps))
+    for rtype, row in wide.iterrows():
+        y = row.to_numpy(dtype=float)
+        # Mask all-nan lines
+        if np.all(np.isnan(y)):
+            continue
+        plt.plot(x, y, marker="o", label=str(rtype))
+
+    plt.xticks(x, steps)
+    plt.xlabel("SCED Step")
+    plt.ylabel("Average normalized MW (MW/HSL)")
+    plt.title("Average MW_frac by SCED Step (line per Resource Type)")
+    plt.grid(True, linestyle="--", alpha=0.3)
+    # Put legend outside if many types
+    lgd = plt.legend(ncol=legend_ncol, fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.15))
+    plt.tight_layout(rect=[0, 0.05, 1, 1])  # leave space for legend if below
+
+    out_path = out_dir / "avg_mwfrac_by_step_all_types.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+
 # ============================ Main ============================ #
 def main():
     print(f"Reading aggregated files from: {INPUT_DIR}")
@@ -387,6 +467,17 @@ def main():
             max_types=None             # or an int to limit how many types
         )
         print(f"✅ Violins saved under: {OUTPUT_DIR / 'price_violins'}")
+    
+    if MAKE_AVG_MWFRAC_LINE:
+        print("Generating single plot of Average MW_frac vs SCED Step (line per Resource Type)...")
+        avg_line_path = plot_avg_mwfrac_by_step_all_types(
+            bids_long,
+            out_dir=OUTPUT_DIR,
+            steps=None,              # or e.g. list(range(1, 16)) to limit to steps 1–15
+            min_points_per_step=5,   # raise if you want to suppress sparse averages
+            legend_ncol=4            # adjust legend layout
+        )
+        print("✅ Saved:", avg_line_path)
 
     print("Done.")
 

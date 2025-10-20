@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
 """
-SCED bidding from aggregated time-series directory + Price heatmaps (months x hours)
+SCED bidding analysis from aggregated time-series directory
 
-Input directory contains files:
+Inputs (in INPUT_DIR):
   aggregation_HSL.csv
   aggregation_SCED1_Curve-MW1.csv
   aggregation_SCED1_Curve-Price1.csv
   ...
-Each file:
-  - Columns: ["Resource Name", "Resource Type", <timestamp_1>, <timestamp_2>, ...]
-  - Timestamps are 5-min resolution column headers.
+Each file columns:
+  ["Resource Name", "Resource Type", <timestamp1>, <timestamp2>, ...] (5-min resolution)
 
-This script:
-  1) Loads & melts all needed files (HSL, MWk, Pricek), pairs MWk/Pricek, merges with HSL
-  2) Computes MW_frac = MW/HSL (per pair, before any aggregation)
-  3) Builds 12 x 24 heatmaps of Price by (month, hour) for every Resource Type × Step
-     - Saves each heatmap PNG under OUTPUT_DIR/price_heatmaps/<ResourceType>/
+Pipeline:
+  1) Load & melt HSL, MW_k, Price_k into long format
+  2) Pair (MW_k, Price_k) with HSL, compute MW_frac = MW/HSL (pairwise, pre-aggregation)
+  3) Save normalized long table
+  4) Produce stacked step bars for every (month, hour)
+  5) Produce 12×24 price heatmaps for each (Resource Type × Step)
+  6) Produce violin plots of Price-by-Step (one per Resource Type)
+
+Notes:
+  - Uses matplotlib only (no seaborn).
+  - MAX_STEPS controls how many (MW, Price) pairs we consider (default 35).
 """
 
+from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Dict, Tuple, List, Optional
@@ -26,48 +32,43 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# ---------------- CONFIG ----------------
-INPUT_DIR  = Path("/path/to/your/aggregated_timeseries_dir")     # <-- set this
-OUTPUT_DIR = Path("/path/to/output/sced_bidding_from_aggregates")# <-- set this
-MAX_STEPS  = 35  # cap number of (MW, Price) pairs to consider
+
+# ============================ CONFIG ============================ #
+INPUT_DIR  = Path("/path/to/your/aggregated_timeseries_dir")      # <-- set this
+OUTPUT_DIR = Path("/path/to/output/sced_bidding_from_aggregates") # <-- set this
+MAX_STEPS  = 35
 TIMESTAMP_TZ = None  # e.g., "America/Chicago" or None to keep naive
-# ---------------------------------------
+
+# Toggle outputs on/off if needed
+MAKE_STEP_BARS_BY_MONTH_HOUR = True
+MAKE_PRICE_HEATMAPS          = True
+MAKE_PRICE_VIOLINS           = True
+# ================================================================ #
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# --------- Filename parsing helpers ---------
+# ---------- Filename parsing ---------- #
 RE_HSL = re.compile(r"^aggregation[_-]HSL\.csv$", re.IGNORECASE)
 RE_MW  = re.compile(r"^aggregation[_-]SCED1[_ ]?Curve[-_]?MW(\d+)\.csv$", re.IGNORECASE)
 RE_PRC = re.compile(r"^aggregation[_-]SCED1[_ ]?Curve[-_]?Price(\d+)\.csv$", re.IGNORECASE)
 
 def classify_file(fname: str) -> Tuple[str, Optional[int]]:
-    """
-    Classify a file:
-      - ("HSL", None)     for HSL file
-      - ("MW", step)      for curve MW step file
-      - ("PRICE", step)   for curve Price step file
-      - ("OTHER", None)   otherwise
-    """
-    if RE_HSL.match(fname):
-        return "HSL", None
+    if RE_HSL.match(fname): return "HSL", None
     m = RE_MW.match(fname)
-    if m:
-        return "MW", int(m.group(1))
+    if m: return "MW", int(m.group(1))
     p = RE_PRC.match(fname)
-    if p:
-        return "PRICE", int(p.group(1))
+    if p: return "PRICE", int(p.group(1))
     return "OTHER", None
 
-# --------- IO / melt helpers ---------
+# ---------- IO / melt helpers ---------- #
 def melt_metric_csv(path: Path, value_name: str) -> pd.DataFrame:
     """
-    Read a single 'aggregation_*.csv' file and melt:
-      id_vars = ["Resource Name", "Resource Type"]
-      value_vars = all timestamp columns
-    Return columns: Resource Name, Resource Type, timestamp, <value_name>
+    Read one aggregation_*.csv and melt timestamps wide->long.
+    Returns: columns ["Resource Name","Resource Type","timestamp", value_name]
     """
     df = pd.read_csv(path)
-    # Normalize expected id columns
+
+    # Normalize id headers as needed
     rename_map = {}
     if "Resource Node" in df.columns:
         rename_map["Resource Node"] = "Resource Name"
@@ -86,9 +87,11 @@ def melt_metric_csv(path: Path, value_name: str) -> pd.DataFrame:
 
     long_df = df.melt(id_vars=id_vars, value_vars=ts_cols,
                       var_name="timestamp", value_name=value_name)
+
     # Parse timestamps
     long_df["timestamp"] = pd.to_datetime(long_df["timestamp"], errors="coerce")
     if TIMESTAMP_TZ:
+        # Localize naive or convert if tz-aware
         try:
             long_df["timestamp"] = long_df["timestamp"].dt.tz_localize(
                 TIMESTAMP_TZ, nonexistent="NaT", ambiguous="NaT"
@@ -99,10 +102,10 @@ def melt_metric_csv(path: Path, value_name: str) -> pd.DataFrame:
 
 def ingest_directory(input_dir: Path, max_steps: int = 35) -> Tuple[pd.DataFrame, Dict[int, pd.DataFrame], Dict[int, pd.DataFrame]]:
     """
-    Scan input_dir, melt files, and return:
-      - hsl_long: DataFrame with column 'HSL'
-      - mw_long_map: dict[step] -> DataFrame with column 'MW'
-      - price_long_map: dict[step] -> DataFrame with column 'Price'
+    Scan directory and return:
+      hsl_long: DataFrame with 'HSL'
+      mw_long_map: dict[step] -> DataFrame with 'MW'
+      price_long_map: dict[step] -> DataFrame with 'Price'
     """
     hsl_long = None
     mw_long_map: Dict[int, pd.DataFrame] = {}
@@ -114,112 +117,160 @@ def ingest_directory(input_dir: Path, max_steps: int = 35) -> Tuple[pd.DataFrame
         kind, step = classify_file(f.name)
         if kind == "HSL":
             hsl_long = melt_metric_csv(f, "HSL")
-        elif kind == "MW" and step is not None and 1 <= step <= max_steps:
+        elif kind == "MW" and step and 1 <= step <= max_steps:
             mw_long_map[step] = melt_metric_csv(f, "MW")
-        elif kind == "PRICE" and step is not None and 1 <= step <= max_steps:
+        elif kind == "PRICE" and step and 1 <= step <= max_steps:
             price_long_map[step] = melt_metric_csv(f, "Price")
-        else:
-            continue
 
     if hsl_long is None or hsl_long.empty:
-        raise ValueError("No valid HSL file found (aggregation_HSL.csv) or it is empty.")
+        raise ValueError("No valid aggregation_HSL.csv found or it is empty.")
 
     return hsl_long, mw_long_map, price_long_map
 
 def merge_step(hsl_long: pd.DataFrame, mw_long: pd.DataFrame, price_long: pd.DataFrame, step: int) -> pd.DataFrame:
     """
     Merge HSL, MW_step, Price_step on (Resource Name, Resource Type, timestamp).
-    Add 'Step', compute MW_frac, and derive hour/month.
+    Compute MW_frac pair-wise and derive month/hour.
     """
     keys = ["Resource Name", "Resource Type", "timestamp"]
-    m = hsl_long.merge(mw_long, on=keys, how="inner")
-    m = m.merge(price_long, on=keys, how="inner")
+    m = hsl_long.merge(mw_long, on=keys, how="inner").merge(price_long, on=keys, how="inner")
     m["Step"] = step
 
     # Normalize pair-wise (before any aggregation)
-    m["MW"] = pd.to_numeric(m["MW"], errors="coerce")
+    m["MW"]    = pd.to_numeric(m["MW"],    errors="coerce")
     m["Price"] = pd.to_numeric(m["Price"], errors="coerce")
-    m["HSL"] = pd.to_numeric(m["HSL"], errors="coerce").fillna(0.0)
+    m["HSL"]   = pd.to_numeric(m["HSL"],   errors="coerce").fillna(0.0)
 
     with np.errstate(divide="ignore", invalid="ignore"):
         m["MW_frac"] = np.where(m["HSL"].to_numpy() > 0, m["MW"].to_numpy() / m["HSL"].to_numpy(), np.nan)
 
-    m["hour"] = m["timestamp"].dt.hour
+    m["hour"]  = m["timestamp"].dt.hour
     m["month"] = m["timestamp"].dt.month
     cols = ["Resource Name","Resource Type","timestamp","month","hour","Step","MW","Price","HSL","MW_frac"]
     return m[cols]
 
 def build_bids_long(input_dir: Path, max_steps: int = 35) -> pd.DataFrame:
     """
-    Unified long dataframe combining steps 1..max_steps.
-    Columns: Resource Name, Resource Type, timestamp, month, hour, Step, MW, Price, HSL, MW_frac
+    Unified long table:
+      ["Resource Name","Resource Type","timestamp","month","hour","Step","MW","Price","HSL","MW_frac"]
     """
     hsl_long, mw_map, price_map = ingest_directory(input_dir, max_steps=max_steps)
-
-    steps = sorted(set(mw_map.keys()).intersection(set(price_map.keys())))
+    steps = sorted(set(mw_map.keys()).intersection(price_map.keys()))
     if not steps:
         raise ValueError("No overlapping steps found between MW and Price files.")
-    if max_steps is not None:
-        steps = [s for s in steps if 1 <= s <= max_steps]
+    steps = [s for s in steps if 1 <= s <= max_steps]
 
-    merged_list: List[pd.DataFrame] = []
-    for s in steps:
-        merged_list.append(merge_step(hsl_long, mw_map[s], price_map[s], s))
+    merged = [merge_step(hsl_long, mw_map[s], price_map[s], s) for s in steps]
+    bids_long = pd.concat(merged, ignore_index=True)
 
-    bids_long = pd.concat(merged_list, ignore_index=True)
-    bids_long = bids_long.dropna(subset=["Price"])  # keep price rows
+    # Keep valid normalized rows; price can be NaN in some views, but normalize rows need finite MW_frac
+    bids_long = bids_long.dropna(subset=["MW_frac"])
+    bids_long = bids_long[(bids_long["MW_frac"] >= 0) & np.isfinite(bids_long["MW_frac"])]
     return bids_long
 
-# ---------------------- Heatmap generation ---------------------- #
+
+# ---------- Charts: Step bars by (month, hour) ---------- #
+def plot_step_bars_by_month_hour(bids_long: pd.DataFrame, out_dir: Path):
+    """
+    For each (month, hour), produce a stacked bar chart:
+      x = Step (1..N)
+      y = mean(MW_frac) for that (month, hour)
+      stacks = Resource Type
+    Saves: out_dir/step_bars_by_month_hour/<MM>/bars_month_MM_hour_HH.png
+    """
+    root = out_dir / "step_bars_by_month_hour"
+    root.mkdir(parents=True, exist_ok=True)
+
+    grp = (bids_long
+           .groupby(["month","hour","Step","Resource Type"], observed=True)["MW_frac"]
+           .mean().reset_index())
+
+    all_types = sorted(grp["Resource Type"].dropna().unique().tolist())
+    all_steps = sorted(grp["Step"].dropna().unique().astype(int).tolist())
+    months = list(range(1, 13))
+    hours = list(range(0, 24))
+
+    for mm in months:
+        mdir = root / f"{mm:02d}"
+        mdir.mkdir(parents=True, exist_ok=True)
+
+        for hh in hours:
+            sub = grp[(grp["month"] == mm) & (grp["hour"] == hh)]
+            fig = plt.figure(figsize=(14, 6))
+            if sub.empty:
+                plt.title(f"Normalized Bids by Step — Month {mm}, Hour {hh} (no data)")
+                plt.xlabel("Step (1..N)")
+                plt.ylabel("Mean normalized MW (MW/HSL)")
+            else:
+                # Matrix: step x type
+                mat = np.zeros((len(all_steps), len(all_types)))
+                for i, s in enumerate(all_steps):
+                    row = sub[sub["Step"] == s]
+                    vals = row.set_index("Resource Type")["MW_frac"].reindex(all_types).fillna(0).to_numpy()
+                    mat[i, :] = vals
+
+                x = np.arange(len(all_steps))
+                bottom = np.zeros(len(all_steps))
+                for j, rtype in enumerate(all_types):
+                    heights = mat[:, j]
+                    plt.bar(x, heights, bottom=bottom, label=rtype)
+                    bottom += heights
+
+                plt.xticks(x, all_steps)
+                plt.xlabel("Step (1..N)")
+                plt.ylabel("Mean normalized MW (MW/HSL)")
+                plt.title(f"How Resource Types Bid by Step — Month {mm}, Hour {hh}")
+                plt.legend(ncol=3, fontsize=8)
+
+            out_path = mdir / f"bars_month_{mm:02d}_hour_{hh:02d}.png"
+            plt.tight_layout()
+            plt.savefig(out_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+
+
+# ---------- Charts: 12×24 price heatmaps per (Resource Type × Step) ---------- #
 def plot_price_heatmaps_month_hour(bids_long: pd.DataFrame, out_dir: Path):
     """
-    Create 12 x 24 heatmaps of Price for each (Resource Type, Step).
-      - x-axis: hour 0..23
-      - y-axis: month 1..12
-      - value: mean Price for that (month, hour)
-    Saves: out_dir/price_heatmaps/<ResourceType>/heatmap_price_<ResourceType>_step<k>.png
+    One heatmap per (Resource Type, Step):
+      x = hour (0..23), y = month (1..12), value = mean Price
+    Saves: out_dir/price_heatmaps/<ResourceType>/heatmap_price_<rtype>_stepXX.png
     """
     heatmaps_root = out_dir / "price_heatmaps"
     heatmaps_root.mkdir(parents=True, exist_ok=True)
 
-    # Pre-aggregate: mean price for each (rtype, step, month, hour)
     grp = (bids_long.groupby(["Resource Type","Step","month","hour"], observed=True)["Price"]
            .mean().reset_index())
 
     resource_types = sorted(grp["Resource Type"].dropna().unique().tolist())
     steps = sorted(grp["Step"].dropna().unique().astype(int).tolist())
 
-    # Fixed axes
     hours = np.arange(0, 24)
     months = np.arange(1, 13)
 
     for rtype in resource_types:
         type_dir = heatmaps_root / re.sub(r"[^A-Za-z0-9._-]+","_", rtype)
         type_dir.mkdir(parents=True, exist_ok=True)
-
         sub_type = grp[grp["Resource Type"] == rtype]
+
         for s in steps:
             sub = sub_type[sub_type["Step"] == s]
             if sub.empty:
-                # still emit an empty heatmap for consistency
                 mat = np.full((len(months), len(hours)), np.nan)
             else:
-                # Build matrix: rows=months(1..12), cols=hours(0..23)
                 pivot = sub.pivot(index="month", columns="hour", values="Price")
                 pivot = pivot.reindex(index=months, columns=hours)
                 mat = pivot.to_numpy()
 
             fig = plt.figure(figsize=(10, 6))
-            # imshow with explicit extents to label axes nicely
-            # y from 1..12; x from 0..23
-            plt.imshow(mat, aspect="auto", origin="lower",
-                       extent=[hours.min()-0.5, hours.max()+0.5, months.min()-0.5, months.max()+0.5])
+            plt.imshow(
+                mat, aspect="auto", origin="lower",
+                extent=[hours.min()-0.5, hours.max()+0.5, months.min()-0.5, months.max()+0.5]
+            )
             cbar = plt.colorbar()
             cbar.set_label("Mean bid price ($/MWh)")
             plt.xlabel("Hour of day")
             plt.ylabel("Month (1–12)")
             plt.title(f"Price Heatmap — {rtype} — Step {s}")
-            # ticks
             plt.xticks(np.arange(0, 24, 1))
             plt.yticks(np.arange(1, 13, 1))
             out_path = type_dir / f"heatmap_price_{re.sub(r'[^A-Za-z0-9._-]+','_', rtype)}_step{s:02d}.png"
@@ -227,20 +278,117 @@ def plot_price_heatmaps_month_hour(bids_long: pd.DataFrame, out_dir: Path):
             plt.savefig(out_path, dpi=150, bbox_inches="tight")
             plt.close(fig)
 
-# --------------------------- Main --------------------------- #
+
+# ---------- Charts: Violin plots of Price by Step (per Resource Type) ---------- #
+def plot_price_violins_by_step_per_type(
+    bids_long: pd.DataFrame,
+    out_dir: Path,
+    steps: List[int] | None = None,
+    clip_quantiles: tuple[float, float] | None = (0.01, 0.99),
+    max_types: int | None = None,
+):
+    """
+    One violin plot per Resource Type:
+      x = Step (1..N)
+      y = Price ($/MWh)
+      Each violin is the price distribution for that step.
+
+    Parameters:
+      steps          : restrict to subset of steps (default = all)
+      clip_quantiles : trim tails to reduce extreme outliers (set None to disable)
+      max_types      : limit number of resource types to plot (None = all)
+    """
+    viol_root = out_dir / "price_violins"
+    viol_root.mkdir(parents=True, exist_ok=True)
+
+    df = bids_long.dropna(subset=["Price", "Step", "Resource Type"]).copy()
+
+    all_steps = sorted(df["Step"].dropna().unique().astype(int).tolist())
+    if steps is None:
+        steps = all_steps
+    else:
+        steps = [s for s in steps if s in all_steps]
+        if not steps:
+            raise ValueError("No requested steps found in data.")
+
+    type_counts = df.groupby("Resource Type").size().sort_values(ascending=False)
+    resource_types = type_counts.index.tolist()
+    if max_types is not None and max_types > 0:
+        resource_types = resource_types[:max_types]
+
+    for rtype in resource_types:
+        sub = df[df["Resource Type"] == rtype]
+        if sub.empty:
+            continue
+
+        # Build arrays of prices per step
+        data_arrays = []
+        for s in steps:
+            arr = pd.to_numeric(sub.loc[sub["Step"] == s, "Price"], errors="coerce").dropna().to_numpy()
+            if arr.size > 0 and clip_quantiles is not None:
+                lo, hi = np.nanquantile(arr, clip_quantiles[0]), np.nanquantile(arr, clip_quantiles[1])
+                arr = arr[(arr >= lo) & (arr <= hi)]
+            data_arrays.append(arr)
+
+        if not any(len(a) for a in data_arrays):
+            continue
+
+        fig = plt.figure(figsize=(14, 6))
+        parts = plt.violinplot(
+            data_arrays,
+            positions=np.arange(1, len(steps) + 1),
+            showmeans=False,
+            showmedians=True,
+            showextrema=False,
+            widths=0.8,
+        )
+        for pc in parts['bodies']:
+            pc.set_alpha(0.7)
+
+        plt.xlabel("Step")
+        plt.ylabel("Bid price ($/MWh)")
+        plt.title(f"SCED Bid Price by Step — {rtype}")
+        plt.xticks(np.arange(1, len(steps) + 1), steps)
+        plt.grid(True, axis="y", linestyle="--", alpha=0.3)
+
+        safe_rtype = re.sub(r"[^A-Za-z0-9._-]+", "_", str(rtype))
+        out_path = viol_root / f"violin_price_by_step_{safe_rtype}.png"
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+
+# ============================ Main ============================ #
 def main():
     print(f"Reading aggregated files from: {INPUT_DIR}")
     bids_long = build_bids_long(INPUT_DIR, max_steps=MAX_STEPS)
 
-    # Save the normalized long table for downstream analysis
     out_csv = OUTPUT_DIR / "bids_long_steps_from_aggregates.csv"
     bids_long.to_csv(out_csv, index=False)
     print(f"✅ Wrote normalized long table: {out_csv}")
 
-    # Generate price heatmaps (months x hours) for each resource type & step
-    print("Generating months×hours price heatmaps for each Resource Type × Step...")
-    plot_price_heatmaps_month_hour(bids_long, OUTPUT_DIR)
-    print(f"✅ Heatmaps saved under: {OUTPUT_DIR / 'price_heatmaps'}")
+    if MAKE_STEP_BARS_BY_MONTH_HOUR:
+        print("Generating stacked step bars for each (month, hour)...")
+        plot_step_bars_by_month_hour(bids_long, OUTPUT_DIR)
+        print(f"✅ Bar charts saved under: {OUTPUT_DIR / 'step_bars_by_month_hour'}")
+
+    if MAKE_PRICE_HEATMAPS:
+        print("Generating 12×24 price heatmaps for each Resource Type × Step...")
+        plot_price_heatmaps_month_hour(bids_long, OUTPUT_DIR)
+        print(f"✅ Heatmaps saved under: {OUTPUT_DIR / 'price_heatmaps'}")
+
+    if MAKE_PRICE_VIOLINS:
+        print("Generating violin plots of Price by Step per Resource Type...")
+        plot_price_violins_by_step_per_type(
+            bids_long,
+            out_dir=OUTPUT_DIR,
+            steps=None,                # or list(range(1, 11)) to limit steps
+            clip_quantiles=(0.01, 0.99),  # set to None to disable clipping
+            max_types=None             # or an int to limit how many types
+        )
+        print(f"✅ Violins saved under: {OUTPUT_DIR / 'price_violins'}")
+
+    print("Done.")
 
 if __name__ == "__main__":
     main()

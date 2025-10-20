@@ -2,39 +2,24 @@
 """
 add_resource_type.py
 
-This script:
-1. Scans nested ZIPs (outer ZIPs containing inner ZIPs) for CSVs with
-   'SCED_Gen_Resource_Data' in their filenames.
-2. Extracts the first-found mapping of {Resource Name -> Fuel}.
-3. Amends each target CSV (where first column = 'Resource Name') by adding
-   a 'Resource Type' column with the fuel type.
-4. Writes amended CSVs to the output directory.
+- Scans nested ZIPs (outer ZIPs containing inner ZIPs) for CSVs with
+  'SCED_Gen_Resource_Data' in their filenames and builds a first-match map
+  {Resource Name -> Fuel}.
+- Amends target CSVs named 'aggregation_*.csv' (first column = 'Resource Name',
+  remaining columns are timestamps) by inserting a 'Resource Type' column
+  after 'Resource Name'.
 """
 
 # ==========================================================
 # ----------- CONFIGURATION SECTION (EDIT THESE) -----------
 # ==========================================================
-
-# Path to your target CSVs (each starting with "Resource Name")
-TARGET_DIR = "/path/to/target_csvs"
-
-# Path to the root directory that contains the outer ZIP files
-ZIP_ROOT = "/path/to/zip_tree"
-
-# Path where amended CSVs will be written
-OUT_DIR = "/path/to/output_csvs"
-
-# If True, overwrites target CSVs directly
-INPLACE = False
-
-# Optional: limit the number of outer zips processed for faster testing
-LIMIT_ZIPS = None  # e.g. 3 or None for no limit
-
-# ==========================================================
-# --------------------- SCRIPT LOGIC -----------------------
+TARGET_DIR = "/path/to/target_csvs"   # directory with aggregation_*.csv
+ZIP_ROOT   = "/path/to/zip_tree"      # directory containing outer ZIPs
+OUT_DIR    =  "/path/to/output_csvs"  # where amended CSVs are written
+INPLACE    = False                    # True = overwrite target files
+LIMIT_ZIPS = None                     # e.g., 3 for quick testing, or None
 # ==========================================================
 
-import os
 import sys
 import csv
 import io
@@ -51,7 +36,7 @@ FUEL_COL_CANDIDATES = [
 ]
 
 TARGET_RESOURCE_COL = "Resource Name"
-OUTPUT_FUEL_COL = "Resource Type"
+OUTPUT_FUEL_COL    = "Resource Type"
 
 
 def best_column(df_columns, candidates):
@@ -68,6 +53,7 @@ def best_column(df_columns, candidates):
 
 
 def read_sced_csv_from_bytes(data: bytes) -> pd.DataFrame | None:
+    # Try common delimiters
     for sep in [",", "|", "\t", ";"]:
         try:
             df = pd.read_csv(io.BytesIO(data), sep=sep, dtype=str, low_memory=False)
@@ -79,10 +65,10 @@ def read_sced_csv_from_bytes(data: bytes) -> pd.DataFrame | None:
 
 
 def build_resource_fuel_map(zip_root: Path, limit: int | None = None) -> dict[str, str]:
-    mapping = {}
+    mapping: dict[str, str] = {}
     processed_outer = 0
-
     outer_zips = sorted([p for p in zip_root.rglob("*.zip") if p.is_file()])
+
     for outer_zip_path in outer_zips:
         if limit is not None and processed_outer >= limit:
             break
@@ -95,6 +81,10 @@ def build_resource_fuel_map(zip_root: Path, limit: int | None = None) -> dict[st
                         continue
                     try:
                         inner_bytes = outer_z.read(inner_name)
+                    except Exception:
+                        continue
+
+                    try:
                         with ZipFile(io.BytesIO(inner_bytes), "r") as inner_z:
                             csv_members = [
                                 m for m in inner_z.namelist()
@@ -104,29 +94,55 @@ def build_resource_fuel_map(zip_root: Path, limit: int | None = None) -> dict[st
                             for csv_name in csv_members:
                                 try:
                                     csv_bytes = inner_z.read(csv_name)
-                                    df = read_sced_csv_from_bytes(csv_bytes)
                                 except Exception:
                                     continue
+                                df = read_sced_csv_from_bytes(csv_bytes)
                                 if df is None or df.empty:
                                     continue
+
                                 res_col = best_column(df.columns, RESOURCE_COL_CANDIDATES)
                                 fuel_col = best_column(df.columns, FUEL_COL_CANDIDATES)
                                 if res_col is None or fuel_col is None:
                                     continue
+
                                 res_series = df[res_col].astype(str).str.strip()
                                 fuel_series = df[fuel_col].astype(str).str.strip()
+
                                 for r, f in zip(res_series, fuel_series):
                                     if not r or r.lower() in ("nan", "none"):
                                         continue
                                     if not f or f.lower() in ("nan", "none"):
                                         continue
+                                    # First match wins
                                     if r not in mapping:
                                         mapping[r] = f
+                    except BadZipFile:
+                        continue
                     except Exception:
                         continue
         except BadZipFile:
             continue
+        except Exception:
+            continue
+
     return mapping
+
+
+def ensure_resource_name_first(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename/position the resource column so that TARGET_RESOURCE_COL is first."""
+    if df.columns[0] == TARGET_RESOURCE_COL:
+        return df
+    # Try to find a column that matches "Resource Name" intent and move/rename it
+    guess = best_column(df.columns, [TARGET_RESOURCE_COL] + RESOURCE_COL_CANDIDATES)
+    if guess is None:
+        raise ValueError(f"Missing '{TARGET_RESOURCE_COL}' or equivalent first column.")
+    if guess != TARGET_RESOURCE_COL:
+        df = df.rename(columns={guess: TARGET_RESOURCE_COL})
+    # Move to front if not already
+    cols = list(df.columns)
+    cols.remove(TARGET_RESOURCE_COL)
+    df = df[[TARGET_RESOURCE_COL] + cols]
+    return df
 
 
 def amend_target_csv(target_path: Path, res2fuel: dict[str, str], inplace: bool, out_dir: Path | None):
@@ -134,49 +150,56 @@ def amend_target_csv(target_path: Path, res2fuel: dict[str, str], inplace: bool,
     if df.empty:
         amended = df
     else:
-        first_col = df.columns[0]
-        if first_col != TARGET_RESOURCE_COL:
-            guess = best_column(df.columns, [TARGET_RESOURCE_COL])
-            if guess:
-                df = df.rename(columns={guess: TARGET_RESOURCE_COL})
-        if TARGET_RESOURCE_COL not in df.columns:
-            raise ValueError(f"{target_path.name}: Missing '{TARGET_RESOURCE_COL}' column.")
+        df = ensure_resource_name_first(df)
+
+        # Build Resource Type from map; Unknown if not found
         resource_types = df[TARGET_RESOURCE_COL].astype(str).str.strip().map(lambda r: res2fuel.get(r, "Unknown"))
+
         if OUTPUT_FUEL_COL in df.columns:
             df[OUTPUT_FUEL_COL] = resource_types
             amended = df
         else:
             amended = df.copy()
             amended.insert(1, OUTPUT_FUEL_COL, resource_types)
+
+    # Write
     if inplace:
         amended.to_csv(target_path, index=False, quoting=csv.QUOTE_MINIMAL)
     else:
+        assert out_dir is not None
         out_dir.mkdir(parents=True, exist_ok=True)
         amended.to_csv(out_dir / target_path.name, index=False, quoting=csv.QUOTE_MINIMAL)
 
 
 def main():
     target_dir = Path(TARGET_DIR)
-    zip_root = Path(ZIP_ROOT)
-    out_dir = Path(OUT_DIR)
+    zip_root   = Path(ZIP_ROOT)
+    out_dir    = Path(OUT_DIR)
 
     if not target_dir.exists() or not zip_root.exists():
-        print("Check your directory paths at the top of the script!", file=sys.stderr)
+        print("Check your paths at the top of the script.", file=sys.stderr)
         sys.exit(1)
 
     print("Building Resource->Fuel map from SCED ZIPs...")
     res2fuel = build_resource_fuel_map(zip_root, LIMIT_ZIPS)
-    print(f"Found {len(res2fuel)} resource-fuel pairs")
+    print(f"Found {len(res2fuel)} unique resources with fuels.")
 
-    target_csvs = sorted(target_dir.glob("*.csv"))
+    # ONLY process files named aggregation_*.csv
+    target_csvs = sorted(target_dir.glob("aggregation_*.csv"))
+    if not target_csvs:
+        print(f"No files matching 'aggregation_*.csv' in {target_dir}", file=sys.stderr)
+        sys.exit(0)
+
+    amended = 0
     for csv_path in target_csvs:
         try:
             amend_target_csv(csv_path, res2fuel, INPLACE, out_dir)
+            amended += 1
             print(f"✓ Amended {csv_path.name}")
         except Exception as e:
             print(f"[WARN] Skipped {csv_path.name}: {e}", file=sys.stderr)
 
-    print("Done.")
+    print(f"Done. Amended {amended}/{len(target_csvs)} files.")
 
 
 if __name__ == "__main__":

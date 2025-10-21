@@ -6,7 +6,7 @@ Generates per day:
   2) SCED step price violin plots (by fuel)
   3) SCED step normalized-bid line plot (by fuel):
        - Normalize each aggregation_SCED1_Curve-MW<k>.csv by aggregation_HSL.csv
-       - Save normalized CSVs alongside inputs
+       - Save normalized CSVs back into the day folder
        - Plot average normalized bid vs step, one line per fuel
 
 Input (from your extractor step):
@@ -29,19 +29,16 @@ PLOTS_DIR/
       normalized_bids_by_stage.png
       normalized_bids_by_stage.csv
 
-Notes:
-- Wide format expected:
+Assumptions:
+- Wide format:
     col0 = "Resource Name"
     col1 = "Resource Type"
     col2+ = 5-minute timestamps as column headers
-- Base Point hourly agg:
-    "mean" -> hourly average MW (typical for instantaneous base point)
-    "mwh"  -> sum(MW) * (5/60) => MWh per hour
 """
 
 from __future__ import annotations
 from pathlib import Path
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, Tuple, List
 import re
 
 import pandas as pd
@@ -51,14 +48,12 @@ import matplotlib.pyplot as plt
 # ===================== EDIT THESE =====================
 ROOT_DIR  = r"/path/to/output_root"   # contains YYYY-MM-DD subfolders
 PLOTS_DIR = r"/path/to/plots_out"     # results written here, mirrored per-day
-# Base Point controls
-BP_AGG_MODE = "mean"                  # "mean" or "mwh"
-BP_SAVE_HOURLY_CSV = True             # write the hourly pivot per day
-# SCED price violins
-SCED_SAVE_VALUES_CSV = False          # write flattened per-fuel values per step
+# Optional toggles (leave as-is unless you want different behavior)
+BP_AGG_MODE = "mean"                  # "mean" (MW) or "mwh" (energy)
+BP_SAVE_HOURLY_CSV = True             # write hourly pivot per day
+SCED_SAVE_VALUES_CSV = False          # write per-step flattened price values
 VIOLIN_MIN_SAMPLES = 1                # min samples per fuel to draw a violin
-# SCED normalized-bids (MW/HSL) summary output
-SAVE_NORMALIZED_SUMMARY_CSV = True
+SAVE_NORMALIZED_SUMMARY_CSV = True    # write the per-day summary used for line plot
 # ======================================================
 
 PRICE_STEP_PATTERN = re.compile(r"aggregation_SCED1_Curve-Price(\d+)\.csv$", re.IGNORECASE)
@@ -282,14 +277,14 @@ def normalize_mw_by_hsl(stage_df: pd.DataFrame, hsl_df: pd.DataFrame) -> pd.Data
     """
     Elementwise normalization with strict alignment:
       - Match rows by Resource Name (case/whitespace tolerant).
-      - Match columns by timestamp headers (intersection only, order-agnostic; output chronological).
-      - Return a wide frame: Resource Name, Resource Type, then the common timestamps with values = MW/HSL.
-      - HSL<=0 or NaN -> NaN in result (no divide-by-zero).
+      - Match columns by timestamp headers (intersection only, chronological).
+      - Return wide frame: Resource Name, Resource Type, then common timestamps as MW/HSL.
+      - HSL<=0 or NaN -> NaN (avoid divide-by-zero).
     """
     s_name, s_type = normalize_key_columns(stage_df)
     h_name, h_type = normalize_key_columns(hsl_df)
 
-    # --- Normalize resource-name keys (case/whitespace tolerant) ---
+    # Normalize resource-name keys (casefolded, trimmed)
     def norm_key(s: pd.Series) -> pd.Series:
         return s.astype(str).str.strip().str.casefold()
 
@@ -298,47 +293,43 @@ def normalize_mw_by_hsl(stage_df: pd.DataFrame, hsl_df: pd.DataFrame) -> pd.Data
     stage["_key"] = norm_key(stage[s_name])
     hsl["_key"]   = norm_key(hsl[h_name])
 
-    # If there are duplicate resource names, keep the first occurrence (or change to .groupby("_key").sum() if desired)
+    # If duplicates exist, keep first occurrence (customize if needed)
     stage = stage.drop_duplicates(subset=["_key"], keep="first")
     hsl   = hsl.drop_duplicates(subset=["_key"], keep="first")
 
     stage = stage.set_index("_key")
     hsl   = hsl.set_index("_key")
 
-    # --- Find common timestamp columns (intersection only) ---
+    # Timestamp intersections
     s_ts = detect_timestamp_columns(stage.reset_index(), (s_name, s_type))
     h_ts = detect_timestamp_columns(hsl.reset_index(),   (h_name, h_type))
     common_ts = sorted(set(s_ts).intersection(h_ts), key=lambda c: pd.to_datetime(c))
     if not common_ts:
         raise ValueError("No overlapping timestamp columns between MW stage and HSL.")
 
-    # --- Find common resource rows (intersection only) ---
+    # Common rows (resources)
     idx_common = stage.index.intersection(hsl.index)
     if idx_common.empty:
         raise ValueError("No overlapping Resource Name rows between MW stage and HSL (after normalization).")
 
-    # --- Slice to the aligned blocks, same order of rows and columns on both sides ---
+    # Aligned numeric blocks
     stage_block = stage.loc[idx_common, common_ts].apply(pd.to_numeric, errors="coerce")
     hsl_block   = hsl.loc[idx_common,   common_ts].apply(pd.to_numeric, errors="coerce")
 
-    # --- Safe elementwise division (only where HSL>0 and finite) ---
     with np.errstate(divide="ignore", invalid="ignore"):
         norm_vals = np.where(np.isfinite(hsl_block.values) & (hsl_block.values > 0.0),
                              stage_block.values / hsl_block.values,
                              np.nan)
 
-    # --- Compose output with original display names & fuel from the stage MW table ---
-    # Map key -> original (display) name from the stage file; fall back to key if missing.
-    key_to_name = stage.loc[idx_common, s_name].astype(str).fillna("").replace("", np.nan)
-    key_to_name = key_to_name.where(key_to_name.notna(), other=idx_common)
-    key_to_type = stage.loc[idx_common, s_type].astype(str).fillna("Unknown")
+    # Compose output with display names and fuel from the stage file
+    disp_names = stage.loc[idx_common, s_name].astype(str)
+    fuel_types = stage.loc[idx_common, s_type].astype(str).fillna("Unknown")
 
     out = pd.DataFrame(norm_vals, index=idx_common, columns=common_ts)
-    out.insert(0, "Resource Type", key_to_type.values)
-    out.insert(0, "Resource Name", key_to_name.values)
+    out.insert(0, "Resource Type", fuel_types.values)
+    out.insert(0, "Resource Name", disp_names.values)
     out.reset_index(drop=True, inplace=True)
     return out
-
 
 def average_normalized_by_fuel(norm_df: pd.DataFrame) -> Dict[str, float]:
     """Average across all resources & timestamps for each fuel type -> scalar per fuel."""
@@ -346,9 +337,7 @@ def average_normalized_by_fuel(norm_df: pd.DataFrame) -> Dict[str, float]:
     ts_cols = detect_timestamp_columns(norm_df, (name_col, type_col))
     vals = norm_df[ts_cols].apply(pd.to_numeric, errors="coerce")
     vals.insert(0, "Resource Type", norm_df[type_col].astype(str).fillna("Unknown"))
-    # mean across rows and timestamps (ignore NaN)
     by_fuel = vals.groupby("Resource Type", dropna=False).mean(numeric_only=True).mean(axis=1, numeric_only=True)
-    # Return as dict
     return {str(k): float(v) for k, v in by_fuel.sort_index().items()}
 
 def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summary_csv: bool) -> None:
@@ -362,7 +351,6 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
     day = day_dir.name
     hsl_path = day_dir / "aggregation_HSL.csv"
     if not hsl_path.exists():
-        # fallback
         matches = list(day_dir.glob("*HSL*.csv"))
         if not matches:
             print(f"[INFO] {day}: no HSL file; skipping normalized MW lines.")
@@ -388,7 +376,6 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
         return int(m.group(1)) if m else 1_000_000
     mw_files = sorted(mw_files, key=step_key)
 
-    # Per-step averages per fuel
     summary: Dict[int, Dict[str, float]] = {}
 
     for stage_csv in mw_files:
@@ -407,7 +394,6 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
             continue
 
         # Save normalized CSV back into inputs folder
-        suffix = f"{step_num}" if step_num is not None else "X"
         norm_path = day_dir / f"{stage_csv.stem}_normalized.csv"
         try:
             norm_df.to_csv(norm_path, index=False)
@@ -427,10 +413,7 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
     # Assemble summary table: rows=step, cols=fuels (sorted)
     all_fuels = sorted({fuel for d in summary.values() for fuel in d.keys()})
     steps_sorted = sorted(summary.keys())
-    data = []
-    for s in steps_sorted:
-        row = [summary[s].get(fuel, np.nan) for fuel in all_fuels]
-        data.append(row)
+    data = [[summary[s].get(fuel, np.nan) for fuel in all_fuels] for s in steps_sorted]
     summary_df = pd.DataFrame(data, index=steps_sorted, columns=all_fuels)
 
     # Plot: lines per fuel across steps

@@ -280,54 +280,65 @@ def process_sced_violins_day(day_dir: Path, plots_root: Path, save_values_csv: b
 # =========================================
 def normalize_mw_by_hsl(stage_df: pd.DataFrame, hsl_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Returns a normalized wide dataframe with:
-      - col0: Resource Name (matching intersection)
-      - col1: Resource Type (from stage_df for those resources)
-      - col2+: timestamps (intersection of parseable headers in both), values = stage / hsl
-    Any division where HSL <= 0 or NaN => NaN result.
+    Elementwise normalization with strict alignment:
+      - Match rows by Resource Name (case/whitespace tolerant).
+      - Match columns by timestamp headers (intersection only, order-agnostic; output chronological).
+      - Return a wide frame: Resource Name, Resource Type, then the common timestamps with values = MW/HSL.
+      - HSL<=0 or NaN -> NaN in result (no divide-by-zero).
     """
     s_name, s_type = normalize_key_columns(stage_df)
     h_name, h_type = normalize_key_columns(hsl_df)
 
-    # Intersection of resources by Resource Name
-    stage_df = stage_df.copy()
-    hsl_df   = hsl_df.copy()
-    stage_df[s_name] = stage_df[s_name].astype(str).str.strip()
-    hsl_df[h_name]   = hsl_df[h_name].astype(str).str.strip()
+    # --- Normalize resource-name keys (case/whitespace tolerant) ---
+    def norm_key(s: pd.Series) -> pd.Series:
+        return s.astype(str).str.strip().str.casefold()
 
-    stage_df = stage_df.set_index(s_name)
-    hsl_df   = hsl_df.set_index(h_name)
+    stage = stage_df.copy()
+    hsl   = hsl_df.copy()
+    stage["_key"] = norm_key(stage[s_name])
+    hsl["_key"]   = norm_key(hsl[h_name])
 
-    common_units = stage_df.index.intersection(hsl_df.index)
-    if common_units.empty:
-        raise ValueError("No overlapping resources (Resource Name) between MW stage and HSL.")
+    # If there are duplicate resource names, keep the first occurrence (or change to .groupby("_key").sum() if desired)
+    stage = stage.drop_duplicates(subset=["_key"], keep="first")
+    hsl   = hsl.drop_duplicates(subset=["_key"], keep="first")
 
-    stage_df = stage_df.loc[common_units]
-    hsl_df   = hsl_df.loc[common_units]
+    stage = stage.set_index("_key")
+    hsl   = hsl.set_index("_key")
 
-    # Timestamp intersections (parseable headers only)
-    s_ts = detect_timestamp_columns(stage_df.reset_index(), (s_name, s_type))
-    h_ts = detect_timestamp_columns(hsl_df.reset_index(), (h_name, h_type))
+    # --- Find common timestamp columns (intersection only) ---
+    s_ts = detect_timestamp_columns(stage.reset_index(), (s_name, s_type))
+    h_ts = detect_timestamp_columns(hsl.reset_index(),   (h_name, h_type))
     common_ts = sorted(set(s_ts).intersection(h_ts), key=lambda c: pd.to_datetime(c))
     if not common_ts:
         raise ValueError("No overlapping timestamp columns between MW stage and HSL.")
 
-    # Build numeric arrays
-    s_vals = stage_df[common_ts].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
-    h_vals = hsl_df[common_ts].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+    # --- Find common resource rows (intersection only) ---
+    idx_common = stage.index.intersection(hsl.index)
+    if idx_common.empty:
+        raise ValueError("No overlapping Resource Name rows between MW stage and HSL (after normalization).")
 
-    # Safe division: HSL<=0 or NaN -> NaN
-    with np.errstate(divide='ignore', invalid='ignore'):
-        norm_vals = np.where(np.isfinite(h_vals) & (h_vals > 0.0), s_vals / h_vals, np.nan)
+    # --- Slice to the aligned blocks, same order of rows and columns on both sides ---
+    stage_block = stage.loc[idx_common, common_ts].apply(pd.to_numeric, errors="coerce")
+    hsl_block   = hsl.loc[idx_common,   common_ts].apply(pd.to_numeric, errors="coerce")
 
-    # Compose result frame
-    out = pd.DataFrame(norm_vals, index=common_units, columns=common_ts)
-    # Resource Type from stage_df (aligned on index)
-    type_series = stage_df[s_type].astype(str).fillna("Unknown")
-    out.insert(0, "Resource Type", type_series)
-    out.insert(0, "Resource Name", out.index)
+    # --- Safe elementwise division (only where HSL>0 and finite) ---
+    with np.errstate(divide="ignore", invalid="ignore"):
+        norm_vals = np.where(np.isfinite(hsl_block.values) & (hsl_block.values > 0.0),
+                             stage_block.values / hsl_block.values,
+                             np.nan)
+
+    # --- Compose output with original display names & fuel from the stage MW table ---
+    # Map key -> original (display) name from the stage file; fall back to key if missing.
+    key_to_name = stage.loc[idx_common, s_name].astype(str).fillna("").replace("", np.nan)
+    key_to_name = key_to_name.where(key_to_name.notna(), other=idx_common)
+    key_to_type = stage.loc[idx_common, s_type].astype(str).fillna("Unknown")
+
+    out = pd.DataFrame(norm_vals, index=idx_common, columns=common_ts)
+    out.insert(0, "Resource Type", key_to_type.values)
+    out.insert(0, "Resource Name", key_to_name.values)
     out.reset_index(drop=True, inplace=True)
     return out
+
 
 def average_normalized_by_fuel(norm_df: pd.DataFrame) -> Dict[str, float]:
     """Average across all resources & timestamps for each fuel type -> scalar per fuel."""

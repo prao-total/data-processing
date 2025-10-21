@@ -24,11 +24,45 @@ def load_env():
         "other_fuel_veto_thresh": int(os.getenv("OTHER_FUEL_VETO_THRESH", "88")),
     }
 
-# ================= NORMALIZATION =================
+# ===================== UTIL: Column resolution =====================
+def _norm_header(s: str) -> str:
+    # Upper-case, remove all non-alphanumerics (spaces, underscores, punctuation)
+    return re.sub(r'[^A-Z0-9]', '', str(s).upper())
+
+def _resolve_columns(df: pd.DataFrame, need: dict) -> dict:
+    """
+    need: {"CANONICAL": ["candidate1", "candidate2", ...]}
+    returns mapping {"CANONICAL": <actual column in df>}
+    Raises KeyError with a helpful message if any are missing.
+    """
+    norm_to_actual = {_norm_header(c): c for c in df.columns}
+    out = {}
+    missing = []
+    for canon, candidates in need.items():
+        found = None
+        for cand in candidates:
+            key = _norm_header(cand)
+            if key in norm_to_actual:
+                found = norm_to_actual[key]
+                break
+        if not found:
+            missing.append(f"{canon} (tried {candidates})")
+        else:
+            out[canon] = found
+    if missing:
+        raise KeyError(
+            "cdr_list column(s) not found: "
+            + "; ".join(missing)
+            + f". Available columns: {list(df.columns)}"
+        )
+    return out
+
+# ================= NORMALIZATION / PARSING =================
 GENERIC_SUFFIXES = [
     r"\bLLC\b", r"\bINC\b", r"\bENERGY\b", r"\bPOWER\b", r"\bGENERATION\b", r"\bCOMPANY\b",
     r"\bSTATION\b", r"\bPLANT\b", r"\bHOLDINGS\b", r"\bPARTNERS\b", r"\bLP\b", r"\bCO\b"
 ]
+# NOTE: we do not strip unit-number tokens here; we do that in plant_base()
 UNIT_PATTERNS = [r"\bUNIT\s*\d+\b", r"\bU\s*[-]?\s*\d+\b", r"\bBLOCK\s*\d+\b", r"\bSTG?\s*\d+\b", r"\bCT\s*\d+\b", r"\bST\s*\d+\b"]
 ABBREV_MAP = {
     "&": " AND ",
@@ -77,7 +111,7 @@ def extract_unit_numbers(raw: str) -> List[int]:
             except:
                 pass
 
-    # Roman numerals after UNIT/Block/etc.
+    # Roman numerals after UNIT/U/CT/ST/BLOCK
     for pat in [r"\bUNIT\s+(I{1,3}|IV|V|VI{0,3}|IX|X)\b",
                 r"\bU\s*[-]?\s*(I{1,3}|IV|V|VI{0,3}|IX|X)\b",
                 r"\bCT\s*[-]?\s*(I{1,3}|IV|V|VI{0,3}|IX|X)\b",
@@ -97,6 +131,7 @@ def normalize(s: str) -> str:
     for k, v in ABBREV_MAP.items():
         s = s.replace(k, v)
     s = re.sub(r"[^A-Z0-9\s]", " ", s)
+    # remove generic suffixes but NOT unit-number tokens here
     for pat in GENERIC_SUFFIXES:
         s = re.sub(pat, " ", s)
     s = re.sub(r"\s+", " ", s).strip()
@@ -140,30 +175,48 @@ def load_gas_resources(excel_path: str) -> pd.DataFrame:
     gas["PLANT_BASE_CDR"] = gas["CDR Name"].map(plant_base) if "CDR Name" in gas.columns else ""
     return gas
 
-def load_cdr_list(cdr_path: str) -> pd.DataFrame:
+def load_cdr_list(cdr_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Must contain columns (case-insensitive): UNIT CODE, UNIT NAME, FUEL
-    Returns NG-only subset, with normalized helpers.
+    Must contain UNIT CODE, UNIT NAME, FUEL (any common header variant).
+    Returns (cdr_ng, cdr_full_std) where:
+      - cdr_ng = Natural Gas rows only (strict NG universe, with CDR_* columns)
+      - cdr_full_std = full CDR (all fuels), standardized to UNIT_CODE/UNIT_NAME/FUEL
     """
-    cdr = pd.read_csv(cdr_path)
-    cols = {c.upper().strip(): c for c in cdr.columns}
-    need = ["UNIT CODE", "UNIT NAME", "FUEL"]
-    missing = [k for k in need if k not in cols]
-    if missing:
-        raise ValueError(f"cdr_list missing columns: {missing}. Found: {list(cdr.columns)}")
-    cdr = cdr.rename(columns={
-        cols["UNIT CODE"]: "CDR_UNIT_CODE",
-        cols["UNIT NAME"]: "CDR_UNIT_NAME",
-        cols["FUEL"]: "CDR_FUEL",
+    cdr_full = pd.read_csv(cdr_path)
+    # Accept common header variants
+    need = {
+        "UNIT_CODE": ["UNIT CODE", "UNIT_CODE", "UNITCODE", "ERCOT UNIT CODE", "ERCOT_UNIT_CODE", "CDR_UNIT_CODE"],
+        "UNIT_NAME": ["UNIT NAME", "UNIT_NAME", "UNITNAME", "CDR UNIT NAME", "CDR_UNIT_NAME", "NAME"],
+        "FUEL":      ["FUEL", "PRIMARY FUEL", "FUEL TYPE", "FUEL_TYPE"],
+    }
+    cols = _resolve_columns(cdr_full, need)
+
+    # Standardize
+    cdr_full_std = cdr_full.rename(columns={
+        cols["UNIT_CODE"]: "UNIT_CODE",
+        cols["UNIT_NAME"]: "UNIT_NAME",
+        cols["FUEL"]: "FUEL",
+    }).copy()
+
+    cdr_full_std["UNIT_CODE"] = cdr_full_std["UNIT_CODE"].astype(str).str.strip()
+    cdr_full_std["UNIT_NAME"] = cdr_full_std["UNIT_NAME"].astype(str).str.strip()
+    cdr_full_std["FUEL"] = cdr_full_std["FUEL"].astype(str).str.strip().str.upper()
+
+    # Add helpers
+    cdr_full_std["UNIT_NAME_N"] = cdr_full_std["UNIT_NAME"].map(normalize)
+    cdr_full_std["PLANT_BASE"] = cdr_full_std["UNIT_NAME"].map(plant_base)
+
+    # NG-only universe for matching
+    cdr_ng = cdr_full_std[cdr_full_std["FUEL"].isin(["GAS", "NATURAL GAS"])].copy()
+
+    # For compatibility with rest of code (NG view gets CDR_* names)
+    cdr_ng = cdr_ng.rename(columns={
+        "UNIT_CODE": "CDR_UNIT_CODE",
+        "UNIT_NAME": "CDR_UNIT_NAME",
+        "UNIT_NAME_N": "CDR_UNIT_NAME_N",
+        "PLANT_BASE": "CDR_PLANT_BASE",
     })
-    cdr["CDR_UNIT_CODE"] = cdr["CDR_UNIT_CODE"].astype(str).str.strip()
-    cdr["CDR_UNIT_NAME"] = cdr["CDR_UNIT_NAME"].astype(str).str.strip()
-    cdr["CDR_FUEL"] = cdr["CDR_FUEL"].astype(str).str.strip().str.upper()
-    cdr["CDR_UNIT_NAME_N"] = cdr["CDR_UNIT_NAME"].map(normalize)
-    cdr["CDR_PLANT_BASE"] = cdr["CDR_UNIT_NAME"].map(plant_base)
-    # NG subset for matching universe
-    cdr_ng = cdr[cdr["CDR_FUEL"].isin(["GAS", "NATURAL GAS"])].copy()
-    return cdr_ng, cdr  # (ng_only, full_for_veto)
+    return cdr_ng, cdr_full_std
 
 def apply_manual_crosswalk(names: pd.Series, manual_path: str) -> Dict[str, str]:
     try:
@@ -175,7 +228,7 @@ def apply_manual_crosswalk(names: pd.Series, manual_path: str) -> Dict[str, str]
         print(f"⚠️ Manual crosswalk load failed: {e}")
     return {}
 
-# ======== Alias & Corpus Builders (massive recall focus) ========
+# ======== Alias & Corpus Builders (recall-focused) ========
 def generate_unit_aliases(plant_str: str, unit_nums: List[int]) -> List[str]:
     """
     Given a plant base and list of unit numbers, generate robust aliases:
@@ -195,7 +248,7 @@ def generate_unit_aliases(plant_str: str, unit_nums: List[int]) -> List[str]:
     return list(dict.fromkeys(aliases))  # unique, preserve order
 
 def build_unit_number_index(cdr_ng: pd.DataFrame) -> Dict[str, List[int]]:
-    """Map ERCOT unit code -> list of unit numbers inferred from CDR name."""
+    """Map ERCOT unit code -> list of unit numbers inferred from CDR NG unit name."""
     idx = {}
     for _, r in cdr_ng.iterrows():
         code = r["CDR_UNIT_CODE"]
@@ -207,28 +260,19 @@ def build_unit_number_index(cdr_ng: pd.DataFrame) -> Dict[str, List[int]]:
 def build_alias_maps_rich(gas_df: pd.DataFrame, cdr_ng: pd.DataFrame, cdr_full: pd.DataFrame):
     """
     Build two alias maps (gas vs other) with 1:1 enforcement, using:
-    - CDR NG unit names
+    - CDR NG unit names (authoritative)
     - Gas fields (Name/CDR Name/INR code/code)
     - Generated aliases from plant base + unit numbers
     """
     gas_units = set(gas_df["ERCOT_UnitCode"].astype(str))
 
-    # Full CDR split for non-gas veto
-    cols = {c.upper().strip(): c for c in cdr_full.columns}
-    cdr_full_std = cdr_full.rename(columns={
-        cols["UNIT CODE"]: "UNIT_CODE",
-        cols["UNIT NAME"]: "UNIT_NAME",
-        cols["FUEL"]: "FUEL",
-    }).copy()
-    cdr_full_std["FUEL"] = cdr_full_std["FUEL"].astype(str).str.strip().str.upper()
-    cdr_other = cdr_full_std[~cdr_full_std["FUEL"].isin(["GAS", "NATURAL GAS"])].copy()
-    cdr_other["UNIT_CODE"] = cdr_other["UNIT_CODE"].astype(str).str.strip()
-    cdr_other["UNIT_NAME"] = cdr_other["UNIT_NAME"].astype(str).str.strip()
+    # Non-gas side (for veto)
+    cdr_other = cdr_full[~cdr_full["FUEL"].isin(["GAS", "NATURAL GAS"])].copy()
 
     # NG subset intersected with gas units
     cdr_gas = cdr_ng[cdr_ng["CDR_UNIT_CODE"].isin(gas_units)].copy()
 
-    # Precompute plant base and unit numbers for CDR gas units
+    # Precompute unit numbers and plant base for gas
     unit_num_idx = build_unit_number_index(cdr_gas)
     cdr_gas["PLANT_BASE"] = cdr_gas["CDR_UNIT_NAME"].map(plant_base)
 
@@ -242,7 +286,7 @@ def build_alias_maps_rich(gas_df: pd.DataFrame, cdr_ng: pd.DataFrame, cdr_full: 
                 return
             alias_to_units.setdefault(k, set()).add(unit)
 
-        # Authoritative CDR names (gas)
+        # Authoritative CDR names
         for _, r in cdr_gas.iterrows():
             u = r["CDR_UNIT_CODE"]
             add(r["CDR_UNIT_NAME"], u)
@@ -252,7 +296,7 @@ def build_alias_maps_rich(gas_df: pd.DataFrame, cdr_ng: pd.DataFrame, cdr_full: 
             u = str(r.get("ERCOT_UnitCode", "")).strip()
             if not u:
                 continue
-            add(u, u)
+            add(u, u)  # code itself
             for f in ["Name", "CDR Name", "ERCOT_INR Code"]:
                 if f in gas_df.columns:
                     val = r.get(f)
@@ -260,13 +304,10 @@ def build_alias_maps_rich(gas_df: pd.DataFrame, cdr_ng: pd.DataFrame, cdr_full: 
                         continue
                     add(str(val), u)
 
-        # Generated aliases from plant base + unit numbers
-        # First, build mapping unit -> base using whichever we have
+        # Generated aliases using plant base + unit numbers
         unit_to_base = {}
-        # Prefer CDR base if present
         for _, r in cdr_gas.iterrows():
             unit_to_base[r["CDR_UNIT_CODE"]] = r["PLANT_BASE"]
-        # Fall back to gas_df bases
         for _, r in gas_df.iterrows():
             u = str(r.get("ERCOT_UnitCode", "")).strip()
             if u and u not in unit_to_base:
@@ -277,14 +318,14 @@ def build_alias_maps_rich(gas_df: pd.DataFrame, cdr_ng: pd.DataFrame, cdr_full: 
             if not base:
                 continue
             nums = unit_num_idx.get(unit, [])
-            # If no unit number inferred, try heuristics: if code ends with digits
+            # If no inferred unit number, try code suffix or small generic set
             m = re.search(r"(\d+)$", str(unit))
             if not nums and m:
                 try:
                     nums = [int(m.group(1))]
                 except:
                     pass
-            for alias in generate_unit_aliases(base, nums or [1,2,3,4]):  # try a small range if unknown
+            for alias in generate_unit_aliases(base, nums or [1, 2, 3, 4]):
                 add(alias, unit)
 
         return alias_to_units
@@ -316,15 +357,7 @@ def build_alias_maps_rich(gas_df: pd.DataFrame, cdr_ng: pd.DataFrame, cdr_full: 
 def build_fuzzy_corpora(gas_df: pd.DataFrame, cdr_ng: pd.DataFrame, cdr_full: pd.DataFrame):
     gas_units = set(gas_df["ERCOT_UnitCode"].astype(str))
     cdr_gas = cdr_ng[cdr_ng["CDR_UNIT_CODE"].isin(gas_units)].copy()
-
-    cols = {c.upper().strip(): c for c in cdr_full.columns}
-    cdr_full_std = cdr_full.rename(columns={
-        cols["UNIT CODE"]: "UNIT_CODE",
-        cols["UNIT NAME"]: "UNIT_NAME",
-        cols["FUEL"]: "FUEL",
-    }).copy()
-    cdr_full_std["FUEL"] = cdr_full_std["FUEL"].astype(str).str.strip().str.upper()
-    cdr_other = cdr_full_std[~cdr_full_std["FUEL"].isin(["GAS", "NATURAL GAS"])].copy()
+    cdr_other = cdr_full[~cdr_full["FUEL"].isin(["GAS", "NATURAL GAS"])].copy()
 
     def corpus_from(cdr_part, code_col, name_col, include_gas_fields: bool):
         corpus = []
@@ -363,8 +396,8 @@ def best_fuzzy_match(q_norm: str, corpus, k=5):
 def map_resource_names(
     resource_series: pd.Series,
     gas_df: pd.DataFrame,
-    cdr_ng: pd.DataFrame,       # NG-only
-    cdr_full: pd.DataFrame,     # all fuels (for veto)
+    cdr_ng: pd.DataFrame,       # NG-only, standardized (CDR_UNIT_CODE/CDR_UNIT_NAME/...)
+    cdr_full: pd.DataFrame,     # all fuels, standardized (UNIT_CODE/UNIT_NAME/FUEL)
     manual_map: Dict[str, str],
     high_thresh: int = 90,
     review_thresh: int = 70,
@@ -411,11 +444,8 @@ def map_resource_names(
                 chosen = alias_map_gas[q_norm]
                 method = "alias_exact"
             else:
-                # 3) plant-base + unit number prioritization (deterministic)
-                #    try to find aliases that start with the same plant base and unit num variations
-                #    by generating the same alias patterns we used for indexing
+                # 3) plant-base + unit-number deterministic linking
                 if q_base and q_nums:
-                    # generate the same forms and see if any hits exist in alias_map_gas
                     candidates = []
                     for alias in generate_unit_aliases(q_base, q_nums):
                         key = normalize(alias)
@@ -425,13 +455,10 @@ def map_resource_names(
                     if len(candidates) == 1:
                         chosen = candidates[0]
                         method = "plant_base+unitnum_exact"
-                    elif len(candidates) > 1:
-                        # still ambiguous; leave for fuzzy/review
-                        pass
 
-                # 4) (optional) constrained fuzzy with non-gas veto
+                # 4) optional constrained fuzzy (with non-gas veto)
                 if chosen is None and enable_fuzzy and q_norm:
-                    # other-fuel exact veto
+                    # Other-fuel exact veto
                     if q_norm in alias_map_other:
                         out_values.append(original)
                         row = {
@@ -444,7 +471,7 @@ def map_resource_names(
                         }
                         tracker_rows.append(row); uncertain_rows.append(row)
                         continue
-                    # other-fuel fuzzy veto
+                    # Other-fuel fuzzy veto
                     other_top = best_fuzzy_match(q_norm, corpus_other, k=1)
                     other_best = other_top[0] if other_top else None
                     if other_best and other_best[0] >= other_fuel_veto_thresh:
@@ -460,7 +487,7 @@ def map_resource_names(
                         tracker_rows.append(row); uncertain_rows.append(row)
                         continue
 
-                    # gas fuzzy (not vetoed)
+                    # Gas fuzzy (not vetoed)
                     gas_top = best_fuzzy_match(q_norm, corpus_gas, k=5)
                     if gas_top:
                         best_score, best_unit, best_field, best_raw = gas_top[0]
@@ -502,7 +529,7 @@ def map_resource_names(
     return pd.Series(out_values), pd.DataFrame(tracker_rows), pd.DataFrame(uncertain_rows)
 
 # ================= COVERAGE =================
-def coverage_report(gas_df: pd.DataFrame, tracker_df: pd.DataFrame) -> pd.DataFrame:
+def coverage_report(gas_df: pd.DataFrame, tracker_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     gas_units = set(gas_df["ERCOT_UnitCode"].astype(str))
     matched_units = set(tracker_df.loc[tracker_df["Was Replaced"] == True, "Matched Name"].astype(str))
     missing = sorted(gas_units - matched_units)
@@ -558,7 +585,9 @@ def update_resource_names(
     tracker_df.to_csv(tracker_path, index=False)
     uncertain_df.to_csv(review_path, index=False)
     cov_df.to_csv(coverage_path, index=False)
-    missing_df[["ERCOT_UnitCode","Name","CDR Name","ERCOT_INR Code"]].to_csv(missing_gas_path, index=False)
+    # Keep helpful context fields if present
+    keep_cols = [c for c in ["ERCOT_UnitCode","Name","CDR Name","ERCOT_INR Code","County","CDR Zone"] if c in missing_df.columns]
+    (missing_df[keep_cols] if keep_cols else missing_df).to_csv(missing_gas_path, index=False)
 
     print(f"✅ Updated aggregated file: {output_path}")
     print(f"📊 Tracker file: {tracker_path}")
@@ -573,7 +602,7 @@ def main():
     gas = load_gas_resources(cfg["gas_file"])
     print(f"   Gas units: {len(gas)}")
 
-    print("🔄 Loading CDR list...")
+    print("🔄 Loading CDR list (robust headers)...")
     cdr_ng, cdr_full = load_cdr_list(cfg["cdr_file"])
     print(f"   CDR NG rows: {len(cdr_ng)}, Full CDR rows: {len(cdr_full)}")
 

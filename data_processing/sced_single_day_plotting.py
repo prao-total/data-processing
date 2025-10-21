@@ -51,6 +51,7 @@ BP_AGG_MODE = "mean"                  # "mean" or "mwh"
 BP_SAVE_HOURLY_CSV = True             # write the hourly pivot per day
 # SCED violin controls
 SCED_SAVE_VALUES_CSV = False          # write flattened per-fuel values per step
+VIOLIN_MIN_SAMPLES = 1                # require at least this many samples per fuel to include in a violin
 # ======================================================
 
 STEP_PATTERN = re.compile(r"aggregation_SCED1_Curve-Price(\d+)\.csv$", re.IGNORECASE)
@@ -72,7 +73,7 @@ def detect_timestamp_columns(df: pd.DataFrame, keys: Tuple[str, str]) -> List[st
     name_col, type_col = keys
     ts_cols: List[str] = []
     for col in df.columns:
-        if col in (name_col, type_col): 
+        if col in (name_col, type_col):
             continue
         ts = pd.to_datetime(col, errors="coerce")
         if pd.isna(ts):
@@ -108,9 +109,9 @@ def hourly_by_fuel_from_wide(df: pd.DataFrame, agg_mode: str) -> pd.DataFrame:
     fuel_5min = fuel_5min.groupby(level=0).sum()   # collapse duplicate headers if any
 
     if agg_mode.lower() == "mwh":
-        hourly = fuel_5min.resample("H").sum() * (5.0/60.0)
+        hourly = fuel_5min.resample("h").sum() * (5.0 / 60.0)  # 'h' to avoid FutureWarning
     else:
-        hourly = fuel_5min.resample("H").mean()
+        hourly = fuel_5min.resample("h").mean()
 
     hourly.columns = [str(c) if c is not None else "Unknown" for c in hourly.columns]
     hourly = hourly.reindex(sorted(hourly.columns), axis=1)
@@ -124,7 +125,7 @@ def plot_base_point_day(day: str, hourly_df: pd.DataFrame, out_png: Path, agg_mo
     day_start = pd.to_datetime(day)
     day_end   = day_start + pd.Timedelta(days=1)
     hourly_df = hourly_df[(hourly_df.index >= day_start) & (hourly_df.index < day_end)]
-    hourly_df = hourly_df.reindex(pd.date_range(day_start, day_end, freq="H", inclusive="left"), fill_value=0.0)
+    hourly_df = hourly_df.reindex(pd.date_range(day_start, day_end, freq="h", inclusive="left"), fill_value=0.0)
 
     plot_df = hourly_df.copy()
     plot_df.index = plot_df.index.hour  # 0..23
@@ -196,7 +197,8 @@ def load_violin_data_by_fuel(df: pd.DataFrame) -> Dict[str, np.ndarray]:
     for fuel, block in prices.groupby("__fuel__"):
         vals = block[ts_cols].to_numpy().ravel()
         vals = vals[np.isfinite(vals)]
-        out[str(fuel)] = vals
+        # Keep only real numbers; drop empty arrays in the caller
+        out[str(fuel)] = vals.astype(float)
     return out
 
 def plot_violin_step(day: str, step_csv: Path, day_out_dir: Path, save_values_csv: bool) -> None:
@@ -219,8 +221,27 @@ def plot_violin_step(day: str, step_csv: Path, day_out_dir: Path, save_values_cs
         print(f"[INFO] {day}: no data in {step_csv.name}; skipping.")
         return
 
-    fuels = sorted(data_by_fuel.keys())
-    datasets = [data_by_fuel[f] for f in fuels]
+    # Filter out fuels with too few samples to plot
+    fuels_all = sorted(data_by_fuel.keys())
+    fuels = []
+    datasets = []
+    skipped = []
+    for f in fuels_all:
+        arr = data_by_fuel[f]
+        if arr is None or arr.size < VIOLIN_MIN_SAMPLES:
+            skipped.append(f)
+            continue
+        fuels.append(f)
+        datasets.append(arr)
+
+    if skipped:
+        print(f"[INFO] {day}: {step_csv.name} – skipped empty/short fuels: {', '.join(skipped)}")
+
+    # Nothing to plot?
+    if not datasets:
+        title_step = f"SCED Step {step_num}" if step_num is not None else "SCED Step"
+        print(f"[INFO] {day}: {title_step} – no fuels with data; skipping plot.")
+        return
 
     fig, ax = plt.subplots(figsize=(14, 7))
     ax.violinplot(datasets, showmeans=False, showmedians=True, showextrema=True)
@@ -242,9 +263,8 @@ def plot_violin_step(day: str, step_csv: Path, day_out_dir: Path, save_values_cs
 
     if save_values_csv:
         vals_list = []
-        for fuel in fuels:
-            vals = data_by_fuel[fuel]
-            vals_list.append(pd.DataFrame({"fuel": fuel, "price": vals}))
+        for fuel, arr in zip(fuels, datasets):
+            vals_list.append(pd.DataFrame({"fuel": fuel, "price": arr}))
         long_df = pd.concat(vals_list, ignore_index=True)
         out_csv = out_dir / f"step_{suffix}_values.csv"
         long_df.to_csv(out_csv, index=False)

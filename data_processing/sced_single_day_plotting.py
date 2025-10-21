@@ -1,28 +1,33 @@
 #!/usr/bin/env python3
 # sced_single_day_plotting.py
 """
-Generates:
+Generates per day:
   1) Base Point stacked bar plots (hourly by fuel)
   2) SCED step price violin plots (by fuel)
+  3) SCED step normalized-bid line plot (by fuel):
+       - Normalize each aggregation_SCED1_Curve-MW<k>.csv by aggregation_HSL.csv
+       - Save normalized CSVs alongside inputs
+       - Plot average normalized bid vs step, one line per fuel
 
 Input (from your extractor step):
 ROOT_DIR/
   YYYY-MM-DD/
     aggregation_Base_Point.csv
-    aggregation_SCED1_Curve-Price1.csv
-    aggregation_SCED1_Curve-Price2.csv
-    ...
+    aggregation_HSL.csv
+    aggregation_SCED1_Curve-Price1.csv, ...
+    aggregation_SCED1_Curve-MW1.csv, ...
 
 Outputs:
 PLOTS_DIR/
   YYYY-MM-DD/
     base_point_stacked_<agg>.png
-    base_point_hourly_<agg>.csv           # optional
+    base_point_hourly_<agg>.csv         # optional
     sced_violin/
       step_01_violin.png
-      step_01_values.csv                  # optional
-      step_02_violin.png
-      ...
+      step_01_values.csv                # optional
+    sced_normalized/
+      normalized_bids_by_stage.png
+      normalized_bids_by_stage.csv
 
 Notes:
 - Wide format expected:
@@ -36,7 +41,7 @@ Notes:
 
 from __future__ import annotations
 from pathlib import Path
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Optional
 import re
 
 import pandas as pd
@@ -49,12 +54,15 @@ PLOTS_DIR = r"/path/to/plots_out"     # results written here, mirrored per-day
 # Base Point controls
 BP_AGG_MODE = "mean"                  # "mean" or "mwh"
 BP_SAVE_HOURLY_CSV = True             # write the hourly pivot per day
-# SCED violin controls
+# SCED price violins
 SCED_SAVE_VALUES_CSV = False          # write flattened per-fuel values per step
-VIOLIN_MIN_SAMPLES = 1                # require at least this many samples per fuel to include in a violin
+VIOLIN_MIN_SAMPLES = 1                # min samples per fuel to draw a violin
+# SCED normalized-bids (MW/HSL) summary output
+SAVE_NORMALIZED_SUMMARY_CSV = True
 # ======================================================
 
-STEP_PATTERN = re.compile(r"aggregation_SCED1_Curve-Price(\d+)\.csv$", re.IGNORECASE)
+PRICE_STEP_PATTERN = re.compile(r"aggregation_SCED1_Curve-Price(\d+)\.csv$", re.IGNORECASE)
+MW_STEP_PATTERN    = re.compile(r"aggregation_SCED1_Curve-MW(\d+)\.csv$", re.IGNORECASE)
 
 # --------- Shared helpers ---------
 def normalize_key_columns(df: pd.DataFrame) -> Tuple[str, str]:
@@ -84,32 +92,24 @@ def detect_timestamp_columns(df: pd.DataFrame, keys: Tuple[str, str]) -> List[st
     ts_cols = sorted(ts_cols, key=lambda c: pd.to_datetime(c))
     return ts_cols
 
-# --------- Base Point (stacked bar) ---------
+# =========================
+# 1) Base Point (stacked)
+# =========================
 def hourly_by_fuel_from_wide(df: pd.DataFrame, agg_mode: str) -> pd.DataFrame:
-    """
-    Wide 5-min -> hourly by fuel:
-      - sum across resources within each fuel for each 5-min timestamp
-      - resample to hourly (mean MW or MWh)
-    Returns DataFrame indexed by hour (Timestamp), columns = fuels (sorted).
-    """
     name_col, type_col = normalize_key_columns(df)
     ts_cols = detect_timestamp_columns(df, (name_col, type_col))
 
-    # numeric 5-min values, coerce bad to 0
     numeric = df[ts_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
-
-    # Sum across resources per fuel for each 5-min timestamp
     numeric.insert(0, "Resource Type", df[type_col].astype(str).fillna("Unknown"))
     fuel_5min = numeric.groupby("Resource Type", dropna=False).sum(numeric_only=True)
 
-    # index by actual timestamps (columns are the times)
     col_ts = pd.to_datetime(fuel_5min.columns, errors="coerce")
     fuel_5min.columns = col_ts
-    fuel_5min = fuel_5min.T.sort_index()           # index: 5-min timestamps, cols: fuel
-    fuel_5min = fuel_5min.groupby(level=0).sum()   # collapse duplicate headers if any
+    fuel_5min = fuel_5min.T.sort_index()
+    fuel_5min = fuel_5min.groupby(level=0).sum()
 
     if agg_mode.lower() == "mwh":
-        hourly = fuel_5min.resample("h").sum() * (5.0 / 60.0)  # 'h' to avoid FutureWarning
+        hourly = fuel_5min.resample("h").sum() * (5.0 / 60.0)
     else:
         hourly = fuel_5min.resample("h").mean()
 
@@ -121,7 +121,6 @@ def plot_base_point_day(day: str, hourly_df: pd.DataFrame, out_png: Path, agg_mo
     if hourly_df.empty:
         print(f"[WARN] {day}: no hourly data; skipping Base Point plot.")
         return
-    # clamp to that day & ensure a full 24-hour axis
     day_start = pd.to_datetime(day)
     day_end   = day_start + pd.Timedelta(days=1)
     hourly_df = hourly_df[(hourly_df.index >= day_start) & (hourly_df.index < day_end)]
@@ -144,7 +143,6 @@ def plot_base_point_day(day: str, hourly_df: pd.DataFrame, out_png: Path, agg_mo
 
 def process_base_point_day(day_dir: Path, plots_root: Path, agg_mode: str, save_hourly_csv: bool) -> None:
     day = day_dir.name
-    # expected name; allow some flexibility
     csv_path = day_dir / "aggregation_Base_Point.csv"
     if not csv_path.exists():
         matches = list(day_dir.glob("aggregation_Base_Point*.csv")) or list(day_dir.glob("*Base*Point*.csv"))
@@ -181,12 +179,10 @@ def process_base_point_day(day_dir: Path, plots_root: Path, agg_mode: str, save_
     out_png = day_out / f"base_point_stacked_{agg_mode}.png"
     plot_base_point_day(day, hourly, out_png, agg_mode)
 
-# --------- SCED (violin plots) ---------
+# =========================
+# 2) SCED price violins
+# =========================
 def load_violin_data_by_fuel(df: pd.DataFrame) -> Dict[str, np.ndarray]:
-    """
-    Build dict fuel -> flattened vector of all 5-min prices that day
-    (across resources & timestamps), dropping NaN/inf.
-    """
     name_col, type_col = normalize_key_columns(df)
     ts_cols = detect_timestamp_columns(df, (name_col, type_col))
     prices = df[ts_cols].apply(pd.to_numeric, errors="coerce")
@@ -197,12 +193,11 @@ def load_violin_data_by_fuel(df: pd.DataFrame) -> Dict[str, np.ndarray]:
     for fuel, block in prices.groupby("__fuel__"):
         vals = block[ts_cols].to_numpy().ravel()
         vals = vals[np.isfinite(vals)]
-        # Keep only real numbers; drop empty arrays in the caller
         out[str(fuel)] = vals.astype(float)
     return out
 
 def plot_violin_step(day: str, step_csv: Path, day_out_dir: Path, save_values_csv: bool) -> None:
-    m = STEP_PATTERN.search(step_csv.name)
+    m = PRICE_STEP_PATTERN.search(step_csv.name)
     step_num = int(m.group(1)) if m else None
 
     try:
@@ -221,23 +216,15 @@ def plot_violin_step(day: str, step_csv: Path, day_out_dir: Path, save_values_cs
         print(f"[INFO] {day}: no data in {step_csv.name}; skipping.")
         return
 
-    # Filter out fuels with too few samples to plot
     fuels_all = sorted(data_by_fuel.keys())
-    fuels = []
-    datasets = []
-    skipped = []
+    fuels, datasets, skipped = [], [], []
     for f in fuels_all:
         arr = data_by_fuel[f]
         if arr is None or arr.size < VIOLIN_MIN_SAMPLES:
-            skipped.append(f)
-            continue
-        fuels.append(f)
-        datasets.append(arr)
-
+            skipped.append(f); continue
+        fuels.append(f); datasets.append(arr)
     if skipped:
         print(f"[INFO] {day}: {step_csv.name} – skipped empty/short fuels: {', '.join(skipped)}")
-
-    # Nothing to plot?
     if not datasets:
         title_step = f"SCED Step {step_num}" if step_num is not None else "SCED Step"
         print(f"[INFO] {day}: {title_step} – no fuels with data; skipping plot.")
@@ -262,9 +249,7 @@ def plot_violin_step(day: str, step_csv: Path, day_out_dir: Path, save_values_cs
     print(f"[OK] Saved: {out_png}")
 
     if save_values_csv:
-        vals_list = []
-        for fuel, arr in zip(fuels, datasets):
-            vals_list.append(pd.DataFrame({"fuel": fuel, "price": arr}))
+        vals_list = [pd.DataFrame({"fuel": f, "price": arr}) for f, arr in zip(fuels, datasets)]
         long_df = pd.concat(vals_list, ignore_index=True)
         out_csv = out_dir / f"step_{suffix}_values.csv"
         long_df.to_csv(out_csv, index=False)
@@ -277,19 +262,185 @@ def process_sced_violins_day(day_dir: Path, plots_root: Path, save_values_csv: b
 
     step_files = list(day_dir.glob("aggregation_SCED1_Curve-Price*.csv"))
     if not step_files:
-        # broader fallback
         step_files = list(day_dir.glob("*SCED*Curve*Price*.csv"))
     if not step_files:
         print(f"[INFO] {day}: no SCED price files; skipping violins.")
         return
 
     def step_key(p: Path):
-        m = STEP_PATTERN.search(p.name)
+        m = PRICE_STEP_PATTERN.search(p.name)
         return int(m.group(1)) if m else 1_000_000
     step_files = sorted(step_files, key=step_key)
 
     for step_csv in step_files:
         plot_violin_step(day, step_csv, day_out, save_values_csv)
+
+# =========================================
+# 3) SCED normalized-bids (MW/HSL) lines
+# =========================================
+def normalize_mw_by_hsl(stage_df: pd.DataFrame, hsl_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Returns a normalized wide dataframe with:
+      - col0: Resource Name (matching intersection)
+      - col1: Resource Type (from stage_df for those resources)
+      - col2+: timestamps (intersection of parseable headers in both), values = stage / hsl
+    Any division where HSL <= 0 or NaN => NaN result.
+    """
+    s_name, s_type = normalize_key_columns(stage_df)
+    h_name, h_type = normalize_key_columns(hsl_df)
+
+    # Intersection of resources by Resource Name
+    stage_df = stage_df.copy()
+    hsl_df   = hsl_df.copy()
+    stage_df[s_name] = stage_df[s_name].astype(str).str.strip()
+    hsl_df[h_name]   = hsl_df[h_name].astype(str).str.strip()
+
+    stage_df = stage_df.set_index(s_name)
+    hsl_df   = hsl_df.set_index(h_name)
+
+    common_units = stage_df.index.intersection(hsl_df.index)
+    if common_units.empty:
+        raise ValueError("No overlapping resources (Resource Name) between MW stage and HSL.")
+
+    stage_df = stage_df.loc[common_units]
+    hsl_df   = hsl_df.loc[common_units]
+
+    # Timestamp intersections (parseable headers only)
+    s_ts = detect_timestamp_columns(stage_df.reset_index(), (s_name, s_type))
+    h_ts = detect_timestamp_columns(hsl_df.reset_index(), (h_name, h_type))
+    common_ts = sorted(set(s_ts).intersection(h_ts), key=lambda c: pd.to_datetime(c))
+    if not common_ts:
+        raise ValueError("No overlapping timestamp columns between MW stage and HSL.")
+
+    # Build numeric arrays
+    s_vals = stage_df[common_ts].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+    h_vals = hsl_df[common_ts].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+
+    # Safe division: HSL<=0 or NaN -> NaN
+    with np.errstate(divide='ignore', invalid='ignore'):
+        norm_vals = np.where(np.isfinite(h_vals) & (h_vals > 0.0), s_vals / h_vals, np.nan)
+
+    # Compose result frame
+    out = pd.DataFrame(norm_vals, index=common_units, columns=common_ts)
+    # Resource Type from stage_df (aligned on index)
+    type_series = stage_df[s_type].astype(str).fillna("Unknown")
+    out.insert(0, "Resource Type", type_series)
+    out.insert(0, "Resource Name", out.index)
+    out.reset_index(drop=True, inplace=True)
+    return out
+
+def average_normalized_by_fuel(norm_df: pd.DataFrame) -> Dict[str, float]:
+    """Average across all resources & timestamps for each fuel type -> scalar per fuel."""
+    name_col, type_col = normalize_key_columns(norm_df)
+    ts_cols = detect_timestamp_columns(norm_df, (name_col, type_col))
+    vals = norm_df[ts_cols].apply(pd.to_numeric, errors="coerce")
+    vals.insert(0, "Resource Type", norm_df[type_col].astype(str).fillna("Unknown"))
+    # mean across rows and timestamps (ignore NaN)
+    by_fuel = vals.groupby("Resource Type", dropna=False).mean(numeric_only=True).mean(axis=1, numeric_only=True)
+    # Return as dict
+    return {str(k): float(v) for k, v in by_fuel.sort_index().items()}
+
+def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summary_csv: bool) -> None:
+    """
+    For a given day:
+      - Load aggregation_HSL.csv
+      - For each aggregation_SCED1_Curve-MW<k>.csv:
+          normalize by HSL, save normalized CSV back into day_dir
+      - Build a line chart: x = step (k), y = avg normalized bid; one line per fuel
+    """
+    day = day_dir.name
+    hsl_path = day_dir / "aggregation_HSL.csv"
+    if not hsl_path.exists():
+        # fallback
+        matches = list(day_dir.glob("*HSL*.csv"))
+        if not matches:
+            print(f"[INFO] {day}: no HSL file; skipping normalized MW lines.")
+            return
+        hsl_path = matches[0]
+
+    try:
+        hsl_df = pd.read_csv(hsl_path, dtype=str)
+    except Exception as e:
+        print(f"[ERROR] {day}: failed to read HSL {hsl_path.name}: {e}")
+        return
+
+    # Find SCED MW step files
+    mw_files = list(day_dir.glob("aggregation_SCED1_Curve-MW*.csv"))
+    if not mw_files:
+        mw_files = list(day_dir.glob("*SCED*Curve*MW*.csv"))
+    if not mw_files:
+        print(f"[INFO] {day}: no SCED MW step files; skipping normalized MW lines.")
+        return
+
+    def step_key(p: Path):
+        m = MW_STEP_PATTERN.search(p.name)
+        return int(m.group(1)) if m else 1_000_000
+    mw_files = sorted(mw_files, key=step_key)
+
+    # Per-step averages per fuel
+    summary: Dict[int, Dict[str, float]] = {}
+
+    for stage_csv in mw_files:
+        m = MW_STEP_PATTERN.search(stage_csv.name)
+        step_num = int(m.group(1)) if m else None
+        try:
+            stage_df = pd.read_csv(stage_csv, dtype=str)
+        except Exception as e:
+            print(f"[ERROR] {day}: read failed for {stage_csv.name}: {e}")
+            continue
+
+        try:
+            norm_df = normalize_mw_by_hsl(stage_df, hsl_df)
+        except Exception as e:
+            print(f"[INFO] {day}: {stage_csv.name} – normalization skipped: {e}")
+            continue
+
+        # Save normalized CSV back into inputs folder
+        suffix = f"{step_num}" if step_num is not None else "X"
+        norm_path = day_dir / f"{stage_csv.stem}_normalized.csv"
+        try:
+            norm_df.to_csv(norm_path, index=False)
+            print(f"[OK] Saved normalized: {norm_path}")
+        except Exception as e:
+            print(f"[ERROR] {day}: failed to write normalized CSV {norm_path.name}: {e}")
+
+        # Compute scalar per fuel for this step
+        avg_by_fuel = average_normalized_by_fuel(norm_df)
+        if step_num is not None:
+            summary[step_num] = avg_by_fuel
+
+    if not summary:
+        print(f"[INFO] {day}: no normalized data to summarize; skipping line plot.")
+        return
+
+    # Assemble summary table: rows=step, cols=fuels (sorted)
+    all_fuels = sorted({fuel for d in summary.values() for fuel in d.keys()})
+    steps_sorted = sorted(summary.keys())
+    data = []
+    for s in steps_sorted:
+        row = [summary[s].get(fuel, np.nan) for fuel in all_fuels]
+        data.append(row)
+    summary_df = pd.DataFrame(data, index=steps_sorted, columns=all_fuels)
+
+    # Plot: lines per fuel across steps
+    day_out = plots_root / day / "sced_normalized"
+    day_out.mkdir(parents=True, exist_ok=True)
+
+    ax = summary_df.plot(figsize=(14, 7), marker="o")
+    ax.set_title(f"{day} – Average Normalized Bid by SCED Step")
+    ax.set_xlabel("SCED Step")
+    ax.set_ylabel("Average Normalized Bid (MW / HSL)")
+    ax.legend(title="Fuel Type", bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0.)
+    plt.tight_layout()
+    out_png = day_out / "normalized_bids_by_stage.png"
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+    print(f"[OK] Saved: {out_png}")
+
+    if save_summary_csv:
+        out_csv = day_out / "normalized_bids_by_stage.csv"
+        summary_df.to_csv(out_csv, index_label="step")
+        print(f"[OK] Saved: {out_csv}")
 
 # --------- Driver ---------
 def main():
@@ -303,10 +454,12 @@ def main():
         return
 
     for day_dir in day_dirs:
-        # Base Point (stacked bar)
+        # 1) Base Point (stacked bar)
         process_base_point_day(day_dir, out, BP_AGG_MODE, BP_SAVE_HOURLY_CSV)
-        # SCED violins
+        # 2) SCED price violins
         process_sced_violins_day(day_dir, out, SCED_SAVE_VALUES_CSV)
+        # 3) SCED normalized-bid lines
+        process_sced_normalized_lines_day(day_dir, out, SAVE_NORMALIZED_SUMMARY_CSV)
 
 if __name__ == "__main__":
     main()

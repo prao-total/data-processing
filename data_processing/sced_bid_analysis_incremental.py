@@ -1,54 +1,48 @@
 #!/usr/bin/env python3
 """
-Incremental SCED bidding analysis (Polars) with live partial plots + ETA.
+Incremental SCED bidding analysis (Polars) with live partial plots + ETA,
+using Polars *only* for heavy work (no pandas on 10^8 rows).
 
-Input directory (wide CSVs):
+Inputs (wide CSVs):
   aggregation_HSL.csv
   aggregation_SCED1_Curve-MW1.csv
   aggregation_SCED1_Curve-Price1.csv
   ...
-Columns:
-  ["Resource Name", "Resource Type", <timestamp1>, <timestamp2>, ...] (5-min)
 
-What this script does:
-- Processes one SCED "Step" at a time using Polars (fast, multithreaded).
-- Maintains running aggregates to write partial plots ASAP.
-- Prints a live ETA after a quick warmup using observed throughput.
+Outputs update after each processed step:
+  - step_bars_by_month_hour/<MM>/bars_month_MM_hour_HH.png
+  - price_heatmaps/<ResourceType>/heatmap_price_<rtype>_stepXX.png
+  - avg_mwfrac_by_step_all_types.png
+  - avg_price_by_step_all_types.png
+  - price_violins/violin_price_by_step_<rtype>.png
 
 Requires: pip install polars pyarrow matplotlib
 """
 
 from __future__ import annotations
-import os
-import re
-import time
+import re, time
 from pathlib import Path
-from typing import Optional, Dict, Tuple, Iterable, List
+from typing import Optional, Dict, Tuple, List
 
 import numpy as np
 import polars as pl
 import matplotlib.pyplot as plt
 
 # ============================ CONFIG ============================ #
-INPUT_DIR  = Path("/path/to/your/aggregated_timeseries_dir")       # <-- set this
-OUTPUT_DIR = Path("/path/to/output/sced_bidding_incremental")      # <-- set this
+INPUT_DIR  = Path("C:/Users/<you>/Documents/aggregated_timeseries")     # <-- set this
+OUTPUT_DIR = Path("C:/Users/<you>/Documents/sced_bidding_incremental")  # <-- set this
 
 MAX_STEPS  = 35
-TIMESTAMP_TZ: Optional[str] = None          # e.g., "America/Chicago" or None
+TIMESTAMP_TZ: Optional[str] = None      # e.g. "America/Chicago" or None
 
-# Flush plots every N steps processed (1 = after each step)
-INCREMENTAL_FLUSH_EVERY_STEPS = 1
-
-# Violin sampling cap per (Resource Type × Step). None = keep all (not recommended)
+INCREMENTAL_FLUSH_EVERY_STEPS = 1       # write partial plots after each step
 MAX_VIOLIN_SAMPLES_PER_GROUP: Optional[int] = 8000
-
-# Warmup for ETA (after this many steps we print initial ETA)
 WARMUP_STEPS_FOR_ETA = 2
 # ================================================================ #
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---------------- Filename parsing ---------------- #
+# ---------- file name parsing ---------- #
 RE_HSL = re.compile(r"^aggregation[_-]HSL\.csv$", re.IGNORECASE)
 RE_MW  = re.compile(r"^aggregation[_-]SCED1[_ ]?Curve[-_]?MW(\d+)\.csv$", re.IGNORECASE)
 RE_PRC = re.compile(r"^aggregation[_-]SCED1[_ ]?Curve[-_]?Price(\d+)\.csv$", re.IGNORECASE)
@@ -61,53 +55,55 @@ def classify_file(fname: str):
     if p: return "PRICE", int(p.group(1))
     return "OTHER", None
 
-# ---------------- Polars helpers ---------------- #
+# ---------- Polars helpers ---------- #
 def scan_csv_normalized(path: Path) -> pl.LazyFrame:
     lf = pl.scan_csv(str(path))
-    cols = lf.columns
-    if "Resource Node" in cols and "Resource Name" not in cols:
+    # resolve schema cheaply to check name presence
+    names = lf.collect_schema().names()
+    if "Resource Node" in names and "Resource Name" not in names:
         lf = lf.rename({"Resource Node": "Resource Name"})
     return lf
 
-def melt_metric_csv(path: Path, value_name: str) -> pl.LazyFrame:
+def unpivot_metric_csv(path: Path, value_name: str) -> pl.LazyFrame:
     lf = scan_csv_normalized(path)
-    cols = lf.columns
-    id_vars = [c for c in ["Resource Name", "Resource Type"] if c in cols]
+    names = lf.collect_schema().names()
+    id_vars = [c for c in ("Resource Name", "Resource Type") if c in names]
     if len(id_vars) != 2:
         raise ValueError(f"{path.name}: missing id columns.")
-    ts_cols = [c for c in cols if c not in id_vars]
+    ts_cols = [c for c in names if c not in id_vars]
     if not ts_cols:
         return pl.LazyFrame({"Resource Name": [], "Resource Type": [], "timestamp": [], value_name: []})
-    lf = lf.melt(id_vars=id_vars, value_vars=ts_cols,
-                 variable_name="timestamp", value_name=value_name)
-    lf = lf.with_columns(pl.col("timestamp").str.strptime(pl.Datetime, strict=False))
+    lf = lf.unpivot(
+        index=id_vars,
+        on=ts_cols,
+        variable_name="timestamp",
+        value_name=value_name
+    ).with_columns(
+        pl.col("timestamp").str.strptime(pl.Datetime, strict=False)
+    )
     if TIMESTAMP_TZ:
         lf = lf.with_columns(pl.col("timestamp").dt.replace_time_zone(TIMESTAMP_TZ))
     return lf
 
-def join_step_long(hsl_path: Path, mw_path: Path, pr_path: Path, step: int) -> pl.DataFrame:
-    keys = ["Resource Name", "Resource Type", "timestamp"]
-    hsl = melt_metric_csv(hsl_path, "HSL").with_columns(pl.col("HSL").cast(pl.Float64))
-    mw  = melt_metric_csv(mw_path,  "MW").with_columns(pl.col("MW").cast(pl.Float64))
-    pr  = melt_metric_csv(pr_path,  "Price").with_columns(pl.col("Price").cast(pl.Float64))
-    joined = (
+def step_lazy(hsl_path: Path, mw_path: Path, pr_path: Path, step: int) -> pl.LazyFrame:
+    keys = ["Resource Name","Resource Type","timestamp"]
+    hsl = unpivot_metric_csv(hsl_path, "HSL").with_columns(pl.col("HSL").cast(pl.Float64))
+    mw  = unpivot_metric_csv(mw_path,  "MW").with_columns(pl.col("MW").cast(pl.Float64))
+    pr  = unpivot_metric_csv(pr_path,  "Price").with_columns(pl.col("Price").cast(pl.Float64))
+    lf = (
         hsl.join(mw, on=keys, how="inner")
            .join(pr, on=keys, how="inner")
            .with_columns(
                pl.lit(step).alias("Step"),
-               (pl.when(pl.col("HSL") > 0)
-                .then(pl.col("MW")/pl.col("HSL"))
-                .otherwise(None)
-               ).alias("MW_frac"),
                pl.col("timestamp").dt.hour().alias("hour"),
                pl.col("timestamp").dt.month().alias("month"),
+               pl.when(pl.col("HSL") > 0).then(pl.col("MW")/pl.col("HSL")).otherwise(None).alias("MW_frac")
            )
-           .select(["Resource Name","Resource Type","timestamp","month","hour",
-                    "Step","MW","Price","HSL","MW_frac"])
+           .select(["Resource Name","Resource Type","timestamp","month","hour","Step","MW","Price","HSL","MW_frac"])
     )
-    return joined.collect(streaming=True)
+    return lf
 
-# ---------------- Running aggregates (SUM/COUNT) ---------------- #
+# ---------- running accumulators (Python dicts of sums/counts) ---------- #
 # Bars: mean(MW_frac) by (month, hour, Step, Resource Type)
 bars_sum: Dict[Tuple[int,int,int,str], float] = {}
 bars_cnt: Dict[Tuple[int,int,int,str], int]   = {}
@@ -116,177 +112,181 @@ bars_cnt: Dict[Tuple[int,int,int,str], int]   = {}
 heat_sum: Dict[Tuple[str,int,int,int], float] = {}
 heat_cnt: Dict[Tuple[str,int,int,int], int]   = {}
 
-# Avg lines: MW_frac / Price by (Resource Type, Step)
+# Lines: avg MW_frac / Price by (Resource Type, Step)
 mw_sum: Dict[Tuple[str,int], float] = {}
 mw_cnt: Dict[Tuple[str,int], int]   = {}
 pr_sum: Dict[Tuple[str,int], float] = {}
 pr_cnt: Dict[Tuple[str,int], int]   = {}
 
-# Violins: sampled prices for (Resource Type, Step)
+# Violins: sampled prices
 rng = np.random.default_rng(1234)
 viol_samples: Dict[Tuple[str,int], np.ndarray] = {}
 viol_seen:    Dict[Tuple[str,int], int] = {}
 
-def _accumulate_sums_counts(sum_dict, cnt_dict, key, values: np.ndarray):
-    if values.size == 0: return
-    finite = values[np.isfinite(values)]
-    if finite.size == 0: return
-    sum_dict[key] = sum_dict.get(key, 0.0) + float(np.sum(finite))
-    cnt_dict[key] = cnt_dict.get(key, 0)   + int(finite.size)
+def _acc(sumd, cntd, key, s, c):
+    if c and c > 0 and s is not None:
+        sumd[key] = sumd.get(key, 0.0) + float(s)
+        cntd[key] = cntd.get(key, 0)   + int(c)
 
 def _reservoir_add(key: Tuple[str,int], values: np.ndarray, cap: Optional[int]):
-    if values.size == 0: return
     values = values[np.isfinite(values)]
     if values.size == 0: return
     if cap is None:
         arr = viol_samples.get(key)
         viol_samples[key] = values if arr is None else np.concatenate([arr, values])
-        viol_seen[key] = viol_seen.get(key, 0) + len(values)
+        viol_seen[key] = viol_seen.get(key, 0) + values.size
         return
     n_old = viol_seen.get(key, 0)
     pool  = viol_samples.get(key)
     if pool is None:
-        take = values[:cap] if len(values) > cap else values
+        take = values[:cap] if values.size > cap else values
         viol_samples[key] = take.copy()
-        viol_seen[key] = n_old + len(values)
+        viol_seen[key] = n_old + values.size
         return
     if pool.shape[0] < cap:
-        needed = cap - pool.shape[0]
-        add = values[:needed] if len(values) >= needed else values
+        need = cap - pool.shape[0]
+        add = values[:need] if values.size >= need else values
         viol_samples[key] = np.concatenate([pool, add])
-        viol_seen[key] = n_old + len(values)
+        viol_seen[key] = n_old + values.size
         return
-    # Full reservoir: replace with probability cap/t
+    # full: classic Algorithm R
     for v in values:
         n_old += 1
-        j = rng.integers(1, n_old + 1)
+        j = rng.integers(1, n_old+1)
         if j <= cap:
-            viol_samples[key][j-1] = v
+            pool[j-1] = v
     viol_seen[key] = n_old
 
-# ---------------- Incremental update ---------------- #
-def update_running_aggregates(step_df: pl.DataFrame):
-    if step_df.is_empty():
-        return
-    pdf = step_df.select([
-        "Resource Type","Step","month","hour","MW_frac","Price"
-    ]).to_pandas()
+# ---------- update accumulators from ONE step (all in Polars) ---------- #
+def update_from_step_lazy(step_lf: pl.LazyFrame):
+    # 1) Bars + Heatmaps by (rtype, step, month, hour)
+    agg_mh = (
+        step_lf
+        .group_by(["Resource Type","Step","month","hour"])
+        .agg(
+            mwfrac_sum = pl.col("MW_frac").sum(),
+            mwfrac_cnt = pl.col("MW_frac").is_finite().sum(),
+            price_sum  = pl.col("Price").sum(),
+            price_cnt  = pl.col("Price").is_finite().sum(),
+        )
+        .collect()   # collects only a few thousand rows, not 10^8
+    )
+    for r in agg_mh.iter_rows(named=True):
+        rtype = str(r["Resource Type"]); s = int(r["Step"]); mo = int(r["month"]); hr = int(r["hour"])
+        _acc(bars_sum, bars_cnt, (mo, hr, s, rtype), r["mwfrac_sum"], r["mwfrac_cnt"])
+        _acc(heat_sum, heat_cnt, (rtype, s, mo, hr), r["price_sum"], r["price_cnt"])
 
-    # Bars & Heatmaps
-    for (rtype, s, mo, hr), grp in pdf.groupby(["Resource Type","Step","month","hour"]):
-        key_b = (int(mo), int(hr), int(s), str(rtype))
-        _accumulate_sums_counts(bars_sum, bars_cnt, key_b, grp["MW_frac"].to_numpy(dtype=float))
-        key_h = (str(rtype), int(s), int(mo), int(hr))
-        _accumulate_sums_counts(heat_sum, heat_cnt, key_h, grp["Price"].to_numpy(dtype=float))
+    # 2) Lines by (rtype, step)
+    agg_lines = (
+        step_lf
+        .group_by(["Resource Type","Step"])
+        .agg(
+            mwfrac_sum = pl.col("MW_frac").sum(),
+            mwfrac_cnt = pl.col("MW_frac").is_finite().sum(),
+            price_sum  = pl.col("Price").sum(),
+            price_cnt  = pl.col("Price").is_finite().sum(),
+        )
+        .collect()
+    )
+    for r in agg_lines.iter_rows(named=True):
+        rtype = str(r["Resource Type"]); s = int(r["Step"])
+        _acc(mw_sum, mw_cnt, (rtype, s), r["mwfrac_sum"], r["mwfrac_cnt"])
+        _acc(pr_sum, pr_cnt, (rtype, s), r["price_sum"],  r["price_cnt"])
 
-    # Avg lines
-    for (rtype, s), grp in pdf.groupby(["Resource Type","Step"]):
-        key = (str(rtype), int(s))
-        _accumulate_sums_counts(mw_sum, mw_cnt, key, grp["MW_frac"].to_numpy(dtype=float))
-        _accumulate_sums_counts(pr_sum, pr_cnt, key, grp["Price"].to_numpy(dtype=float))
-
-    # Violins
+    # 3) Violins: per (rtype, step) sample of Price
     if MAX_VIOLIN_SAMPLES_PER_GROUP is not None:
-        for (rtype, s), grp in pdf.groupby(["Resource Type","Step"]):
-            vals = grp["Price"].to_numpy(dtype=float)
-            _reservoir_add((str(rtype), int(s)), vals, MAX_VIOLIN_SAMPLES_PER_GROUP)
+        viol = (
+            step_lf
+            .group_by(["Resource Type","Step"])
+            .agg(
+                pl.col("Price").drop_nulls().sample(n=MAX_VIOLIN_SAMPLES_PER_GROUP, with_replacement=False).alias("samples")
+            )
+            .collect()
+        )
+        for r in viol.iter_rows(named=True):
+            rtype = str(r["Resource Type"]); s = int(r["Step"])
+            arr = np.array(r["samples"], dtype=float) if r["samples"] is not None else np.array([], dtype=float)
+            if arr.size:
+                _reservoir_add((rtype, s), arr, MAX_VIOLIN_SAMPLES_PER_GROUP)
 
-# ---- Helpers to convert aggregates to small DataFrames for plotting ---- #
-def df_bars_rows():
-    rows = []
-    for k, sm in bars_sum.items():
-        mo, hr, step, rtype = k
-        cnt = bars_cnt.get(k, 0)
+# ---------- small helpers to build tiny DataFrames for plotting ---------- #
+def rows_bars():
+    for (mo,hr,s,rtype), ssum in bars_sum.items():
+        cnt = bars_cnt.get((mo,hr,s,rtype), 0)
         if cnt > 0:
-            rows.append((mo, hr, step, rtype, sm/cnt))
-    return rows
+            yield (mo, hr, s, rtype, ssum/cnt)
 
-def df_heatmap_rows_for_step(step: int):
-    rows = []
-    for k, sm in heat_sum.items():
-        rtype, s, mo, hr = k
+def rows_heat_step(step: int):
+    for (rtype,s,mo,hr), ssum in heat_sum.items():
         if s != step: continue
-        cnt = heat_cnt.get(k, 0)
+        cnt = heat_cnt.get((rtype,s,mo,hr), 0)
         if cnt > 0:
-            rows.append((rtype, s, mo, hr, sm/cnt))
-    return rows
+            yield (rtype, s, mo, hr, ssum/cnt)
 
-def df_avg_rows(which: str):
-    rows = []
+def rows_avg(which: str):
     if which == "mw":
-        for k, sm in mw_sum.items():
-            rtype, step = k
-            cnt = mw_cnt.get(k, 0)
+        for (rtype,s), ssum in mw_sum.items():
+            cnt = mw_cnt.get((rtype,s), 0)
             if cnt > 0:
-                rows.append((rtype, step, sm/cnt))
+                yield (rtype, s, ssum/cnt)
     else:
-        for k, sm in pr_sum.items():
-            rtype, step = k
-            cnt = pr_cnt.get(k, 0)
+        for (rtype,s), ssum in pr_sum.items():
+            cnt = pr_cnt.get((rtype,s), 0)
             if cnt > 0:
-                rows.append((rtype, step, sm/cnt))
-    return rows
+                yield (rtype, s, ssum/cnt)
 
-# ---------------- Plotters (overwrite files each flush) ---------------- #
-def plot_step_bars_by_month_hour_from_rows(rows, out_dir: Path):
+# ---------- plotting (convert only small aggregated slices to pandas) ---------- #
+def plot_step_bars_by_month_hour_from_rows(rows_iter, out_dir: Path):
     import pandas as pd
-    if not rows:
-        return
+    rows = list(rows_iter)
+    if not rows: return
     df = pd.DataFrame(rows, columns=["month","hour","Step","Resource Type","avg_mw_frac"])
     all_types = sorted(df["Resource Type"].unique().tolist())
     all_steps = sorted(df["Step"].unique().astype(int).tolist())
-    months = range(1,13)
-    hours = range(0,24)
+    months = range(1,13); hours = range(0,24)
 
     root = out_dir / "step_bars_by_month_hour"
     root.mkdir(parents=True, exist_ok=True)
-
     for mm in months:
-        mdir = root / f"{mm:02d}"
-        mdir.mkdir(parents=True, exist_ok=True)
-        sub_m = df[df["month"] == mm]
+        mdir = root / f"{mm:02d}"; mdir.mkdir(parents=True, exist_ok=True)
+        sub_m = df[df["month"]==mm]
         for hh in hours:
-            sub = sub_m[sub_m["hour"] == hh]
+            sub = sub_m[sub_m["hour"]==hh]
             fig = plt.figure(figsize=(14,6))
             if sub.empty:
                 plt.title(f"Normalized Bids by Step — Month {mm}, Hour {hh} (partial/no data)")
-                plt.xlabel("Step (1..N)"); plt.ylabel("Mean normalized MW (MW/HSL)")
+                plt.xlabel("Step"); plt.ylabel("Mean normalized MW (MW/HSL)")
             else:
                 mat = np.zeros((len(all_steps), len(all_types)))
                 for i, s in enumerate(all_steps):
-                    row = sub[sub["Step"] == s].set_index("Resource Type")["avg_mw_frac"].reindex(all_types).fillna(0)
+                    row = sub[sub["Step"]==s].set_index("Resource Type")["avg_mw_frac"].reindex(all_types).fillna(0)
                     mat[i,:] = row.to_numpy()
-                x = np.arange(len(all_steps))
-                bottom = np.zeros(len(all_steps))
+                x = np.arange(len(all_steps)); bottom = np.zeros(len(all_steps))
                 for j, rtype in enumerate(all_types):
                     heights = mat[:, j]
                     if np.allclose(heights, 0.0): continue
                     plt.bar(x, heights, bottom=bottom, label=rtype)
                     bottom += heights
-                plt.xticks(x, all_steps)
-                plt.xlabel("Step (1..N)"); plt.ylabel("Mean normalized MW (MW/HSL)")
+                plt.xticks(x, all_steps); plt.xlabel("Step (1..N)")
+                plt.ylabel("Mean normalized MW (MW/HSL)")
                 plt.title(f"How Resource Types Bid by Step — Month {mm}, Hour {hh} (partial)")
                 plt.legend(ncol=3, fontsize=8)
             out_path = mdir / f"bars_month_{mm:02d}_hour_{hh:02d}.png"
             plt.tight_layout(); plt.savefig(out_path, dpi=130, bbox_inches="tight"); plt.close(fig)
 
-def plot_price_heatmap_for_step_from_rows(rows_for_step, out_dir: Path, step: int):
+def plot_price_heatmap_for_step_from_rows(rows_iter, out_dir: Path, step: int):
     import pandas as pd
-    hours = np.arange(0,24); months = np.arange(1,13)
-    if not rows_for_step:
-        return
-    df = pd.DataFrame(rows_for_step, columns=["Resource Type","Step","month","hour","avg_price"])
+    rows = list(rows_iter)
+    if not rows: return
+    df = pd.DataFrame(rows, columns=["Resource Type","Step","month","hour","avg_price"])
     rtypes = sorted(df["Resource Type"].unique().tolist())
-
-    heat_root = out_dir / "price_heatmaps"
-    heat_root.mkdir(parents=True, exist_ok=True)
-
+    hours = np.arange(0,24); months = np.arange(1,13)
+    heat_root = out_dir / "price_heatmaps"; heat_root.mkdir(parents=True, exist_ok=True)
     for rtype in rtypes:
-        sub = df[df["Resource Type"] == rtype]
+        sub = df[df["Resource Type"]==rtype]
         if sub.empty: continue
         pivot = sub.pivot(index="month", columns="hour", values="avg_price").reindex(index=months, columns=hours)
         mat = pivot.to_numpy()
-
         fig = plt.figure(figsize=(10,6))
         plt.imshow(mat, aspect="auto", origin="lower",
                    extent=[hours.min()-0.5, hours.max()+0.5, months.min()-0.5, months.max()+0.5])
@@ -295,22 +295,19 @@ def plot_price_heatmap_for_step_from_rows(rows_for_step, out_dir: Path, step: in
         plt.title(f"Price Heatmap — {rtype} — Step {step} (partial)")
         plt.xticks(np.arange(0,24,1)); plt.yticks(np.arange(1,13,1))
         safe = re.sub(r"[^A-Za-z0-9._-]+","_", str(rtype))
-        type_dir = heat_root / safe
-        type_dir.mkdir(parents=True, exist_ok=True)
-        out_path = type_dir / f"heatmap_price_{safe}_step{step:02d}.png"
-        plt.tight_layout(); plt.savefig(out_path, dpi=130, bbox_inches="tight"); plt.close(fig)
+        out_path = (heat_root / safe); out_path.mkdir(parents=True, exist_ok=True)
+        plt.tight_layout(); plt.savefig(out_path / f"heatmap_price_{safe}_step{step:02d}.png", dpi=130, bbox_inches="tight")
+        plt.close(fig)
 
-def plot_avg_lines_from_rows(rows, out_path: Path, ylabel: str, title: str):
+def plot_avg_lines_from_rows(rows_iter, out_path: Path, ylabel: str, title: str):
     import pandas as pd
-    if not rows:
-        return
+    rows = list(rows_iter)
+    if not rows: return
     df = pd.DataFrame(rows, columns=["Resource Type","Step","avg"])
     steps = sorted(df["Step"].unique().astype(int).tolist())
-    if not steps:
-        return
+    if not steps: return
     wide = df.pivot(index="Resource Type", columns="Step", values="avg").reindex(columns=steps)
     order = wide.mean(axis=1, skipna=True).sort_values(ascending=False).index.tolist()
-
     fig = plt.figure(figsize=(12,6))
     x = np.arange(len(steps))
     for rtype in order:
@@ -325,31 +322,19 @@ def plot_avg_lines_from_rows(rows, out_path: Path, ylabel: str, title: str):
     plt.savefig(out_path, dpi=130, bbox_inches="tight"); plt.close(fig)
 
 def plot_price_violins_incremental(out_dir: Path):
-    """One violin per Resource Type using the (partial) reservoirs so far."""
-    if not viol_samples:
-        return
-    viol_root = out_dir / "price_violins"
-    viol_root.mkdir(parents=True, exist_ok=True)
-
-    # Collect steps per type
+    if not viol_samples: return
+    viol_root = out_dir / "price_violins"; viol_root.mkdir(parents=True, exist_ok=True)
     by_type: Dict[str, Dict[int, np.ndarray]] = {}
     for (rtype, step), arr in viol_samples.items():
         if arr.size == 0: continue
         by_type.setdefault(rtype, {})[step] = arr
-
-    for rtype, step_map in by_type.items():
-        steps = sorted(step_map.keys())
-        arrays = [step_map[s] for s in steps]
-        if not any(len(a) for a in arrays):
-            continue
-        fig = plt.figure(figsize=(14, 6))
-        parts = plt.violinplot(
-            arrays,
-            positions=np.arange(1, len(steps)+1),
-            showmeans=False, showmedians=True, showextrema=False, widths=0.85,
-        )
-        for pc in parts['bodies']:
-            pc.set_alpha(0.7)
+    for rtype, s_map in by_type.items():
+        steps = sorted(s_map.keys()); arrays = [s_map[s] for s in steps]
+        if not any(len(a) for a in arrays): continue
+        fig = plt.figure(figsize=(14,6))
+        parts = plt.violinplot(arrays, positions=np.arange(1, len(steps)+1),
+                               showmeans=False, showmedians=True, showextrema=False, widths=0.85)
+        for pc in parts['bodies']: pc.set_alpha(0.7)
         plt.xlabel("Step"); plt.ylabel("Bid Price ($/MWh)")
         plt.title(f"SCED Bid Price by Step — {rtype} (partial)")
         plt.xticks(np.arange(1, len(steps)+1), steps)
@@ -358,29 +343,22 @@ def plot_price_violins_incremental(out_dir: Path):
         out_path = viol_root / f"violin_price_by_step_{safe}.png"
         plt.tight_layout(); plt.savefig(out_path, dpi=130, bbox_inches="tight"); plt.close(fig)
 
-# ---------------- Main incremental loop w/ ETA ---------------- #
+# ---------- main loop with ETA ---------- #
 def main():
     # Map files
     hsl_path: Optional[Path] = None
     mw_paths: Dict[int, Path] = {}
     pr_paths: Dict[int, Path] = {}
-
     for f in INPUT_DIR.iterdir():
         if not f.is_file(): continue
         kind, step = classify_file(f.name)
-        if kind == "HSL":
-            hsl_path = f
-        elif kind == "MW" and step and 1 <= step <= MAX_STEPS:
-            mw_paths[step] = f
-        elif kind == "PRICE" and step and 1 <= step <= MAX_STEPS:
-            pr_paths[step] = f
-    if hsl_path is None:
-        raise ValueError("aggregation_HSL.csv not found.")
+        if kind == "HSL": hsl_path = f
+        elif kind == "MW" and step and 1 <= step <= MAX_STEPS: mw_paths[step] = f
+        elif kind == "PRICE" and step and 1 <= step <= MAX_STEPS: pr_paths[step] = f
+    if hsl_path is None: raise ValueError("aggregation_HSL.csv not found.")
     steps = sorted(set(mw_paths.keys()).intersection(pr_paths.keys()))
-    if not steps:
-        raise ValueError("No overlapping steps between MW and Price files.")
+    if not steps: raise ValueError("No overlapping MW/Price steps.")
 
-    # --- ETA init ---
     total_bytes = sum((p.stat().st_size for p in INPUT_DIR.glob("*.csv")), start=0)
     processed_bytes = 0
     t0_all = time.time()
@@ -391,65 +369,65 @@ def main():
         print(f"• Processing Step {s} ...")
         t0_step = time.time()
 
-        # Build this step
-        step_df = join_step_long(hsl_path, mw_paths[s], pr_paths[s], s)
-        print(f"  rows after join: {step_df.height:,}")
-        update_running_aggregates(step_df)
+        # Build this step as LazyFrame (no collection yet)
+        lf = step_lazy(hsl_path, mw_paths[s], pr_paths[s], s)
 
-        # --- ETA accounting for this step ---
-        # Approx bytes attributed to this step (MW+Price for this step + share of HSL)
-        step_size = (mw_paths[s].stat().st_size if s in mw_paths else 0) \
-                  + (pr_paths[s].stat().st_size if s in pr_paths else 0)
-        step_size += hsl_path.stat().st_size / len(steps)
+        # (Optional) sanity check row estimate without materializing:
+        # n_rows_est = lf.select(pl.len()).collect().item()
+        # print("  ~rows (est):", int(n_rows_est))
+
+        # Update running aggregates by collecting *only aggregated* results:
+        update_from_step_lazy(lf)
+
+        # ETA accounting
+        step_size = mw_paths[s].stat().st_size + pr_paths[s].stat().st_size + hsl_path.stat().st_size/len(steps)
         processed_bytes += step_size
         processed_steps += 1
-
         elapsed_step = time.time() - t0_step
         print(f"  step time: {elapsed_step:.2f}s")
 
-        # After warmup, compute ETA based on observed throughput
         if processed_steps >= WARMUP_STEPS_FOR_ETA:
             elapsed_all = time.time() - t0_all
             bps = processed_bytes / elapsed_all if elapsed_all > 0 else 0.0
             if bps > 0:
-                remaining_bytes = max(0.0, total_bytes - processed_bytes)
-                eta_sec = remaining_bytes / bps
+                remaining = max(0.0, total_bytes - processed_bytes)
+                eta_sec = remaining / bps
                 print(f"  ~Throughput: {bps/1e6:.1f} MB/s; "
                       f"progress {processed_bytes/1e9:.2f}/{total_bytes/1e9:.2f} GB; "
                       f"ETA ~{eta_sec/60:.1f} min")
 
-        # Partial flush?
+        # Partial plots (from small aggregated dicts)
         if INCREMENTAL_FLUSH_EVERY_STEPS and (processed_steps % INCREMENTAL_FLUSH_EVERY_STEPS == 0):
             print("  ↳ Writing partial plots...")
-            plot_step_bars_by_month_hour_from_rows(df_bars_rows(), OUTPUT_DIR)
-            plot_price_heatmap_for_step_from_rows(df_heatmap_rows_for_step(s), OUTPUT_DIR, s)
+            plot_step_bars_by_month_hour_from_rows(rows_bars(), OUTPUT_DIR)
+            plot_price_heatmap_for_step_from_rows(rows_heat_step(s), OUTPUT_DIR, s)
             plot_avg_lines_from_rows(
-                df_avg_rows("mw"),
+                rows_avg("mw"),
                 OUTPUT_DIR / "avg_mwfrac_by_step_all_types.png",
                 ylabel="Average normalized MW (MW/HSL)",
                 title="Average MW_frac by SCED Step (partial)"
             )
             plot_avg_lines_from_rows(
-                df_avg_rows("price"),
+                rows_avg("price"),
                 OUTPUT_DIR / "avg_price_by_step_all_types.png",
                 ylabel="Average bid Price ($/MWh)",
                 title="Average Price by SCED Step (partial)"
             )
             plot_price_violins_incremental(OUTPUT_DIR)
 
-    # Final flush (all steps)
+    # Final plots (all steps)
     print("Finalizing plots with all steps...")
-    plot_step_bars_by_month_hour_from_rows(df_bars_rows(), OUTPUT_DIR)
+    plot_step_bars_by_month_hour_from_rows(rows_bars(), OUTPUT_DIR)
     for s in steps:
-        plot_price_heatmap_for_step_from_rows(df_heatmap_rows_for_step(s), OUTPUT_DIR, s)
+        plot_price_heatmap_for_step_from_rows(rows_heat_step(s), OUTPUT_DIR, s)
     plot_avg_lines_from_rows(
-        df_avg_rows("mw"),
+        rows_avg("mw"),
         OUTPUT_DIR / "avg_mwfrac_by_step_all_types.png",
         ylabel="Average normalized MW (MW/HSL)",
         title="Average MW_frac by SCED Step"
     )
     plot_avg_lines_from_rows(
-        df_avg_rows("price"),
+        rows_avg("price"),
         OUTPUT_DIR / "avg_price_by_step_all_types.png",
         ylabel="Average bid Price ($/MWh)",
         title="Average Price by SCED Step"

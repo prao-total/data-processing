@@ -217,7 +217,16 @@ def update_from_batch_lazy(batch_lf: pl.LazyFrame):
         viol = (
             batch_lf
             .group_by(["Resource Type","Step"])
-            .agg(pl.col("Price").drop_nulls().sample(n=MAX_VIOLIN_SAMPLES_PER_GROUP, with_replacement=False).alias("samples"))
+            .agg(
+                pl.when(pl.count() > MAX_VIOLIN_SAMPLES_PER_GROUP)
+                .then(
+                    pl.col("Price")
+                        .drop_nulls()
+                        .sample(n=MAX_VIOLIN_SAMPLES_PER_GROUP, with_replacement=False)
+                )
+                .otherwise(pl.col("Price").drop_nulls())
+                .alias("samples")
+            )
             .collect()
         )
         for r in viol.iter_rows(named=True):

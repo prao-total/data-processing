@@ -340,15 +340,133 @@ def average_normalized_by_fuel(norm_df: pd.DataFrame) -> Dict[str, float]:
     by_fuel = vals.groupby("Resource Type", dropna=False).mean(numeric_only=True).mean(axis=1, numeric_only=True)
     return {str(k): float(v) for k, v in by_fuel.sort_index().items()}
 
+
+def normalize_by_row_max_with_hsl_and_bp(step_dfs: Dict[int, pd.DataFrame],
+                                         hsl_df: pd.DataFrame,
+                                         bp_df: pd.DataFrame) -> Tuple[Dict[int, pd.DataFrame], pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+    """
+    Align all inputs on common resources and timestamps.
+    For each resource×timestamp cell, compute:
+      M_sced = max over all SCED-MW steps
+      M_all  = max(M_sced, HSL)
+
+    Return:
+      - norm_steps: dict[step]-> normalized (values / M_all)
+      - hsl_norm  : normalized HSL (values / M_all)
+      - bp_norm   : normalized Base Point (values / M_all)
+      - max_sced_per_row: Series indexed by row (resource) with sum_over_timestamps(M_sced)
+      - fuel_per_row: Series fuel type per resource row (from the first step that has it, else HSL/BP)
+    """
+    # Normalize keys
+    # Find key columns for each df
+    # Use first step to detect columns
+    first_df = next(iter(step_dfs.values()))
+    s_name, s_type = normalize_key_columns(first_df)
+    h_name, h_type = normalize_key_columns(hsl_df)
+    b_name, b_type = normalize_key_columns(bp_df)
+
+    def norm_series(s: pd.Series) -> pd.Series:
+        return s.astype(str).str.strip().str.casefold()
+
+    # Set index by normalized resource name
+    step_aligned = {}
+    for k, df in step_dfs.items():
+        df2 = df.copy()
+        df2["_key"] = norm_series(df2[s_name])
+        df2 = df2.set_index("_key")
+        step_aligned[k] = df2
+
+    h2 = hsl_df.copy()
+    h2["_key"] = norm_series(h2[h_name])
+    h2 = h2.set_index("_key")
+
+    b2 = bp_df.copy()
+    b2["_key"] = norm_series(b2[b_name])
+    b2 = b2.set_index("_key")
+
+    # Common timestamp columns across all steps + HSL + BP
+    ts_sets = []
+    for df in step_aligned.values():
+        name_col, type_col = normalize_key_columns(df.reset_index())
+        ts_sets.append(set(detect_timestamp_columns(df.reset_index(), (name_col, type_col))))
+    ts_sets.append(set(detect_timestamp_columns(h2.reset_index(), (h_name, h_type))))
+    ts_sets.append(set(detect_timestamp_columns(b2.reset_index(), (b_name, b_type))))
+    common_ts = sorted(set.intersection(*ts_sets), key=lambda c: pd.to_datetime(c))
+    if not common_ts:
+        raise ValueError("No overlapping timestamp columns across SCED steps, HSL, and Base Point.")
+
+    # Common resource rows
+    common_idx = set(h2.index) & set(b2.index)
+    for df in step_aligned.values():
+        common_idx &= set(df.index)
+    common_idx = pd.Index(sorted(common_idx))
+    if common_idx.empty:
+        raise ValueError("No overlapping Resource Name rows across SCED steps, HSL, and Base Point.")
+
+    # Extract numeric blocks
+    step_vals = {k: df.loc[common_idx, common_ts].apply(pd.to_numeric, errors="coerce").to_numpy()
+                 for k, df in step_aligned.items()}
+    h_vals = h2.loc[common_idx, common_ts].apply(pd.to_numeric, errors="coerce").to_numpy()
+    b_vals = b2.loc[common_idx, common_ts].apply(pd.to_numeric, errors="coerce").to_numpy()
+
+    # Compute M_sced and M_all
+    # Stack steps into 3D: (n_steps, n_rows, n_ts)
+    steps_sorted = sorted(step_vals.keys())
+    stack = np.stack([step_vals[k] for k in steps_sorted], axis=0)  # shape (S, R, T)
+    M_sced = np.nanmax(stack, axis=0)  # (R, T)
+    M_all = np.nanmax(np.stack([M_sced, h_vals], axis=0), axis=0)   # include HSL
+
+    # Avoid zeros and non-finite
+    M_all_safe = np.where(np.isfinite(M_all) & (M_all > 0.0), M_all, np.nan)
+
+    # Normalize each step, HSL, BP
+    norm_steps = {}
+    with np.errstate(divide="ignore", invalid="ignore"):
+        for i, k in enumerate(steps_sorted):
+            norm = np.where(np.isfinite(M_all_safe), stack[i] / M_all_safe, np.nan)
+            out = pd.DataFrame(norm, index=common_idx, columns=common_ts)
+            # attach display columns from the step df
+            src = step_aligned[k].loc[common_idx]
+            out.insert(0, "Resource Type", src[s_type].astype(str).fillna("Unknown").values)
+            out.insert(0, "Resource Name", src[s_name].astype(str).values)
+            norm_steps[k] = out.reset_index(drop=True)
+
+        h_norm = np.where(np.isfinite(M_all_safe), h_vals / M_all_safe, np.nan)
+        hsl_norm = pd.DataFrame(h_norm, index=common_idx, columns=common_ts)
+        hsl_norm.insert(0, "Resource Type", step_aligned[steps_sorted[0]].loc[common_idx][s_type].astype(str).fillna("Unknown").values)
+        hsl_norm.insert(0, "Resource Name", step_aligned[steps_sorted[0]].loc[common_idx][s_name].astype(str).values)
+        hsl_norm = hsl_norm.reset_index(drop=True)
+
+        b_norm = np.where(np.isfinite(M_all_safe), b_vals / M_all_safe, np.nan)
+        bp_norm = pd.DataFrame(b_norm, index=common_idx, columns=common_ts)
+        bp_norm.insert(0, "Resource Type", step_aligned[steps_sorted[0]].loc[common_idx][s_type].astype(str).fillna("Unknown").values)
+        bp_norm.insert(0, "Resource Name", step_aligned[steps_sorted[0]].loc[common_idx][s_name].astype(str).values)
+        bp_norm = bp_norm.reset_index(drop=True)
+
+    # Sum of largest SCED values per row (over timestamps)
+    max_sced_per_row = pd.Series(np.nansum(M_sced, axis=1), index=range(len(common_idx)))  # temp index aligns with reset_index()
+
+    # Fuel per row (from first step)
+    fuel_per_row = step_aligned[steps_sorted[0]].loc[common_idx][s_type].astype(str).fillna("Unknown").reset_index(drop=True)
+
+    return norm_steps, hsl_norm, bp_norm, max_sced_per_row, fuel_per_row
+
+
+
+
 def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summary_csv: bool) -> None:
     """
-    For a given day:
-      - Load aggregation_HSL.csv
-      - For each aggregation_SCED1_Curve-MW<k>.csv:
-          normalize by HSL, save normalized CSV back into day_dir
-      - Build a line chart: x = step (k), y = avg normalized bid; one line per fuel
+    UPDATED:
+      - Build row-wise maxima across ALL SCED MW steps (M_sced).
+      - Define M_all = max(M_sced, HSL).
+      - Normalize each SCED step, HSL, and Base Point by M_all.
+      - Aggregate by fuel, average over resources×timestamps.
+      - Reapply magnitude by multiplying the averaged normalized values by SUM(M_sced) per fuel.
+      - Plot one line per fuel across steps; add dashed horizontal lines for HSL and Base Point (rescaled magnitudes).
     """
     day = day_dir.name
+
+    # Load HSL
     hsl_path = day_dir / "aggregation_HSL.csv"
     if not hsl_path.exists():
         matches = list(day_dir.glob("*HSL*.csv"))
@@ -356,11 +474,24 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
             print(f"[INFO] {day}: no HSL file; skipping normalized MW lines.")
             return
         hsl_path = matches[0]
-
     try:
         hsl_df = pd.read_csv(hsl_path, dtype=str)
     except Exception as e:
         print(f"[ERROR] {day}: failed to read HSL {hsl_path.name}: {e}")
+        return
+
+    # Load Base Point
+    bp_path = day_dir / "aggregation_Base_Point.csv"
+    if not bp_path.exists():
+        matches = list(day_dir.glob("*Base*Point*.csv"))
+        if not matches:
+            print(f"[INFO] {day}: no Base Point file; skipping normalized MW lines.")
+            return
+        bp_path = matches[0]
+    try:
+        bp_df = pd.read_csv(bp_path, dtype=str)
+    except Exception as e:
+        print(f"[ERROR] {day}: failed to read Base Point {bp_path.name}: {e}")
         return
 
     # Find SCED MW step files
@@ -370,60 +501,93 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
     if not mw_files:
         print(f"[INFO] {day}: no SCED MW step files; skipping normalized MW lines.")
         return
-
     def step_key(p: Path):
         m = MW_STEP_PATTERN.search(p.name)
         return int(m.group(1)) if m else 1_000_000
     mw_files = sorted(mw_files, key=step_key)
 
-    summary: Dict[int, Dict[str, float]] = {}
-
-    for stage_csv in mw_files:
-        m = MW_STEP_PATTERN.search(stage_csv.name)
+    # Load step frames
+    step_dfs: Dict[int, pd.DataFrame] = {}
+    for p in mw_files:
+        m = MW_STEP_PATTERN.search(p.name)
         step_num = int(m.group(1)) if m else None
-        try:
-            stage_df = pd.read_csv(stage_csv, dtype=str)
-        except Exception as e:
-            print(f"[ERROR] {day}: read failed for {stage_csv.name}: {e}")
+        if step_num is None:
             continue
-
         try:
-            norm_df = normalize_mw_by_hsl(stage_df, hsl_df)
+            step_dfs[step_num] = pd.read_csv(p, dtype=str)
         except Exception as e:
-            print(f"[INFO] {day}: {stage_csv.name} – normalization skipped: {e}")
-            continue
+            print(f"[WARN] {day}: failed to read {p.name}: {e}")
 
-        # Save normalized CSV back into inputs folder
-        norm_path = day_dir / f"{stage_csv.stem}_normalized.csv"
-        try:
-            norm_df.to_csv(norm_path, index=False)
-            print(f"[OK] Saved normalized: {norm_path}")
-        except Exception as e:
-            print(f"[ERROR] {day}: failed to write normalized CSV {norm_path.name}: {e}")
-
-        # Compute scalar per fuel for this step
-        avg_by_fuel = average_normalized_by_fuel(norm_df)
-        if step_num is not None:
-            summary[step_num] = avg_by_fuel
-
-    if not summary:
-        print(f"[INFO] {day}: no normalized data to summarize; skipping line plot.")
+    if not step_dfs:
+        print(f"[INFO] {day}: no readable SCED MW step files; skipping.")
         return
 
-    # Assemble summary table: rows=step, cols=fuels (sorted)
-    all_fuels = sorted({fuel for d in summary.values() for fuel in d.keys()})
-    steps_sorted = sorted(summary.keys())
-    data = [[summary[s].get(fuel, np.nan) for fuel in all_fuels] for s in steps_sorted]
-    summary_df = pd.DataFrame(data, index=steps_sorted, columns=all_fuels)
+    try:
+        norm_steps, hsl_norm, bp_norm, max_sced_per_row, fuel_per_row = normalize_by_row_max_with_hsl_and_bp(step_dfs, hsl_df, bp_df)
+    except Exception as e:
+        print(f"[ERROR] {day}: normalization by row-max failed: {e}")
+        return
 
-    # Plot: lines per fuel across steps
+    # Compute rescaling magnitude per fuel: sum of largest SCED values (M_sced) per row, then sum within fuel
+    # max_sced_per_row index aligns with fuel_per_row (both reset)
+    fuel_series = fuel_per_row.astype(str).fillna("Unknown")
+    rescale_by_fuel = max_sced_per_row.groupby(fuel_series).sum(min_count=1)
+
+    # Build per-step averaged normalized (over resources×timestamps) by fuel, then rescale
+    steps_sorted = sorted(norm_steps.keys())
+    fuels_sorted = sorted(rescale_by_fuel.index.tolist())
+
+    def avg_over_rows_and_time(df: pd.DataFrame) -> pd.Series:
+        name_col, type_col = normalize_key_columns(df)
+        ts_cols = detect_timestamp_columns(df, (name_col, type_col))
+        vals = df[ts_cols].apply(pd.to_numeric, errors="coerce")
+        vals.insert(0, "Resource Type", df[type_col].astype(str).fillna("Unknown"))
+        by_fuel = vals.groupby("Resource Type", dropna=False).mean(numeric_only=True).mean(axis=1, numeric_only=True)
+        return by_fuel
+
+    scaled_by_step = {}
+    for s in steps_sorted:
+        avg_norm = avg_over_rows_and_time(norm_steps[s])
+        # align with fuels_sorted and rescale
+        scaled = []
+        for f in fuels_sorted:
+            base = avg_norm.get(f, np.nan)
+            scale = rescale_by_fuel.get(f, np.nan)
+            scaled.append(float(base) * float(scale) if np.isfinite(base) and np.isfinite(scale) else np.nan)
+        scaled_by_step[s] = scaled
+
+    summary_scaled = pd.DataFrame.from_dict(scaled_by_step, orient="index", columns=fuels_sorted)
+    summary_scaled.index.name = "SCED Step"
+
+    # Compute HSL and Base Point dashed lines (same normalization and rescaling)
+    hsl_avg = avg_over_rows_and_time(hsl_norm)
+    bp_avg  = avg_over_rows_and_time(bp_norm)
+
+    hsl_scaled = pd.Series({f: (hsl_avg.get(f, np.nan) * rescale_by_fuel.get(f, np.nan)) for f in fuels_sorted})
+    bp_scaled  = pd.Series({f: (bp_avg.get(f, np.nan)  * rescale_by_fuel.get(f, np.nan)) for f in fuels_sorted})
+
+    # Plot
     day_out = plots_root / day / "sced_normalized"
     day_out.mkdir(parents=True, exist_ok=True)
 
-    ax = summary_df.plot(figsize=(14, 7), marker="o")
-    ax.set_title(f"{day} – Average Normalized Bid by SCED Step")
+    fig, ax = plt.subplots(figsize=(14, 7))
+    for f in fuels_sorted:
+        ax.plot(summary_scaled.index.values, summary_scaled[f].values, marker="o", label=f)
+
+    # dashed horizontals
+    for f in fuels_sorted:
+        y_hsl = hsl_scaled.get(f, np.nan)
+        y_bp  = bp_scaled.get(f, np.nan)
+        if np.isfinite(y_hsl):
+            ax.hlines(y=y_hsl, xmin=summary_scaled.index.min(), xmax=summary_scaled.index.max(),
+                      linestyles="dashed", linewidth=1.5, label=f"{f} – HSL")
+        if np.isfinite(y_bp):
+            ax.hlines(y=y_bp, xmin=summary_scaled.index.min(), xmax=summary_scaled.index.max(),
+                      linestyles="dashed", linewidth=1.5, label=f"{f} – Base Point")
+
+    ax.set_title(f"{day} – SCED Steps normalized by row-wise max (rescaled by sum of row maxima)")
     ax.set_xlabel("SCED Step")
-    ax.set_ylabel("Average Normalized Bid (MW / HSL)")
+    ax.set_ylabel("Scaled Value (sum of row max SCED MW × average normalized)")
     ax.legend(title="Fuel Type", bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0.)
     plt.tight_layout()
     out_png = day_out / "normalized_bids_by_stage.png"
@@ -433,10 +597,11 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
 
     if save_summary_csv:
         out_csv = day_out / "normalized_bids_by_stage.csv"
-        summary_df.to_csv(out_csv, index_label="step")
-        print(f"[OK] Saved: {out_csv}")
-
-# --------- Driver ---------
+        try:
+            summary_scaled.to_csv(out_csv)
+            print(f"[OK] Saved: {out_csv}")
+        except Exception as e:
+            print(f"[ERROR] {day}: failed to write summary CSV: {e}")
 def main():
     root = Path(ROOT_DIR).resolve()
     out  = Path(PLOTS_DIR).resolve()

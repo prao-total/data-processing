@@ -451,7 +451,6 @@ def normalize_by_row_max_with_hsl_and_bp(step_dfs: Dict[int, pd.DataFrame],
 
     return norm_steps, hsl_norm, bp_norm, max_sced_per_row, fuel_per_row
 
-
 def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summary_csv: bool) -> None:
     """
     UPDATED:
@@ -461,7 +460,8 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
       - Aggregate by fuel, average over resources×timestamps.
       - Reapply magnitude by multiplying the averaged normalized values by SUM(M_sced) per fuel.
       - Plot one line per fuel across steps; add dashed horizontal lines for HSL and Base Point (rescaled magnitudes).
-      - ALSO write one plot per fuel using the exact same series used in the combined plot.
+      - ALSO emit one plot per fuel using the exact same series used in the combined plot.
+      - NEW: Quick check to list all fuels present in the raw input data (saved to CSV).
     """
     day = day_dir.name
 
@@ -522,6 +522,44 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
     if not step_dfs:
         print(f"[INFO] {day}: no readable SCED MW step files; skipping.")
         return
+
+    # ------------------------------------------------------------
+    # QUICK CHECK: list all fuels present in the raw input data
+    # ------------------------------------------------------------
+    print(f"\n[CHECK] {day}: Inspecting fuels present in raw input data...")
+
+    def _extract_fuels(df: pd.DataFrame) -> pd.Series:
+        name_col, type_col = normalize_key_columns(df)
+        if type_col is None:
+            return pd.Series([], dtype=str)
+        return (
+            df[type_col].astype(str)
+            .str.strip()
+            .replace({"": "Unknown", "None": "Unknown", "nan": "Unknown", "NaN": "Unknown"})
+        )
+
+    fuels_raw: List[str] = []
+    fuels_raw.extend(_extract_fuels(hsl_df).tolist())
+    fuels_raw.extend(_extract_fuels(bp_df).tolist())
+    for _, df in step_dfs.items():
+        fuels_raw.extend(_extract_fuels(df).tolist())
+
+    fuels_raw = pd.Series(fuels_raw, dtype=str).replace(
+        {"": "Unknown", "None": "Unknown", "nan": "Unknown", "NaN": "Unknown"}
+    )
+    unique_fuels_raw = fuels_raw.value_counts(dropna=False).sort_index()
+
+    print(f"[CHECK] {day}: FOUND FUEL TYPES IN INPUT DATA:")
+    for fuel, count in unique_fuels_raw.items():
+        print(f"    - {fuel}: {count} rows")
+
+    check_path = day_dir / "fuel_check_raw_input.csv"
+    try:
+        unique_fuels_raw.to_csv(check_path, header=["count"])
+        print(f"[CHECK] Saved raw fuel diagnostics → {check_path}\n")
+    except Exception as e:
+        print(f"[WARN] {day}: failed to write fuel_check_raw_input.csv: {e}")
+    # ------------------------------------------------------------
 
     # Normalize by row-wise max including HSL baseline
     try:
@@ -614,7 +652,7 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
     plt.close()
     print(f"[OK] Saved: {out_png}")
 
-    # --- ALSO: one plot per fuel using the SAME series as the combined plot ---
+    # ALSO: one plot per fuel using the SAME series as the combined plot
     per_fuel_dir = day_out / "per_fuel"
     per_fuel_dir.mkdir(parents=True, exist_ok=True)
 
@@ -655,6 +693,7 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
             print(f"[OK] Saved: {out_csv}")
         except Exception as e:
             print(f"[ERROR] {day}: failed to write summary CSV: {e}")
+
 
 def main():
     root = Path(ROOT_DIR).resolve()

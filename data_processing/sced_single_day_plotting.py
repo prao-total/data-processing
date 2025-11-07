@@ -452,8 +452,6 @@ def normalize_by_row_max_with_hsl_and_bp(step_dfs: Dict[int, pd.DataFrame],
     return norm_steps, hsl_norm, bp_norm, max_sced_per_row, fuel_per_row
 
 
-
-
 def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summary_csv: bool) -> None:
     """
     UPDATED:
@@ -463,6 +461,7 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
       - Aggregate by fuel, average over resources×timestamps.
       - Reapply magnitude by multiplying the averaged normalized values by SUM(M_sced) per fuel.
       - Plot one line per fuel across steps; add dashed horizontal lines for HSL and Base Point (rescaled magnitudes).
+      - ALSO write one plot per fuel using the exact same series used in the combined plot.
     """
     day = day_dir.name
 
@@ -501,9 +500,11 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
     if not mw_files:
         print(f"[INFO] {day}: no SCED MW step files; skipping normalized MW lines.")
         return
+
     def step_key(p: Path):
         m = MW_STEP_PATTERN.search(p.name)
         return int(m.group(1)) if m else 1_000_000
+
     mw_files = sorted(mw_files, key=step_key)
 
     # Load step frames
@@ -522,14 +523,16 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
         print(f"[INFO] {day}: no readable SCED MW step files; skipping.")
         return
 
+    # Normalize by row-wise max including HSL baseline
     try:
-        norm_steps, hsl_norm, bp_norm, max_sced_per_row, fuel_per_row = normalize_by_row_max_with_hsl_and_bp(step_dfs, hsl_df, bp_df)
+        norm_steps, hsl_norm, bp_norm, max_sced_per_row, fuel_per_row = normalize_by_row_max_with_hsl_and_bp(
+            step_dfs, hsl_df, bp_df
+        )
     except Exception as e:
         print(f"[ERROR] {day}: normalization by row-max failed: {e}")
         return
 
     # Compute rescaling magnitude per fuel: sum of largest SCED values (M_sced) per row, then sum within fuel
-    # max_sced_per_row index aligns with fuel_per_row (both reset)
     fuel_series = fuel_per_row.astype(str).fillna("Unknown")
     rescale_by_fuel = max_sced_per_row.groupby(fuel_series).sum(min_count=1)
 
@@ -542,10 +545,14 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
         ts_cols = detect_timestamp_columns(df, (name_col, type_col))
         vals = df[ts_cols].apply(pd.to_numeric, errors="coerce")
         vals.insert(0, "Resource Type", df[type_col].astype(str).fillna("Unknown"))
-        by_fuel = vals.groupby("Resource Type", dropna=False).mean(numeric_only=True).mean(axis=1, numeric_only=True)
+        by_fuel = (
+            vals.groupby("Resource Type", dropna=False)
+                .mean(numeric_only=True)
+                .mean(axis=1, numeric_only=True)
+        )
         return by_fuel
 
-    scaled_by_step = {}
+    scaled_by_step: Dict[int, List[float]] = {}
     for s in steps_sorted:
         avg_norm = avg_over_rows_and_time(norm_steps[s])
         # align with fuels_sorted and rescale
@@ -566,7 +573,7 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
     hsl_scaled = pd.Series({f: (hsl_avg.get(f, np.nan) * rescale_by_fuel.get(f, np.nan)) for f in fuels_sorted})
     bp_scaled  = pd.Series({f: (bp_avg.get(f, np.nan)  * rescale_by_fuel.get(f, np.nan)) for f in fuels_sorted})
 
-    # Plot
+    # Plot combined
     day_out = plots_root / day / "sced_normalized"
     day_out.mkdir(parents=True, exist_ok=True)
 
@@ -574,16 +581,28 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
     for f in fuels_sorted:
         ax.plot(summary_scaled.index.values, summary_scaled[f].values, marker="o", label=f)
 
-    # dashed horizontals
+    # dashed horizontals on the combined chart (kept as-is)
     for f in fuels_sorted:
         y_hsl = hsl_scaled.get(f, np.nan)
         y_bp  = bp_scaled.get(f, np.nan)
         if np.isfinite(y_hsl):
-            ax.hlines(y=y_hsl, xmin=summary_scaled.index.min(), xmax=summary_scaled.index.max(),
-                      linestyles="dashed", linewidth=1.5, label=f"{f} – HSL")
+            ax.hlines(
+                y=y_hsl,
+                xmin=summary_scaled.index.min(),
+                xmax=summary_scaled.index.max(),
+                linestyles="dashed",
+                linewidth=1.5,
+                label=f"{f} – HSL",
+            )
         if np.isfinite(y_bp):
-            ax.hlines(y=y_bp, xmin=summary_scaled.index.min(), xmax=summary_scaled.index.max(),
-                      linestyles="dashed", linewidth=1.5, label=f"{f} – Base Point")
+            ax.hlines(
+                y=y_bp,
+                xmin=summary_scaled.index.min(),
+                xmax=summary_scaled.index.max(),
+                linestyles="dashed",
+                linewidth=1.5,
+                label=f"{f} – Base Point",
+            )
 
     ax.set_title(f"{day} – SCED Steps normalized by row-wise max (rescaled by sum of row maxima)")
     ax.set_xlabel("SCED Step")
@@ -595,6 +614,40 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
     plt.close()
     print(f"[OK] Saved: {out_png}")
 
+    # --- ALSO: one plot per fuel using the SAME series as the combined plot ---
+    per_fuel_dir = day_out / "per_fuel"
+    per_fuel_dir.mkdir(parents=True, exist_ok=True)
+
+    for f in fuels_sorted:
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        # main line for this fuel
+        x = summary_scaled.index.values
+        y = summary_scaled[f].values
+        ax.plot(x, y, marker="o", linewidth=2, label=f)
+
+        # dashed HSL / Base Point for this fuel (distinct colors)
+        y_hsl = hsl_scaled.get(f, np.nan)
+        y_bp  = bp_scaled.get(f, np.nan)
+        if np.isfinite(y_hsl):
+            ax.axhline(y_hsl, linestyle="--", linewidth=1.75, color="#1f77b4", label="HSL (rescaled)")
+        if np.isfinite(y_bp):
+            ax.axhline(y_bp,  linestyle="--", linewidth=1.75, color="#d62728", label="Base Point (rescaled)")
+
+        ax.set_title(f"{day} – Normalized & Rescaled SCED Curve (Fuel: {f})")
+        ax.set_xlabel("SCED Step")
+        ax.set_ylabel("Scaled Value (Σ row-max SCED × avg normalized)")
+        ax.set_xticks(x)
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+        out_pf = per_fuel_dir / f"{f}_normalized.png"
+        fig.tight_layout()
+        fig.savefig(out_pf, dpi=150)
+        plt.close(fig)
+        print(f"[OK] Saved: {out_pf}")
+
+    # Optional CSV: write combined wide table
     if save_summary_csv:
         out_csv = day_out / "normalized_bids_by_stage.csv"
         try:
@@ -602,6 +655,7 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
             print(f"[OK] Saved: {out_csv}")
         except Exception as e:
             print(f"[ERROR] {day}: failed to write summary CSV: {e}")
+
 def main():
     root = Path(ROOT_DIR).resolve()
     out  = Path(PLOTS_DIR).resolve()

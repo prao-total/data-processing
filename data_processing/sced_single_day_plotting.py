@@ -1,624 +1,399 @@
+
 #!/usr/bin/env python3
-# sced_single_day_plotting.py
 """
-Generates per day:
-  1) Base Point stacked bar plots (hourly by fuel)
-  2) SCED step price violin plots (by fuel)
-  3) SCED step normalized-bid line plot (by fuel):
-       - Normalize each aggregation_SCED1_Curve-MW<k>.csv by aggregation_HSL.csv
-       - Save normalized CSVs back into the day folder
-       - Plot average normalized bid vs step, one line per fuel
+SCED single-day plotting (per-fuel normalized curves with magnitude reapplication).
 
-Input (from your extractor step):
-ROOT_DIR/
-  YYYY-MM-DD/
-    aggregation_Base_Point.csv
-    aggregation_HSL.csv
-    aggregation_SCED1_Curve-Price1.csv, ...
-    aggregation_SCED1_Curve-MW1.csv, ...
-
-Outputs:
-PLOTS_DIR/
-  YYYY-MM-DD/
-    base_point_stacked_<agg>.png
-    base_point_hourly_<agg>.csv         # optional
-    sced_violin/
-      step_01_violin.png
-      step_01_values.csv                # optional
-    sced_normalized/
-      normalized_bids_by_stage.png
-      normalized_bids_by_stage.csv
-
-Assumptions:
-- Wide format:
-    col0 = "Resource Name"
-    col1 = "Resource Type"
-    col2+ = 5-minute timestamps as column headers
+Changes in this version:
+- Creates one normalized plot per FUEL (instead of one multi-fuel plot).
+- Normalization baseline per (resource, timestamp): row-wise max across all SCED MW steps and HSL
+  (i.e., M_all = max(max_sced_step, HSL)). Base Point uses the same M_all per row.
+- After averaging normalized curves within a fuel, reapply magnitude using the sum of per-row SCED maxima
+  (Σ M_sced) for that fuel (as requested).
+- Plot dashed horizontal lines for HSL and Base Point with distinct colors.
 """
 
 from __future__ import annotations
-from pathlib import Path
-from typing import Dict, Tuple, List
+import os
 import re
+import glob
+import math
+from typing import Dict, List, Tuple, Optional
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 
-# ===================== EDIT THESE =====================
-ROOT_DIR  = r"/path/to/output_root"   # contains YYYY-MM-DD subfolders
-PLOTS_DIR = r"/path/to/plots_out"     # results written here, mirrored per-day
-# Optional toggles (leave as-is unless you want different behavior)
-BP_AGG_MODE = "mean"                  # "mean" (MW) or "mwh" (energy)
-BP_SAVE_HOURLY_CSV = True             # write hourly pivot per day
-SCED_SAVE_VALUES_CSV = False          # write per-step flattened price values
-VIOLIN_MIN_SAMPLES = 1                # min samples per fuel to draw a violin
-SAVE_NORMALIZED_SUMMARY_CSV = True    # write the per-day summary used for line plot
-# ======================================================
 
-PRICE_STEP_PATTERN = re.compile(r"aggregation_SCED1_Curve-Price(\d+)\.csv$", re.IGNORECASE)
-MW_STEP_PATTERN    = re.compile(r"aggregation_SCED1_Curve-MW(\d+)\.csv$", re.IGNORECASE)
+# ----------------------- Config -----------------------
+# Root directory that contains YYYY-MM-DD subfolders with aggregated CSVs
+ROOT_DIR = os.environ.get("ROOT_DIR", "./inputs/sced_day")
+# Where plots will be written
+PLOTS_DIR = os.environ.get("PLOTS_DIR", "./plots")
 
-# --------- Shared helpers ---------
-def normalize_key_columns(df: pd.DataFrame) -> Tuple[str, str]:
-    """Find actual 'Resource Name' and 'Resource Type' columns (case/space tolerant)."""
-    def norm(s: str) -> str:
-        return s.strip().lower()
-    m = {norm(c): c for c in df.columns}
-    name_col = m.get("resource name")
-    type_col = m.get("resource type")
-    if not name_col or not type_col:
-        raise ValueError(f"Expected columns 'Resource Name' and 'Resource Type'; found: {list(df.columns)}")
-    return name_col, type_col
+# Filenames (per-day) expected (case-insensitive tolerant search is used as fallback)
+BASE_POINT_NAME_HINT = "aggregation_Base_Point.csv"
+HSL_NAME_HINT        = "aggregation_HSL.csv"
+SCED_MW_GLOB         = "aggregation_SCED1_Curve-MW*.csv"  # stage files (MW1, MW2, ...)
 
-def detect_timestamp_columns(df: pd.DataFrame, keys: Tuple[str, str]) -> List[str]:
-    """Return original column names that parse as datetimes (excluding the two key columns)."""
-    name_col, type_col = keys
-    ts_cols: List[str] = []
-    for col in df.columns:
-        if col in (name_col, type_col):
-            continue
-        ts = pd.to_datetime(col, errors="coerce")
-        if pd.isna(ts):
-            continue
-        ts_cols.append(col)
-    if not ts_cols:
-        raise ValueError("No timestamp columns detected (headers must be parseable datetimes).")
-    ts_cols = sorted(ts_cols, key=lambda c: pd.to_datetime(c))
-    return ts_cols
+# Toggle saving intermediate CSVs
+SAVE_NORMALIZED_VALUES_CSV = os.environ.get("SAVE_NORMALIZED_VALUES_CSV", "0") == "1"
 
-# =========================
-# 1) Base Point (stacked)
-# =========================
-def hourly_by_fuel_from_wide(df: pd.DataFrame, agg_mode: str) -> pd.DataFrame:
-    name_col, type_col = normalize_key_columns(df)
-    ts_cols = detect_timestamp_columns(df, (name_col, type_col))
+# Dashed line colors (explicit per user request for distinct colors)
+HSL_LINE_COLOR = "#1f77b4"   # blue-ish
+BP_LINE_COLOR  = "#d62728"   # red-ish
 
-    numeric = df[ts_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
-    numeric.insert(0, "Resource Type", df[type_col].astype(str).fillna("Unknown"))
-    fuel_5min = numeric.groupby("Resource Type", dropna=False).sum(numeric_only=True)
+# ------------------------------------------------------
 
-    col_ts = pd.to_datetime(fuel_5min.columns, errors="coerce")
-    fuel_5min.columns = col_ts
-    fuel_5min = fuel_5min.T.sort_index()
-    fuel_5min = fuel_5min.groupby(level=0).sum()
 
-    if agg_mode.lower() == "mwh":
-        hourly = fuel_5min.resample("h").sum() * (5.0 / 60.0)
-    else:
-        hourly = fuel_5min.resample("h").mean()
+def _find_case_insensitive(path: str, name_hint: str) -> Optional[str]:
+    """Try direct join; otherwise scan for case-insensitive match."""
+    p = os.path.join(path, name_hint)
+    if os.path.exists(p):
+        return p
+    # fallback: case-insensitive search in folder
+    lower_hint = name_hint.lower()
+    for fn in os.listdir(path):
+        if fn.lower() == lower_hint:
+            return os.path.join(path, fn)
+    return None
 
-    hourly.columns = [str(c) if c is not None else "Unknown" for c in hourly.columns]
-    hourly = hourly.reindex(sorted(hourly.columns), axis=1)
-    return hourly
 
-def plot_base_point_day(day: str, hourly_df: pd.DataFrame, out_png: Path, agg_mode: str) -> None:
-    if hourly_df.empty:
-        print(f"[WARN] {day}: no hourly data; skipping Base Point plot.")
-        return
-    day_start = pd.to_datetime(day)
-    day_end   = day_start + pd.Timedelta(days=1)
-    hourly_df = hourly_df[(hourly_df.index >= day_start) & (hourly_df.index < day_end)]
-    hourly_df = hourly_df.reindex(pd.date_range(day_start, day_end, freq="h", inclusive="left"), fill_value=0.0)
+def _find_glob(path: str, pattern: str) -> List[str]:
+    cand = sorted(glob.glob(os.path.join(path, pattern)))
+    if cand:
+        return cand
+    # broader fallback
+    cand = sorted(glob.glob(os.path.join(path, "*SCED*Curve*MW*.csv")))
+    return cand
 
-    plot_df = hourly_df.copy()
-    plot_df.index = plot_df.index.hour  # 0..23
 
-    ax = plot_df.plot(kind="bar", stacked=True, figsize=(14, 7))
-    ylabel = "Average MW" if agg_mode.lower() == "mean" else "MWh"
-    ax.set_title(f"{day} – Base Point by Fuel Type (Hourly {ylabel})")
-    ax.set_xlabel("Hour of Day")
-    ax.set_ylabel(ylabel)
-    ax.legend(title="Fuel Type", bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0.)
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=150)
-    plt.close()
-    print(f"[OK] Saved: {out_png}")
+def _detect_key_cols(df: pd.DataFrame) -> Tuple[str, Optional[str]]:
+    """Return canonical 'Resource Name' column and optional 'Resource Type' column names as present in df."""
+    cols = {c.strip().lower(): c for c in df.columns}
+    rn = cols.get("resource name") or cols.get("resourcename")
+    rt = cols.get("resource type") or cols.get("resourcetype")
+    if rn is None:
+        # Try fuzzy-ish search
+        for c in df.columns:
+            if re.sub(r"\s+", "", c.strip().lower()) in ("resourcename",):
+                rn = c
+                break
+    if rn is None:
+        raise ValueError("Could not find 'Resource Name' column.")
+    return rn, rt
 
-def process_base_point_day(day_dir: Path, plots_root: Path, agg_mode: str, save_hourly_csv: bool) -> None:
-    day = day_dir.name
-    csv_path = day_dir / "aggregation_Base_Point.csv"
-    if not csv_path.exists():
-        matches = list(day_dir.glob("aggregation_Base_Point*.csv")) or list(day_dir.glob("*Base*Point*.csv"))
-        if not matches:
-            print(f"[INFO] {day}: no Base Point file; skipping.")
-            return
-        csv_path = matches[0]
 
-    try:
-        df = pd.read_csv(csv_path, dtype=str)
-    except Exception as e:
-        print(f"[ERROR] {day}: read failed for {csv_path.name}: {e}")
-        return
-
-    try:
-        hourly = hourly_by_fuel_from_wide(df, agg_mode)
-    except Exception as e:
-        print(f"[ERROR] {day}: Base Point hourly aggregation failed: {e}")
-        return
-
-    day_out = plots_root / day
-    day_out.mkdir(parents=True, exist_ok=True)
-
-    if save_hourly_csv:
-        out_csv = day_out / f"base_point_hourly_{agg_mode}.csv"
-        to_save = hourly.copy()
-        to_save.insert(0, "hour", to_save.index.strftime("%Y-%m-%d %H:%M"))
+def _timestamp_columns(df: pd.DataFrame, exclude: List[str]) -> List[str]:
+    """Columns that look like timestamps (excluding key cols)."""
+    cand = [c for c in df.columns if c not in exclude]
+    out = []
+    for c in cand:
         try:
-            to_save.to_csv(out_csv, index=False)
-            print(f"[OK] Saved: {out_csv}")
-        except Exception as e:
-            print(f"[ERROR] {day}: failed to write hourly CSV: {e}")
-
-    out_png = day_out / f"base_point_stacked_{agg_mode}.png"
-    plot_base_point_day(day, hourly, out_png, agg_mode)
-
-# =========================
-# 2) SCED price violins
-# =========================
-def load_violin_data_by_fuel(df: pd.DataFrame) -> Dict[str, np.ndarray]:
-    name_col, type_col = normalize_key_columns(df)
-    ts_cols = detect_timestamp_columns(df, (name_col, type_col))
-    prices = df[ts_cols].apply(pd.to_numeric, errors="coerce")
-    fuels = df[type_col].astype(str).fillna("Unknown")
-    prices = prices.assign(**{"__fuel__": fuels})
-
-    out: Dict[str, np.ndarray] = {}
-    for fuel, block in prices.groupby("__fuel__"):
-        vals = block[ts_cols].to_numpy().ravel()
-        vals = vals[np.isfinite(vals)]
-        out[str(fuel)] = vals.astype(float)
+            pd.to_datetime(c)
+            out.append(c)
+        except Exception:
+            # not a timestamp header
+            pass
     return out
 
-def plot_violin_step(day: str, step_csv: Path, day_out_dir: Path, save_values_csv: bool) -> None:
-    m = PRICE_STEP_PATTERN.search(step_csv.name)
-    step_num = int(m.group(1)) if m else None
 
-    try:
-        df = pd.read_csv(step_csv, dtype=str)
-    except Exception as e:
-        print(f"[ERROR] {day}: read failed for {step_csv.name}: {e}")
-        return
-
-    try:
-        data_by_fuel = load_violin_data_by_fuel(df)
-    except Exception as e:
-        print(f"[ERROR] {day}: processing failed for {step_csv.name}: {e}")
-        return
-
-    if not data_by_fuel:
-        print(f"[INFO] {day}: no data in {step_csv.name}; skipping.")
-        return
-
-    fuels_all = sorted(data_by_fuel.keys())
-    fuels, datasets, skipped = [], [], []
-    for f in fuels_all:
-        arr = data_by_fuel[f]
-        if arr is None or arr.size < VIOLIN_MIN_SAMPLES:
-            skipped.append(f); continue
-        fuels.append(f); datasets.append(arr)
-    if skipped:
-        print(f"[INFO] {day}: {step_csv.name} – skipped empty/short fuels: {', '.join(skipped)}")
-    if not datasets:
-        title_step = f"SCED Step {step_num}" if step_num is not None else "SCED Step"
-        print(f"[INFO] {day}: {title_step} – no fuels with data; skipping plot.")
-        return
-
-    fig, ax = plt.subplots(figsize=(14, 7))
-    ax.violinplot(datasets, showmeans=False, showmedians=True, showextrema=True)
-    title_step = f"SCED Step {step_num}" if step_num is not None else "SCED Step"
-    ax.set_title(f"{day} – {title_step} Price Distribution by Fuel")
-    ax.set_xlabel("Fuel Type")
-    ax.set_ylabel("Price")
-    ax.set_xticks(range(1, len(fuels) + 1))
-    ax.set_xticklabels(fuels, rotation=30, ha="right")
-    plt.tight_layout()
-
-    out_dir = day_out_dir / "sced_violin"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    suffix = f"{step_num:02d}" if step_num is not None else "X"
-    out_png = out_dir / f"step_{suffix}_violin.png"
-    plt.savefig(out_png, dpi=150)
-    plt.close()
-    print(f"[OK] Saved: {out_png}")
-
-    if save_values_csv:
-        vals_list = [pd.DataFrame({"fuel": f, "price": arr}) for f, arr in zip(fuels, datasets)]
-        long_df = pd.concat(vals_list, ignore_index=True)
-        out_csv = out_dir / f"step_{suffix}_values.csv"
-        long_df.to_csv(out_csv, index=False)
-        print(f"[OK] Saved: {out_csv}")
-
-def process_sced_violins_day(day_dir: Path, plots_root: Path, save_values_csv: bool) -> None:
-    day = day_dir.name
-    day_out = plots_root / day
-    day_out.mkdir(parents=True, exist_ok=True)
-
-    step_files = list(day_dir.glob("aggregation_SCED1_Curve-Price*.csv"))
-    if not step_files:
-        step_files = list(day_dir.glob("*SCED*Curve*Price*.csv"))
-    if not step_files:
-        print(f"[INFO] {day}: no SCED price files; skipping violins.")
-        return
-
-    def step_key(p: Path):
-        m = PRICE_STEP_PATTERN.search(p.name)
-        return int(m.group(1)) if m else 1_000_000
-    step_files = sorted(step_files, key=step_key)
-
-    for step_csv in step_files:
-        plot_violin_step(day, step_csv, day_out, save_values_csv)
-
-# =========================================
-# 3) SCED normalized-bids (MW/HSL) lines
-# =========================================
-def normalize_mw_by_hsl(stage_df: pd.DataFrame, hsl_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Elementwise normalization with strict alignment:
-      - Match rows by Resource Name (case/whitespace tolerant).
-      - Match columns by timestamp headers (intersection only, chronological).
-      - Return wide frame: Resource Name, Resource Type, then common timestamps as MW/HSL.
-      - HSL<=0 or NaN -> NaN (avoid divide-by-zero).
-    """
-    s_name, s_type = normalize_key_columns(stage_df)
-    h_name, h_type = normalize_key_columns(hsl_df)
-
-    # Normalize resource-name keys (casefolded, trimmed)
-    def norm_key(s: pd.Series) -> pd.Series:
-        return s.astype(str).str.strip().str.casefold()
-
-    stage = stage_df.copy()
-    hsl   = hsl_df.copy()
-    stage["_key"] = norm_key(stage[s_name])
-    hsl["_key"]   = norm_key(hsl[h_name])
-
-    # If duplicates exist, keep first occurrence (customize if needed)
-    stage = stage.drop_duplicates(subset=["_key"], keep="first")
-    hsl   = hsl.drop_duplicates(subset=["_key"], keep="first")
-
-    stage = stage.set_index("_key")
-    hsl   = hsl.set_index("_key")
-
-    # Timestamp intersections
-    s_ts = detect_timestamp_columns(stage.reset_index(), (s_name, s_type))
-    h_ts = detect_timestamp_columns(hsl.reset_index(),   (h_name, h_type))
-    common_ts = sorted(set(s_ts).intersection(h_ts), key=lambda c: pd.to_datetime(c))
-    if not common_ts:
-        raise ValueError("No overlapping timestamp columns between MW stage and HSL.")
-
-    # Common rows (resources)
-    idx_common = stage.index.intersection(hsl.index)
-    if idx_common.empty:
-        raise ValueError("No overlapping Resource Name rows between MW stage and HSL (after normalization).")
-
-    # Aligned numeric blocks
-    stage_block = stage.loc[idx_common, common_ts].apply(pd.to_numeric, errors="coerce")
-    hsl_block   = hsl.loc[idx_common,   common_ts].apply(pd.to_numeric, errors="coerce")
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        norm_vals = np.where(np.isfinite(hsl_block.values) & (hsl_block.values > 0.0),
-                             stage_block.values / hsl_block.values,
-                             np.nan)
-
-    # Compose output with display names and fuel from the stage file
-    disp_names = stage.loc[idx_common, s_name].astype(str)
-    fuel_types = stage.loc[idx_common, s_type].astype(str).fillna("Unknown")
-
-    out = pd.DataFrame(norm_vals, index=idx_common, columns=common_ts)
-    out.insert(0, "Resource Type", fuel_types.values)
-    out.insert(0, "Resource Name", disp_names.values)
-    out.reset_index(drop=True, inplace=True)
+def _coerce_numeric(df: pd.DataFrame, ts_cols: List[str]) -> pd.DataFrame:
+    out = df.copy()
+    for c in ts_cols:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
     return out
 
-def average_normalized_by_fuel(norm_df: pd.DataFrame) -> Dict[str, float]:
-    """Average across all resources & timestamps for each fuel type -> scalar per fuel."""
-    name_col, type_col = normalize_key_columns(norm_df)
-    ts_cols = detect_timestamp_columns(norm_df, (name_col, type_col))
-    vals = norm_df[ts_cols].apply(pd.to_numeric, errors="coerce")
-    vals.insert(0, "Resource Type", norm_df[type_col].astype(str).fillna("Unknown"))
-    by_fuel = vals.groupby("Resource Type", dropna=False).mean(numeric_only=True).mean(axis=1, numeric_only=True)
-    return {str(k): float(v) for k, v in by_fuel.sort_index().items()}
 
-
-def normalize_by_row_max_with_hsl_and_bp(step_dfs: Dict[int, pd.DataFrame],
-                                         hsl_df: pd.DataFrame,
-                                         bp_df: pd.DataFrame) -> Tuple[Dict[int, pd.DataFrame], pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+def _align_on_resources_and_timestamps(dfs: List[pd.DataFrame]) -> Tuple[List[pd.DataFrame], List[str], str, Optional[str]]:
     """
-    Align all inputs on common resources and timestamps.
-    For each resource×timestamp cell, compute:
-      M_sced = max over all SCED-MW steps
-      M_all  = max(M_sced, HSL)
-
-    Return:
-      - norm_steps: dict[step]-> normalized (values / M_all)
-      - hsl_norm  : normalized HSL (values / M_all)
-      - bp_norm   : normalized Base Point (values / M_all)
-      - max_sced_per_row: Series indexed by row (resource) with sum_over_timestamps(M_sced)
-      - fuel_per_row: Series fuel type per resource row (from the first step that has it, else HSL/BP)
+    Given [SCED_step_1, ..., SCED_step_K, HSL, BasePoint], align on common resources and timestamp headers.
+    Returns (aligned_dfs, common_ts, resource_name_col, resource_type_col)
     """
-    # Normalize keys
-    # Find key columns for each df
-    # Use first step to detect columns
-    first_df = next(iter(step_dfs.values()))
-    s_name, s_type = normalize_key_columns(first_df)
-    h_name, h_type = normalize_key_columns(hsl_df)
-    b_name, b_type = normalize_key_columns(bp_df)
-
-    def norm_series(s: pd.Series) -> pd.Series:
-        return s.astype(str).str.strip().str.casefold()
-
-    # Set index by normalized resource name
-    step_aligned = {}
-    for k, df in step_dfs.items():
-        df2 = df.copy()
-        df2["_key"] = norm_series(df2[s_name])
-        df2 = df2.set_index("_key")
-        step_aligned[k] = df2
-
-    h2 = hsl_df.copy()
-    h2["_key"] = norm_series(h2[h_name])
-    h2 = h2.set_index("_key")
-
-    b2 = bp_df.copy()
-    b2["_key"] = norm_series(b2[b_name])
-    b2 = b2.set_index("_key")
-
-    # Common timestamp columns across all steps + HSL + BP
-    ts_sets = []
-    for df in step_aligned.values():
-        name_col, type_col = normalize_key_columns(df.reset_index())
-        ts_sets.append(set(detect_timestamp_columns(df.reset_index(), (name_col, type_col))))
-    ts_sets.append(set(detect_timestamp_columns(h2.reset_index(), (h_name, h_type))))
-    ts_sets.append(set(detect_timestamp_columns(b2.reset_index(), (b_name, b_type))))
-    common_ts = sorted(set.intersection(*ts_sets), key=lambda c: pd.to_datetime(c))
-    if not common_ts:
-        raise ValueError("No overlapping timestamp columns across SCED steps, HSL, and Base Point.")
-
-    # Common resource rows
-    common_idx = set(h2.index) & set(b2.index)
-    for df in step_aligned.values():
-        common_idx &= set(df.index)
-    common_idx = pd.Index(sorted(common_idx))
-    if common_idx.empty:
-        raise ValueError("No overlapping Resource Name rows across SCED steps, HSL, and Base Point.")
-
-    # Extract numeric blocks
-    step_vals = {k: df.loc[common_idx, common_ts].apply(pd.to_numeric, errors="coerce").to_numpy()
-                 for k, df in step_aligned.items()}
-    h_vals = h2.loc[common_idx, common_ts].apply(pd.to_numeric, errors="coerce").to_numpy()
-    b_vals = b2.loc[common_idx, common_ts].apply(pd.to_numeric, errors="coerce").to_numpy()
-
-    # Compute M_sced and M_all
-    # Stack steps into 3D: (n_steps, n_rows, n_ts)
-    steps_sorted = sorted(step_vals.keys())
-    stack = np.stack([step_vals[k] for k in steps_sorted], axis=0)  # shape (S, R, T)
-    M_sced = np.nanmax(stack, axis=0)  # (R, T)
-    M_all = np.nanmax(np.stack([M_sced, h_vals], axis=0), axis=0)   # include HSL
-
-    # Avoid zeros and non-finite
-    M_all_safe = np.where(np.isfinite(M_all) & (M_all > 0.0), M_all, np.nan)
-
-    # Normalize each step, HSL, BP
-    norm_steps = {}
-    with np.errstate(divide="ignore", invalid="ignore"):
-        for i, k in enumerate(steps_sorted):
-            norm = np.where(np.isfinite(M_all_safe), stack[i] / M_all_safe, np.nan)
-            out = pd.DataFrame(norm, index=common_idx, columns=common_ts)
-            # attach display columns from the step df
-            src = step_aligned[k].loc[common_idx]
-            out.insert(0, "Resource Type", src[s_type].astype(str).fillna("Unknown").values)
-            out.insert(0, "Resource Name", src[s_name].astype(str).values)
-            norm_steps[k] = out.reset_index(drop=True)
-
-        h_norm = np.where(np.isfinite(M_all_safe), h_vals / M_all_safe, np.nan)
-        hsl_norm = pd.DataFrame(h_norm, index=common_idx, columns=common_ts)
-        hsl_norm.insert(0, "Resource Type", step_aligned[steps_sorted[0]].loc[common_idx][s_type].astype(str).fillna("Unknown").values)
-        hsl_norm.insert(0, "Resource Name", step_aligned[steps_sorted[0]].loc[common_idx][s_name].astype(str).values)
-        hsl_norm = hsl_norm.reset_index(drop=True)
-
-        b_norm = np.where(np.isfinite(M_all_safe), b_vals / M_all_safe, np.nan)
-        bp_norm = pd.DataFrame(b_norm, index=common_idx, columns=common_ts)
-        bp_norm.insert(0, "Resource Type", step_aligned[steps_sorted[0]].loc[common_idx][s_type].astype(str).fillna("Unknown").values)
-        bp_norm.insert(0, "Resource Name", step_aligned[steps_sorted[0]].loc[common_idx][s_name].astype(str).values)
-        bp_norm = bp_norm.reset_index(drop=True)
-
-    # Sum of largest SCED values per row (over timestamps)
-    max_sced_per_row = pd.Series(np.nansum(M_sced, axis=1), index=range(len(common_idx)))  # temp index aligns with reset_index()
-
-    # Fuel per row (from first step)
-    fuel_per_row = step_aligned[steps_sorted[0]].loc[common_idx][s_type].astype(str).fillna("Unknown").reset_index(drop=True)
-
-    return norm_steps, hsl_norm, bp_norm, max_sced_per_row, fuel_per_row
-
-
-
-
-def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summary_csv: bool) -> None:
-    """
-    UPDATED:
-      - Build row-wise maxima across ALL SCED MW steps (M_sced).
-      - Define M_all = max(M_sced, HSL).
-      - Normalize each SCED step, HSL, and Base Point by M_all.
-      - Aggregate by fuel, average over resources×timestamps.
-      - Reapply magnitude by multiplying the averaged normalized values by SUM(M_sced) per fuel.
-      - Plot one line per fuel across steps; add dashed horizontal lines for HSL and Base Point (rescaled magnitudes).
-    """
-    day = day_dir.name
-
-    # Load HSL
-    hsl_path = day_dir / "aggregation_HSL.csv"
-    if not hsl_path.exists():
-        matches = list(day_dir.glob("*HSL*.csv"))
-        if not matches:
-            print(f"[INFO] {day}: no HSL file; skipping normalized MW lines.")
-            return
-        hsl_path = matches[0]
-    try:
-        hsl_df = pd.read_csv(hsl_path, dtype=str)
-    except Exception as e:
-        print(f"[ERROR] {day}: failed to read HSL {hsl_path.name}: {e}")
-        return
-
-    # Load Base Point
-    bp_path = day_dir / "aggregation_Base_Point.csv"
-    if not bp_path.exists():
-        matches = list(day_dir.glob("*Base*Point*.csv"))
-        if not matches:
-            print(f"[INFO] {day}: no Base Point file; skipping normalized MW lines.")
-            return
-        bp_path = matches[0]
-    try:
-        bp_df = pd.read_csv(bp_path, dtype=str)
-    except Exception as e:
-        print(f"[ERROR] {day}: failed to read Base Point {bp_path.name}: {e}")
-        return
-
-    # Find SCED MW step files
-    mw_files = list(day_dir.glob("aggregation_SCED1_Curve-MW*.csv"))
-    if not mw_files:
-        mw_files = list(day_dir.glob("*SCED*Curve*MW*.csv"))
-    if not mw_files:
-        print(f"[INFO] {day}: no SCED MW step files; skipping normalized MW lines.")
-        return
-    def step_key(p: Path):
-        m = MW_STEP_PATTERN.search(p.name)
-        return int(m.group(1)) if m else 1_000_000
-    mw_files = sorted(mw_files, key=step_key)
-
-    # Load step frames
-    step_dfs: Dict[int, pd.DataFrame] = {}
-    for p in mw_files:
-        m = MW_STEP_PATTERN.search(p.name)
-        step_num = int(m.group(1)) if m else None
-        if step_num is None:
+    # Detect keys from the first frame that has them
+    rn, rt = None, None
+    for df in dfs:
+        try:
+            rn, rt = _detect_key_cols(df)
+            break
+        except Exception:
             continue
-        try:
-            step_dfs[step_num] = pd.read_csv(p, dtype=str)
-        except Exception as e:
-            print(f"[WARN] {day}: failed to read {p.name}: {e}")
+    if rn is None:
+        raise ValueError("Could not detect key columns from inputs.")
 
-    if not step_dfs:
-        print(f"[INFO] {day}: no readable SCED MW step files; skipping.")
-        return
+    # Intersect resource sets (case-tolerant on values)
+    def _norm_series(s: pd.Series) -> pd.Series:
+        return s.astype(str).str.strip().str.lower()
 
-    try:
-        norm_steps, hsl_norm, bp_norm, max_sced_per_row, fuel_per_row = normalize_by_row_max_with_hsl_and_bp(step_dfs, hsl_df, bp_df)
-    except Exception as e:
-        print(f"[ERROR] {day}: normalization by row-max failed: {e}")
-        return
+    resource_sets = []
+    for df in dfs:
+        if rn not in df.columns:
+            raise ValueError(f"Missing key col '{rn}' in an input.")
+        resource_sets.append(set(_norm_series(df[rn]).tolist()))
+    common_resources_norm = set.intersection(*resource_sets) if resource_sets else set()
 
-    # Compute rescaling magnitude per fuel: sum of largest SCED values (M_sced) per row, then sum within fuel
-    # max_sced_per_row index aligns with fuel_per_row (both reset)
-    fuel_series = fuel_per_row.astype(str).fillna("Unknown")
-    rescale_by_fuel = max_sced_per_row.groupby(fuel_series).sum(min_count=1)
+    # Intersect timestamp headers
+    ts_common = None
+    for df in dfs:
+        ts = _timestamp_columns(df, exclude=[rn] + ([rt] if rt else []))
+        ts_common = set(ts) if ts_common is None else (ts_common & set(ts))
+    if not ts_common:
+        raise ValueError("No common timestamp columns across inputs.")
+    ts_common = sorted(ts_common, key=lambda x: pd.to_datetime(x))
 
-    # Build per-step averaged normalized (over resources×timestamps) by fuel, then rescale
-    steps_sorted = sorted(norm_steps.keys())
-    fuels_sorted = sorted(rescale_by_fuel.index.tolist())
+    # Filter and coerce numeric
+    aligned = []
+    for df in dfs:
+        d = df.copy()
+        d["_rn_norm"] = _norm_series(d[rn])
+        d = d[d["_rn_norm"].isin(common_resources_norm)].drop(columns=["_rn_norm"])
+        keep = [rn] + ([rt] if rt else []) + ts_common
+        d = d[keep]
+        d = _coerce_numeric(d, ts_common)
+        aligned.append(d.reset_index(drop=True))
 
-    def avg_over_rows_and_time(df: pd.DataFrame) -> pd.Series:
-        name_col, type_col = normalize_key_columns(df)
-        ts_cols = detect_timestamp_columns(df, (name_col, type_col))
-        vals = df[ts_cols].apply(pd.to_numeric, errors="coerce")
-        vals.insert(0, "Resource Type", df[type_col].astype(str).fillna("Unknown"))
-        by_fuel = vals.groupby("Resource Type", dropna=False).mean(numeric_only=True).mean(axis=1, numeric_only=True)
-        return by_fuel
+    return aligned, ts_common, rn, rt
 
-    scaled_by_step = {}
-    for s in steps_sorted:
-        avg_norm = avg_over_rows_and_time(norm_steps[s])
-        # align with fuels_sorted and rescale
-        scaled = []
-        for f in fuels_sorted:
-            base = avg_norm.get(f, np.nan)
-            scale = rescale_by_fuel.get(f, np.nan)
-            scaled.append(float(base) * float(scale) if np.isfinite(base) and np.isfinite(scale) else np.nan)
-        scaled_by_step[s] = scaled
 
-    summary_scaled = pd.DataFrame.from_dict(scaled_by_step, orient="index", columns=fuels_sorted)
-    summary_scaled.index.name = "SCED Step"
+def _build_rowwise_max_and_normalized(
+    sced_steps: List[pd.DataFrame],
+    hsl_df: pd.DataFrame,
+    bp_df: pd.DataFrame
+) -> Tuple[List[pd.DataFrame], pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Given aligned frames (same resources, same timestamps):
+      - sced_steps: list of SCED MW step dataframes
+      - hsl_df: HSL dataframe
+      - bp_df: Base Point dataframe
+    Returns:
+      - sced_norm_steps: list of SCED steps normalized by row-wise M_all (max(max_sced, HSL))
+      - hsl_norm: HSL normalized by same M_all
+      - bp_norm: Base Point normalized by same M_all
+      - sced_row_max: DataFrame of per-row M_sced (max across SCED steps), for re-scaling
+    """
+    # Keys and timestamps
+    rn, rt = _detect_key_cols(hsl_df)
+    ts_cols = _timestamp_columns(hsl_df, exclude=[rn] + ([rt] if rt else []))
 
-    # Compute HSL and Base Point dashed lines (same normalization and rescaling)
-    hsl_avg = avg_over_rows_and_time(hsl_norm)
-    bp_avg  = avg_over_rows_and_time(bp_norm)
+    # Compute M_sced (max across steps per cell) and M_all (max of M_sced and HSL) per (row, ts)
+    # Stack SCED steps into 3D array for vectorized max
+    sced_vals = np.stack([df[ts_cols].to_numpy(dtype=float) for df in sced_steps], axis=0)  # (K, R, T)
+    M_sced = np.nanmax(sced_vals, axis=0)  # (R, T)
+    hsl_vals = hsl_df[ts_cols].to_numpy(dtype=float)
+    M_all = np.fmax(M_sced, hsl_vals)  # row-wise baseline
 
-    hsl_scaled = pd.Series({f: (hsl_avg.get(f, np.nan) * rescale_by_fuel.get(f, np.nan)) for f in fuels_sorted})
-    bp_scaled  = pd.Series({f: (bp_avg.get(f, np.nan)  * rescale_by_fuel.get(f, np.nan)) for f in fuels_sorted})
+    # Avoid divide-by-zero: where M_all <= 0 -> NaN mask
+    denom = M_all.copy()
+    denom[~np.isfinite(denom) | (denom <= 0)] = np.nan
 
-    # Plot
-    day_out = plots_root / day / "sced_normalized"
-    day_out.mkdir(parents=True, exist_ok=True)
+    # Normalize SCED steps
+    sced_norm_steps: List[pd.DataFrame] = []
+    for k, step_df in enumerate(sced_steps):
+        num = step_df[ts_cols].to_numpy(dtype=float)
+        norm_vals = num / denom
+        out = step_df[[rn] + ([rt] if rt else [])].copy()
+        for j, c in enumerate(ts_cols):
+            out[c] = norm_vals[:, j]
+        sced_norm_steps.append(out)
 
-    fig, ax = plt.subplots(figsize=(14, 7))
-    for f in fuels_sorted:
-        ax.plot(summary_scaled.index.values, summary_scaled[f].values, marker="o", label=f)
+    # Normalize HSL and BP
+    def _norm_df(df: pd.DataFrame) -> pd.DataFrame:
+        num = df[ts_cols].to_numpy(dtype=float)
+        norm_vals = num / denom
+        out = df[[rn] + ([rt] if rt else [])].copy()
+        for j, c in enumerate(ts_cols):
+            out[c] = norm_vals[:, j]
+        return out
 
-    # dashed horizontals
-    for f in fuels_sorted:
-        y_hsl = hsl_scaled.get(f, np.nan)
-        y_bp  = bp_scaled.get(f, np.nan)
-        if np.isfinite(y_hsl):
-            ax.hlines(y=y_hsl, xmin=summary_scaled.index.min(), xmax=summary_scaled.index.max(),
-                      linestyles="dashed", linewidth=1.5, label=f"{f} – HSL")
-        if np.isfinite(y_bp):
-            ax.hlines(y=y_bp, xmin=summary_scaled.index.min(), xmax=summary_scaled.index.max(),
-                      linestyles="dashed", linewidth=1.5, label=f"{f} – Base Point")
+    hsl_norm = _norm_df(hsl_df)
+    bp_norm  = _norm_df(bp_df)
 
-    ax.set_title(f"{day} – SCED Steps normalized by row-wise max (rescaled by sum of row maxima)")
-    ax.set_xlabel("SCED Step")
-    ax.set_ylabel("Scaled Value (sum of row max SCED MW × average normalized)")
-    ax.legend(title="Fuel Type", bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0.)
-    plt.tight_layout()
-    out_png = day_out / "normalized_bids_by_stage.png"
-    plt.savefig(out_png, dpi=150)
-    plt.close()
-    print(f"[OK] Saved: {out_png}")
+    # Return M_sced as DataFrame for later grouping / re-sum (magnitude reapplication)
+    sced_row_max = hsl_df[[rn] + ([rt] if rt else [])].copy()
+    for j, c in enumerate(ts_cols):
+        sced_row_max[c] = M_sced[:, j]
 
-    if save_summary_csv:
-        out_csv = day_out / "normalized_bids_by_stage.csv"
-        try:
-            summary_scaled.to_csv(out_csv)
-            print(f"[OK] Saved: {out_csv}")
-        except Exception as e:
-            print(f"[ERROR] {day}: failed to write summary CSV: {e}")
+    return sced_norm_steps, hsl_norm, bp_norm, sced_row_max
+
+
+def _per_fuel_average_and_rescale(
+    sced_norm_steps: List[pd.DataFrame],
+    hsl_norm: pd.DataFrame,
+    bp_norm: pd.DataFrame,
+    sced_row_max: pd.DataFrame
+) -> Tuple[Dict[str, pd.Series], Dict[str, float], Dict[str, float], List[str]]:
+    """
+    For each fuel, compute:
+      - step_curve[fuel]: 1D array (len = K steps). Each value is the mean over rows×timestamps of the normalized step,
+                          then rescaled by Σ(M_sced) within that fuel.
+      - hsl_line[fuel]: scalar, mean of normalized HSL over rows×timestamps, rescaled by same Σ(M_sced)
+      - bp_line[fuel]: scalar, mean of normalized Base Point over rows×timestamps, rescaled by same Σ(M_sced)
+    Returns:
+      step_curve_by_fuel: dict fuel -> pd.Series(index=step_labels, values=rescaled means)
+      hsl_by_fuel: dict fuel -> float (rescaled)
+      bp_by_fuel: dict fuel -> float (rescaled)
+      step_labels: list of labels for x-axis (e.g., ["MW1","MW2",...])
+    """
+    rn, rt = _detect_key_cols(hsl_norm)
+    ts_cols = _timestamp_columns(hsl_norm, exclude=[rn] + ([rt] if rt else []))
+
+    # Determine fuel list
+    if rt is None:
+        raise ValueError("Resource Type column is required to aggregate by fuel.")
+    fuels = sorted(hsl_norm[rt].dropna().astype(str).unique())
+
+    # Prepare Σ(M_sced) per fuel
+    # Use mean across timestamps per row, then sum over rows within fuel -> Σ of per-row maxima (time-averaged)
+    sced_row_max_mean = sced_row_max.copy()
+    sced_row_max_mean["_row_mean"] = sced_row_max[ts_cols].mean(axis=1, skipna=True)
+
+    fuel_max_sum = sced_row_max_mean.groupby(rt)["_row_mean"].sum(min_count=1).to_dict()
+
+    # Prepare step labels
+    step_labels = []
+    for df in sced_norm_steps:
+        # expect columns like ... MW1.csv, MW2.csv; we derive index by position
+        step_labels.append(None)  # placeholder; we will label as 1..K
+    step_labels = [f"Step {i+1}" for i in range(len(sced_norm_steps))]
+
+    # Compute per-step per-fuel means (over rows×timestamps)
+    step_curve_by_fuel: Dict[str, pd.Series] = {}
+    for fuel in fuels:
+        vals = []
+        denom = fuel_max_sum.get(fuel, np.nan)
+        for df in sced_norm_steps:
+            sub = df[df[rt].astype(str) == fuel]
+            if sub.empty:
+                vals.append(np.nan)
+                continue
+            m = sub[ts_cols].to_numpy(dtype=float)
+            mean_norm = np.nanmean(m)  # mean over all rows×timestamps for this step, this fuel
+            # reapply magnitude using Σ(M_sced) for this fuel
+            vals.append(mean_norm * denom if np.isfinite(denom) else np.nan)
+        step_curve_by_fuel[fuel] = pd.Series(vals, index=step_labels, dtype="float64")
+
+    # HSL/BP scalars per fuel
+    hsl_by_fuel: Dict[str, float] = {}
+    bp_by_fuel: Dict[str, float] = {}
+    for fuel in fuels:
+        denom = fuel_max_sum.get(fuel, np.nan)
+        sub_h = hsl_norm[hsl_norm[rt].astype(str) == fuel]
+        sub_b = bp_norm [bp_norm [rt].astype(str) == fuel]
+
+        h_mean = np.nanmean(sub_h[ts_cols].to_numpy(dtype=float)) if not sub_h.empty else np.nan
+        b_mean = np.nanmean(sub_b[ts_cols].to_numpy(dtype=float)) if not sub_b.empty else np.nan
+
+        hsl_by_fuel[fuel] = h_mean * denom if np.isfinite(denom) else np.nan
+        bp_by_fuel[fuel]  = b_mean * denom if np.isfinite(denom) else np.nan
+
+    return step_curve_by_fuel, hsl_by_fuel, bp_by_fuel, step_labels
+
+
+def process_sced_normalized_lines_day_per_fuel(day_dir: str, plots_root: str, save_csv: bool = False) -> None:
+    """
+    For a single YYYY-MM-DD folder:
+      - Load SCED MW step CSVs, HSL, Base Point
+      - Align on resources and timestamps
+      - Compute row-wise max normalization + rescale
+      - Produce ONE plot per fuel with:
+          * Line across steps (rescaled mean normalized step)
+          * Dashed horizontal HSL and Base Point lines (distinct colors)
+      - Save plots under <plots_root>/<YYYY-MM-DD>/sced_normalized_per_fuel/
+    """
+    os.makedirs(plots_root, exist_ok=True)
+    day = os.path.basename(os.path.normpath(day_dir))
+    out_dir = os.path.join(plots_root, day, "sced_normalized_per_fuel")
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Find files
+    hsl_path = _find_case_insensitive(day_dir, HSL_NAME_HINT)
+    bp_path  = _find_case_insensitive(day_dir, BASE_POINT_NAME_HINT)
+    step_paths = _find_glob(day_dir, SCED_MW_GLOB)
+
+    if not hsl_path:
+        raise FileNotFoundError(f"HSL file not found in {day_dir}")
+    if not bp_path:
+        raise FileNotFoundError(f"Base Point file not found in {day_dir}")
+    if not step_paths:
+        raise FileNotFoundError(f"No SCED MW step files found in {day_dir}")
+
+    # Load
+    hsl_df = pd.read_csv(hsl_path)
+    bp_df  = pd.read_csv(bp_path)
+    sced_steps = [pd.read_csv(p) for p in step_paths]
+
+    # Align
+    aligned, ts_cols, rn, rt = _align_on_resources_and_timestamps(sced_steps + [hsl_df, bp_df])
+    K = len(sced_steps)
+    aligned_steps = aligned[:K]
+    hsl_aligned  = aligned[K]
+    bp_aligned   = aligned[K+1]
+
+    # Normalize & build row-max
+    sced_norm_steps, hsl_norm, bp_norm, sced_row_max = _build_rowwise_max_and_normalized(
+        aligned_steps, hsl_aligned, bp_aligned
+    )
+
+    # Aggregate by fuel & rescale
+    step_curve_by_fuel, hsl_by_fuel, bp_by_fuel, step_labels = _per_fuel_average_and_rescale(
+        sced_norm_steps, hsl_norm, bp_norm, sced_row_max
+    )
+
+    # Optional CSV dump per fuel
+    if save_csv:
+        for fuel, series in step_curve_by_fuel.items():
+            csv_path = os.path.join(out_dir, f"{fuel}_normalized_rescaled_curve.csv")
+            series.to_csv(csv_path, header=["value"])
+
+        # HSL/BP summaries
+        summ = []
+        for fuel in sorted(set(list(hsl_by_fuel.keys()) + list(bp_by_fuel.keys()))):
+            summ.append({"fuel": fuel, "hsl_rescaled": hsl_by_fuel.get(fuel, np.nan),
+                         "base_point_rescaled": bp_by_fuel.get(fuel, np.nan)})
+        pd.DataFrame(summ).to_csv(os.path.join(out_dir, "hsl_bp_rescaled_summary.csv"), index=False)
+
+    # Plot one figure per fuel
+    for fuel, series in step_curve_by_fuel.items():
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(range(1, len(series)+1), series.values, marker="o", linewidth=2, label=f"{fuel}")
+
+        # Dashed horizontal lines for HSL and Base Point (distinct colors)
+        hval = hsl_by_fuel.get(fuel, np.nan)
+        bval = bp_by_fuel.get(fuel, np.nan)
+        if np.isfinite(hval):
+            ax.axhline(hval, linestyle="--", linewidth=1.75, color=HSL_LINE_COLOR, label="HSL (rescaled)")
+        if np.isfinite(bval):
+            ax.axhline(bval, linestyle="--", linewidth=1.75, color=BP_LINE_COLOR,  label="Base Point (rescaled)")
+
+        ax.set_title(f"{day} — Normalized & Rescaled SCED Curve (Per Fuel: {fuel})")
+        ax.set_xlabel("SCED Step")
+        ax.set_ylabel("Rescaled magnitude (Σ row SCED maxima weighted)")
+        ax.set_xticks(range(1, len(series)+1))
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+        out_png = os.path.join(out_dir, f"{fuel}_normalized_rescaled.png")
+        fig.tight_layout()
+        fig.savefig(out_png, dpi=150)
+        plt.close(fig)
+
+
 def main():
-    root = Path(ROOT_DIR).resolve()
-    out  = Path(PLOTS_DIR).resolve()
-    out.mkdir(parents=True, exist_ok=True)
+    # Process all subfolders YYYY-MM-DD in ROOT_DIR
+    days = [os.path.join(ROOT_DIR, d) for d in os.listdir(ROOT_DIR)
+            if os.path.isdir(os.path.join(ROOT_DIR, d))]
+    days.sort()
 
-    day_dirs = sorted([p for p in root.iterdir() if p.is_dir()])
-    if not day_dirs:
-        print(f"[WARN] No day subfolders found in {root}")
-        return
+    for day_dir in days:
+        try:
+            process_sced_normalized_lines_day_per_fuel(
+                day_dir,
+                PLOTS_DIR,
+                save_csv=SAVE_NORMALIZED_VALUES_CSV
+            )
+            print(f"Processed: {os.path.basename(day_dir)}")
+        except Exception as e:
+            print(f"! Error processing {day_dir}: {e}")
 
-    for day_dir in day_dirs:
-        # 1) Base Point (stacked bar)
-        process_base_point_day(day_dir, out, BP_AGG_MODE, BP_SAVE_HOURLY_CSV)
-        # 2) SCED price violins
-        process_sced_violins_day(day_dir, out, SCED_SAVE_VALUES_CSV)
-        # 3) SCED normalized-bid lines
-        process_sced_normalized_lines_day(day_dir, out, SAVE_NORMALIZED_SUMMARY_CSV)
 
 if __name__ == "__main__":
     main()

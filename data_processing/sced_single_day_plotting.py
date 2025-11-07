@@ -501,21 +501,303 @@ def normalize_by_row_max_with_hsl_and_bp(
 
     return norm_steps, hsl_norm, bp_norm, max_sced_per_row, fuel_per_row
 
+# def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summary_csv: bool) -> None:
+#     """
+#     UPDATED:
+#       - Build row-wise maxima across ALL SCED MW steps (M_sced).
+#       - Define M_all = max(M_sced, HSL). Normalize SCED steps, HSL, Base Point by M_all.
+#       - Aggregate by fuel (average over resources × timestamps).
+#       - Reapply magnitude by multiplying averaged normalized values by SUM(M_sced) per fuel.
+#       - Plot combined (one line per fuel) — WITHOUT HSL/BP lines.
+#       - Plot per-fuel charts — WITH HSL/BP dashed lines.
+#       - Quick diagnostic: list all fuels in *raw* inputs (CSV).
+#       - NEW: Explicit logging for fuels skipped from plotting and the reason.
+#     """
+#     day = day_dir.name
+
+#     # Load HSL
+#     hsl_path = day_dir / "aggregation_HSL.csv"
+#     if not hsl_path.exists():
+#         matches = list(day_dir.glob("*HSL*.csv"))
+#         if not matches:
+#             print(f"[INFO] {day}: no HSL file; skipping normalized MW lines.")
+#             return
+#         hsl_path = matches[0]
+#     try:
+#         hsl_df = pd.read_csv(hsl_path, dtype=str)
+#     except Exception as e:
+#         print(f"[ERROR] {day}: failed to read HSL {hsl_path.name}: {e}")
+#         return
+
+#     # Load Base Point
+#     bp_path = day_dir / "aggregation_Base_Point.csv"
+#     if not bp_path.exists():
+#         matches = list(day_dir.glob("*Base*Point*.csv"))
+#         if not matches:
+#             print(f"[INFO] {day}: no Base Point file; skipping normalized MW lines.")
+#             return
+#         bp_path = matches[0]
+#     try:
+#         bp_df = pd.read_csv(bp_path, dtype=str)
+#     except Exception as e:
+#         print(f"[ERROR] {day}: failed to read Base Point {bp_path.name}: {e}")
+#         return
+
+#     # Find SCED MW step files
+#     mw_files = list(day_dir.glob("aggregation_SCED1_Curve-MW*.csv"))
+#     if not mw_files:
+#         mw_files = list(day_dir.glob("*SCED*Curve*MW*.csv"))
+#     if not mw_files:
+#         print(f"[INFO] {day}: no SCED MW step files; skipping normalized MW lines.")
+#         return
+
+#     def step_key(p: Path):
+#         m = MW_STEP_PATTERN.search(p.name)
+#         return int(m.group(1)) if m else 1_000_000
+
+#     mw_files = sorted(mw_files, key=step_key)
+
+#     # Load step frames
+#     step_dfs: Dict[int, pd.DataFrame] = {}
+#     for p in mw_files:
+#         m = MW_STEP_PATTERN.search(p.name)
+#         step_num = int(m.group(1)) if m else None
+#         if step_num is None:
+#             continue
+#         try:
+#             step_dfs[step_num] = pd.read_csv(p, dtype=str)
+#         except Exception as e:
+#             print(f"[WARN] {day}: failed to read {p.name}: {e}")
+
+#     if not step_dfs:
+#         print(f"[INFO] {day}: no readable SCED MW step files; skipping.")
+#         return
+
+#     # ------------------------------------------------------------
+#     # QUICK CHECK: list all fuels present in the raw input data
+#     # ------------------------------------------------------------
+#     print(f"\n[CHECK] {day}: Inspecting fuels present in raw input data...")
+
+#     def _extract_fuels(df: pd.DataFrame) -> pd.Series:
+#         name_col, type_col = normalize_key_columns(df)
+#         if type_col is None:
+#             return pd.Series([], dtype=str)
+#         return (
+#             df[type_col].astype(str)
+#             .str.strip()
+#             .replace({"": "Unknown", "None": "Unknown", "nan": "Unknown", "NaN": "Unknown"})
+#         )
+
+#     fuels_raw_list: List[str] = []
+#     fuels_raw_list.extend(_extract_fuels(hsl_df).tolist())
+#     fuels_raw_list.extend(_extract_fuels(bp_df).tolist())
+#     for _, df in step_dfs.items():
+#         fuels_raw_list.extend(_extract_fuels(df).tolist())
+
+#     fuels_raw_series = pd.Series(fuels_raw_list, dtype=str).replace(
+#         {"": "Unknown", "None": "Unknown", "nan": "Unknown", "NaN": "Unknown"}
+#     )
+#     unique_fuels_raw = fuels_raw_series.value_counts(dropna=False).sort_index()
+
+#     raw_fuels_set = set(unique_fuels_raw.index.astype(str))
+#     print(f"[CHECK] {day}: FOUND FUEL TYPES IN INPUT DATA:")
+#     for fuel, count in unique_fuels_raw.items():
+#         print(f"    - {fuel}: {count} rows")
+
+#     check_path = day_dir / "fuel_check_raw_input.csv"
+#     try:
+#         unique_fuels_raw.to_csv(check_path, header=["count"])
+#         print(f"[CHECK] Saved raw fuel diagnostics → {check_path}\n")
+#     except Exception as e:
+#         print(f"[WARN] {day}: failed to write fuel_check_raw_input.csv: {e}")
+#     # ------------------------------------------------------------
+
+#     # Normalize by row-wise max including HSL baseline
+#     try:
+#         norm_steps, hsl_norm, bp_norm, max_sced_per_row, fuel_per_row = normalize_by_row_max_with_hsl_and_bp(
+#             step_dfs, hsl_df, bp_df
+#         )
+#     except Exception as e:
+#         print(f"[ERROR] {day}: normalization by row-max failed: {e}")
+#         return
+
+#     # Compute rescaling magnitude per fuel: SUM of per-row max SCED (M_sced) within each fuel
+#     fuel_series = fuel_per_row.astype(str).fillna("Unknown")
+#     rescale_by_fuel = max_sced_per_row.groupby(fuel_series).sum(min_count=1)  # Series: fuel -> scalar
+#     candidate_fuels_set = set(rescale_by_fuel.index.astype(str))
+
+#     # Helper: averaged normalized per fuel (over resources×timestamps)
+#     def avg_over_rows_and_time(df: pd.DataFrame) -> pd.Series:
+#         name_col, type_col = normalize_key_columns(df)
+#         ts_cols = detect_timestamp_columns(df, (name_col, type_col))
+#         vals = df[ts_cols].apply(pd.to_numeric, errors="coerce")
+#         vals.insert(0, "Resource Type", df[type_col].astype(str).fillna("Unknown"))
+#         by_fuel = (
+#             vals.groupby("Resource Type", dropna=False)
+#                 .mean(numeric_only=True)            # average over time
+#                 .mean(axis=1, numeric_only=True)     # then average across timestamps
+#         )
+#         return by_fuel  # index = fuel, value = scalar
+
+#     steps_sorted = sorted(norm_steps.keys())
+
+#     # Track which fuels actually appear in norm_steps per step (presence before averaging)
+#     fuels_present_by_step: Dict[int, set] = {}
+#     for s in steps_sorted:
+#         df_s = norm_steps[s]
+#         _, type_col = normalize_key_columns(df_s)
+#         if type_col is None:
+#             fuels_present_by_step[s] = set()
+#         else:
+#             fuels_present_by_step[s] = set(
+#                 df_s[type_col].astype(str).fillna("Unknown").str.strip().replace("", "Unknown").unique()
+#             )
+
+#     # Build per-step scaled series (avg normalized × rescale_by_fuel)
+#     scaled_by_step: Dict[int, List[float]] = {}
+#     fuels_sorted = sorted(candidate_fuels_set)
+#     for s in steps_sorted:
+#         avg_norm = avg_over_rows_and_time(norm_steps[s])  # Series: fuel->scalar
+#         row = []
+#         for f in fuels_sorted:
+#             base = avg_norm.get(f, np.nan)                   # averaged normalized (could be NaN)
+#             scale = rescale_by_fuel.get(f, np.nan)           # SUM(M_sced) for that fuel (could be NaN)
+#             row.append(float(base) * float(scale) if np.isfinite(base) and np.isfinite(scale) else np.nan)
+#         scaled_by_step[s] = row
+
+#     summary_scaled = pd.DataFrame.from_dict(scaled_by_step, orient="index", columns=fuels_sorted)
+#     summary_scaled.index.name = "SCED Step"
+
+#     # HSL/Base Point (for per-fuel plots only)
+#     hsl_avg = avg_over_rows_and_time(hsl_norm)
+#     bp_avg  = avg_over_rows_and_time(bp_norm)
+#     hsl_scaled = pd.Series({f: (hsl_avg.get(f, np.nan) * rescale_by_fuel.get(f, np.nan)) for f in fuels_sorted})
+#     bp_scaled  = pd.Series({f: (bp_avg.get(f, np.nan)  * rescale_by_fuel.get(f, np.nan)) for f in fuels_sorted})
+
+#     # ------------------ DIAGNOSTIC: who is plotted vs skipped, and why ------------------
+#     plotted_fuels = []
+#     skipped_fuels = {}
+
+#     # A fuel is "plotted" if it has at least one finite point in the combined line
+#     for f in fuels_sorted:
+#         col = summary_scaled[f]
+#         n_finite = np.isfinite(col.to_numpy(dtype=float)).sum()
+#         if n_finite > 0:
+#             plotted_fuels.append(f)
+#         else:
+#             # Diagnose the reason:
+#             reasons = []
+#             # Did this fuel ever appear in any SCED step (pre-avg)?
+#             appears_any_step = any(f in fuels_present_by_step[s] for s in steps_sorted)
+#             if not appears_any_step:
+#                 reasons.append("no SCED step rows for this fuel")
+
+#             # Is the rescaling factor invalid?
+#             rscale = rescale_by_fuel.get(f, np.nan)
+#             if not np.isfinite(float(rscale)) or float(rscale) == 0.0:
+#                 reasons.append("invalid/zero rescale (sum of row maxima)")
+
+#             # Are the averaged normalized values NaN across all steps?
+#             # Check by recomputing per-step base means (already implicit in summary_scaled being NaN)
+#             if appears_any_step and (np.isnan(col.to_numpy(dtype=float)).all()):
+#                 reasons.append("normalized averages all NaN after coercion/alignment")
+
+#             if not reasons:
+#                 reasons.append("no finite values to plot")
+
+#             skipped_fuels[f] = reasons
+
+#     # Also track fuels that existed *only* in raw inputs, never made it to candidate_fuels_set
+#     raw_not_candidate = sorted(raw_fuels_set - candidate_fuels_set)
+#     for f in raw_not_candidate:
+#         skipped_fuels.setdefault(f, []).append("present in raw input but absent after row-max/rescale grouping")
+
+#     # Emit logs
+#     if plotted_fuels:
+#         print(f"[OK] {day}: Fuels plotted in combined/per-fuel charts: {', '.join(sorted(plotted_fuels))}")
+#     if skipped_fuels:
+#         print(f"[INFO] {day}: Skipped fuels and reasons:")
+#         for f, reasons in sorted(skipped_fuels.items()):
+#             print("   -", f, "→", "; ".join(sorted(set(reasons))))
+#     # -------------------------------------------------------------------------------
+
+#     # ---------------- Combined plot (NO HSL/BP dashed lines) ----------------
+#     day_out = plots_root / day / "sced_normalized"
+#     day_out.mkdir(parents=True, exist_ok=True)
+
+#     fig, ax = plt.subplots(figsize=(14, 7))
+#     for f in fuels_sorted:
+#         series = summary_scaled[f].values
+#         if np.isfinite(series).any():  # only draw if there is something to draw
+#             ax.plot(summary_scaled.index.values, series, marker="o", label=f)
+
+#     ax.set_title(f"{day} – SCED Steps normalized by row-wise max (rescaled by sum of row maxima)")
+#     ax.set_xlabel("SCED Step")
+#     ax.set_ylabel("Scaled Value (sum of row max SCED MW × average normalized)")
+#     ax.legend(title="Fuel Type", bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0.)
+#     plt.tight_layout()
+#     out_png = day_out / "normalized_bids_by_stage.png"
+#     plt.savefig(out_png, dpi=150)
+#     plt.close()
+#     print(f"[OK] Saved: {out_png}")
+
+#     # ---------------- Per-fuel plots (KEEP HSL/BP dashed lines) ----------------
+#     per_fuel_dir = day_out / "per_fuel"
+#     per_fuel_dir.mkdir(parents=True, exist_ok=True)
+
+#     for f in fuels_sorted:
+#         series = summary_scaled[f].values
+#         if not np.isfinite(series).any():
+#             # don't create empty charts
+#             continue
+
+#         fig, ax = plt.subplots(figsize=(10, 6))
+#         x = summary_scaled.index.values
+#         ax.plot(x, series, marker="o", linewidth=2, label=f)
+
+#         # dashed HSL / Base Point for this fuel
+#         y_hsl = hsl_scaled.get(f, np.nan)
+#         y_bp  = bp_scaled.get(f, np.nan)
+#         if np.isfinite(y_hsl):
+#             ax.axhline(y_hsl, linestyle="--", linewidth=1.75, color="#1f77b4", label="HSL (rescaled)")
+#         if np.isfinite(y_bp):
+#             ax.axhline(y_bp,  linestyle="--", linewidth=1.75, color="#d62728", label="Base Point (rescaled)")
+
+#         ax.set_title(f"{day} – Normalized & Rescaled SCED Curve (Fuel: {f})")
+#         ax.set_xlabel("SCED Step")
+#         ax.set_ylabel("Scaled Value (Σ row-max SCED × avg normalized)")
+#         ax.set_xticks(x)
+#         ax.grid(True, alpha=0.3)
+#         ax.legend()
+
+#         out_pf = per_fuel_dir / f"{f}_normalized.png"
+#         fig.tight_layout()
+#         fig.savefig(out_pf, dpi=150)
+#         plt.close(fig)
+#         print(f"[OK] Saved: {out_pf}")
+
+#     # Optional CSV: write combined wide table
+#     if save_summary_csv:
+#         out_csv = day_out / "normalized_bids_by_stage.csv"
+#         try:
+#             summary_scaled.to_csv(out_csv)
+#             print(f"[OK] Saved: {out_csv}")
+#         except Exception as e:
+#             print(f"[ERROR] {day}: failed to write summary CSV: {e}")
+
 def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summary_csv: bool) -> None:
     """
     UPDATED:
-      - Build row-wise maxima across ALL SCED MW steps (M_sced).
-      - Define M_all = max(M_sced, HSL). Normalize SCED steps, HSL, Base Point by M_all.
-      - Aggregate by fuel (average over resources × timestamps).
-      - Reapply magnitude by multiplying averaged normalized values by SUM(M_sced) per fuel.
-      - Plot combined (one line per fuel) — WITHOUT HSL/BP lines.
-      - Plot per-fuel charts — WITH HSL/BP dashed lines.
-      - Quick diagnostic: list all fuels in *raw* inputs (CSV).
-      - NEW: Explicit logging for fuels skipped from plotting and the reason.
+      - Row-wise maxima across all SCED MW steps (M_sced); M_all = max(M_sced, HSL).
+      - Normalize SCED steps, HSL, Base Point by M_all.
+      - Aggregate by fuel over resources×timestamps, then reapply magnitude via SUM(M_sced) per fuel.
+      - Combined plot: one line per fuel (NO HSL/BP lines) + NEW shaded IQR (25–75%) per fuel.
+      - Per-fuel plots: that fuel’s line + HSL/BP dashed lines + NEW shaded IQR (25–75%).
+      - Diagnostics: raw fuels list (CSV), plotted vs skipped fuels (reasons).
     """
     day = day_dir.name
 
-    # Load HSL
+    # ----- Load inputs (same as before) -----
     hsl_path = day_dir / "aggregation_HSL.csv"
     if not hsl_path.exists():
         matches = list(day_dir.glob("*HSL*.csv"))
@@ -529,7 +811,6 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
         print(f"[ERROR] {day}: failed to read HSL {hsl_path.name}: {e}")
         return
 
-    # Load Base Point
     bp_path = day_dir / "aggregation_Base_Point.csv"
     if not bp_path.exists():
         matches = list(day_dir.glob("*Base*Point*.csv"))
@@ -543,7 +824,6 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
         print(f"[ERROR] {day}: failed to read Base Point {bp_path.name}: {e}")
         return
 
-    # Find SCED MW step files
     mw_files = list(day_dir.glob("aggregation_SCED1_Curve-MW*.csv"))
     if not mw_files:
         mw_files = list(day_dir.glob("*SCED*Curve*MW*.csv"))
@@ -554,10 +834,8 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
     def step_key(p: Path):
         m = MW_STEP_PATTERN.search(p.name)
         return int(m.group(1)) if m else 1_000_000
-
     mw_files = sorted(mw_files, key=step_key)
 
-    # Load step frames
     step_dfs: Dict[int, pd.DataFrame] = {}
     for p in mw_files:
         m = MW_STEP_PATTERN.search(p.name)
@@ -573,9 +851,7 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
         print(f"[INFO] {day}: no readable SCED MW step files; skipping.")
         return
 
-    # ------------------------------------------------------------
-    # QUICK CHECK: list all fuels present in the raw input data
-    # ------------------------------------------------------------
+    # ----- Raw fuels quick check (same as before) -----
     print(f"\n[CHECK] {day}: Inspecting fuels present in raw input data...")
 
     def _extract_fuels(df: pd.DataFrame) -> pd.Series:
@@ -598,21 +874,18 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
         {"": "Unknown", "None": "Unknown", "nan": "Unknown", "NaN": "Unknown"}
     )
     unique_fuels_raw = fuels_raw_series.value_counts(dropna=False).sort_index()
-
     raw_fuels_set = set(unique_fuels_raw.index.astype(str))
     print(f"[CHECK] {day}: FOUND FUEL TYPES IN INPUT DATA:")
     for fuel, count in unique_fuels_raw.items():
         print(f"    - {fuel}: {count} rows")
-
     check_path = day_dir / "fuel_check_raw_input.csv"
     try:
         unique_fuels_raw.to_csv(check_path, header=["count"])
         print(f"[CHECK] Saved raw fuel diagnostics → {check_path}\n")
     except Exception as e:
         print(f"[WARN] {day}: failed to write fuel_check_raw_input.csv: {e}")
-    # ------------------------------------------------------------
 
-    # Normalize by row-wise max including HSL baseline
+    # ----- Normalize (using your robust union/partial-steps normalizer) -----
     try:
         norm_steps, hsl_norm, bp_norm, max_sced_per_row, fuel_per_row = normalize_by_row_max_with_hsl_and_bp(
             step_dfs, hsl_df, bp_df
@@ -621,119 +894,154 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
         print(f"[ERROR] {day}: normalization by row-max failed: {e}")
         return
 
-    # Compute rescaling magnitude per fuel: SUM of per-row max SCED (M_sced) within each fuel
+    # ----- Rescale factor by fuel: SUM of per-row max SCED (same) -----
     fuel_series = fuel_per_row.astype(str).fillna("Unknown")
-    rescale_by_fuel = max_sced_per_row.groupby(fuel_series).sum(min_count=1)  # Series: fuel -> scalar
+    rescale_by_fuel = max_sced_per_row.groupby(fuel_series).sum(min_count=1)
     candidate_fuels_set = set(rescale_by_fuel.index.astype(str))
 
-    # Helper: averaged normalized per fuel (over resources×timestamps)
+    # Helpers to aggregate stats over rows×timestamps for each fuel
+    def _numeric_vals_for_fuel(df: pd.DataFrame, fuel: str) -> np.ndarray:
+        name_col, type_col = normalize_key_columns(df)
+        ts_cols = detect_timestamp_columns(df, (name_col, type_col))
+        if type_col is None or not ts_cols:
+            return np.asarray([], dtype=float)
+        sub = df[df[type_col].astype(str).fillna("Unknown") == fuel]
+        if sub.empty:
+            return np.asarray([], dtype=float)
+        vals = sub[ts_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+        return vals.reshape(-1)  # flatten rows×time
+
+    def stats_over_rows_and_time(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series, pd.Series]:
+        """Return mean, Q25, Q75 per fuel for a given step-normalized frame."""
+        # fuels present in df:
+        _, type_col = normalize_key_columns(df)
+        fuels_here = [] if type_col is None else sorted(df[type_col].astype(str).fillna("Unknown").unique())
+        means, q25s, q75s = {}, {}, {}
+        for f in fuels_here:
+            arr = _numeric_vals_for_fuel(df, f)
+            arr = arr[np.isfinite(arr)]
+            if arr.size == 0:
+                means[f] = np.nan; q25s[f] = np.nan; q75s[f] = np.nan
+            else:
+                means[f] = float(np.nanmean(arr))
+                q25s[f]  = float(np.nanpercentile(arr, 25))
+                q75s[f]  = float(np.nanpercentile(arr, 75))
+        # return as Series so .get() works for fuels not present in this step
+        return pd.Series(means, dtype=float), pd.Series(q25s, dtype=float), pd.Series(q75s, dtype=float)
+
+    # Track which fuels appear in each step (for diagnostics)
+    steps_sorted = sorted(norm_steps.keys())
+    fuels_present_by_step: Dict[int, set] = {}
+    for s in steps_sorted:
+        _, type_col = normalize_key_columns(norm_steps[s])
+        if type_col is None:
+            fuels_present_by_step[s] = set()
+        else:
+            fuels_present_by_step[s] = set(
+                norm_steps[s][type_col].astype(str).fillna("Unknown").str.strip().replace("", "Unknown").unique()
+            )
+
+    # ----- Build per-step mean + IQR (25–75%) and then RESCALE all three -----
+    fuels_sorted = sorted(candidate_fuels_set)
+    scaled_mean_by_step: Dict[int, List[float]] = {}
+    scaled_low_by_step:  Dict[int, List[float]] = {}
+    scaled_high_by_step: Dict[int, List[float]] = {}
+
+    for s in steps_sorted:
+        mean_s, q25_s, q75_s = stats_over_rows_and_time(norm_steps[s])
+        row_mean, row_low, row_high = [], [], []
+        for f in fuels_sorted:
+            scale = rescale_by_fuel.get(f, np.nan)
+            mu  = mean_s.get(f,  np.nan)
+            q25 = q25_s.get(f,   np.nan)
+            q75 = q75_s.get(f,   np.nan)
+            if np.isfinite(scale) and np.isfinite(mu):
+                row_mean.append(float(mu) * float(scale))
+            else:
+                row_mean.append(np.nan)
+            if np.isfinite(scale) and np.isfinite(q25) and np.isfinite(q75):
+                row_low.append(float(q25) * float(scale))
+                row_high.append(float(q75) * float(scale))
+            else:
+                row_low.append(np.nan); row_high.append(np.nan)
+        scaled_mean_by_step[s] = row_mean
+        scaled_low_by_step[s]  = row_low
+        scaled_high_by_step[s] = row_high
+
+    summary_scaled = pd.DataFrame.from_dict(scaled_mean_by_step, orient="index", columns=fuels_sorted)
+    summary_low    = pd.DataFrame.from_dict(scaled_low_by_step,  orient="index", columns=fuels_sorted)
+    summary_high   = pd.DataFrame.from_dict(scaled_high_by_step, orient="index", columns=fuels_sorted)
+    summary_scaled.index.name = "SCED Step"
+    summary_low.index    = summary_scaled.index
+    summary_high.index   = summary_scaled.index
+
+    # ----- HSL/BP (used only for per-fuel dashed lines) -----
     def avg_over_rows_and_time(df: pd.DataFrame) -> pd.Series:
         name_col, type_col = normalize_key_columns(df)
         ts_cols = detect_timestamp_columns(df, (name_col, type_col))
         vals = df[ts_cols].apply(pd.to_numeric, errors="coerce")
         vals.insert(0, "Resource Type", df[type_col].astype(str).fillna("Unknown"))
-        by_fuel = (
+        return (
             vals.groupby("Resource Type", dropna=False)
-                .mean(numeric_only=True)            # average over time
-                .mean(axis=1, numeric_only=True)     # then average across timestamps
+                .mean(numeric_only=True)
+                .mean(axis=1, numeric_only=True)
         )
-        return by_fuel  # index = fuel, value = scalar
+    hsl_scaled = pd.Series({f: (avg_over_rows_and_time(hsl_norm).get(f, np.nan) *
+                                rescale_by_fuel.get(f, np.nan)) for f in fuels_sorted})
+    bp_scaled  = pd.Series({f: (avg_over_rows_and_time(bp_norm).get(f,  np.nan) *
+                                rescale_by_fuel.get(f, np.nan)) for f in fuels_sorted})
 
-    steps_sorted = sorted(norm_steps.keys())
-
-    # Track which fuels actually appear in norm_steps per step (presence before averaging)
-    fuels_present_by_step: Dict[int, set] = {}
-    for s in steps_sorted:
-        df_s = norm_steps[s]
-        _, type_col = normalize_key_columns(df_s)
-        if type_col is None:
-            fuels_present_by_step[s] = set()
-        else:
-            fuels_present_by_step[s] = set(
-                df_s[type_col].astype(str).fillna("Unknown").str.strip().replace("", "Unknown").unique()
-            )
-
-    # Build per-step scaled series (avg normalized × rescale_by_fuel)
-    scaled_by_step: Dict[int, List[float]] = {}
-    fuels_sorted = sorted(candidate_fuels_set)
-    for s in steps_sorted:
-        avg_norm = avg_over_rows_and_time(norm_steps[s])  # Series: fuel->scalar
-        row = []
-        for f in fuels_sorted:
-            base = avg_norm.get(f, np.nan)                   # averaged normalized (could be NaN)
-            scale = rescale_by_fuel.get(f, np.nan)           # SUM(M_sced) for that fuel (could be NaN)
-            row.append(float(base) * float(scale) if np.isfinite(base) and np.isfinite(scale) else np.nan)
-        scaled_by_step[s] = row
-
-    summary_scaled = pd.DataFrame.from_dict(scaled_by_step, orient="index", columns=fuels_sorted)
-    summary_scaled.index.name = "SCED Step"
-
-    # HSL/Base Point (for per-fuel plots only)
-    hsl_avg = avg_over_rows_and_time(hsl_norm)
-    bp_avg  = avg_over_rows_and_time(bp_norm)
-    hsl_scaled = pd.Series({f: (hsl_avg.get(f, np.nan) * rescale_by_fuel.get(f, np.nan)) for f in fuels_sorted})
-    bp_scaled  = pd.Series({f: (bp_avg.get(f, np.nan)  * rescale_by_fuel.get(f, np.nan)) for f in fuels_sorted})
-
-    # ------------------ DIAGNOSTIC: who is plotted vs skipped, and why ------------------
-    plotted_fuels = []
-    skipped_fuels = {}
-
-    # A fuel is "plotted" if it has at least one finite point in the combined line
+    # ----- Diagnostics: who plotted vs skipped (same logic) -----
+    plotted_fuels, skipped_fuels = [], {}
     for f in fuels_sorted:
-        col = summary_scaled[f]
-        n_finite = np.isfinite(col.to_numpy(dtype=float)).sum()
-        if n_finite > 0:
+        col = pd.to_numeric(summary_scaled[f], errors="coerce").to_numpy(dtype=float)
+        if np.isfinite(col).sum() > 0:
             plotted_fuels.append(f)
         else:
-            # Diagnose the reason:
             reasons = []
-            # Did this fuel ever appear in any SCED step (pre-avg)?
             appears_any_step = any(f in fuels_present_by_step[s] for s in steps_sorted)
             if not appears_any_step:
                 reasons.append("no SCED step rows for this fuel")
-
-            # Is the rescaling factor invalid?
             rscale = rescale_by_fuel.get(f, np.nan)
             if not np.isfinite(float(rscale)) or float(rscale) == 0.0:
                 reasons.append("invalid/zero rescale (sum of row maxima)")
-
-            # Are the averaged normalized values NaN across all steps?
-            # Check by recomputing per-step base means (already implicit in summary_scaled being NaN)
-            if appears_any_step and (np.isnan(col.to_numpy(dtype=float)).all()):
+            if appears_any_step and (np.isnan(col).all()):
                 reasons.append("normalized averages all NaN after coercion/alignment")
-
             if not reasons:
                 reasons.append("no finite values to plot")
-
             skipped_fuels[f] = reasons
 
-    # Also track fuels that existed *only* in raw inputs, never made it to candidate_fuels_set
     raw_not_candidate = sorted(raw_fuels_set - candidate_fuels_set)
     for f in raw_not_candidate:
         skipped_fuels.setdefault(f, []).append("present in raw input but absent after row-max/rescale grouping")
 
-    # Emit logs
     if plotted_fuels:
         print(f"[OK] {day}: Fuels plotted in combined/per-fuel charts: {', '.join(sorted(plotted_fuels))}")
     if skipped_fuels:
         print(f"[INFO] {day}: Skipped fuels and reasons:")
         for f, reasons in sorted(skipped_fuels.items()):
             print("   -", f, "→", "; ".join(sorted(set(reasons))))
-    # -------------------------------------------------------------------------------
 
-    # ---------------- Combined plot (NO HSL/BP dashed lines) ----------------
+    # ----- Plot: Combined (NO HSL/BP) + shaded IQR per fuel -----
     day_out = plots_root / day / "sced_normalized"
     day_out.mkdir(parents=True, exist_ok=True)
 
     fig, ax = plt.subplots(figsize=(14, 7))
+    x = summary_scaled.index.values
     for f in fuels_sorted:
-        series = summary_scaled[f].values
-        if np.isfinite(series).any():  # only draw if there is something to draw
-            ax.plot(summary_scaled.index.values, series, marker="o", label=f)
+        y  = pd.to_numeric(summary_scaled[f], errors="coerce").to_numpy(dtype=float)
+        yl = pd.to_numeric(summary_low[f],    errors="coerce").to_numpy(dtype=float)
+        yh = pd.to_numeric(summary_high[f],   errors="coerce").to_numpy(dtype=float)
+        if np.isfinite(y).any():
+            line, = ax.plot(x, y, marker="o", linewidth=2, label=f)
+            # shading only where both bounds are finite
+            mask = np.isfinite(yl) & np.isfinite(yh)
+            if mask.any():
+                ax.fill_between(x[mask], yl[mask], yh[mask], alpha=0.2)
 
-    ax.set_title(f"{day} – SCED Steps normalized by row-wise max (rescaled by sum of row maxima)")
+    ax.set_title(f"{day} – SCED Steps normalized by row-wise max (rescaled) with IQR shading")
     ax.set_xlabel("SCED Step")
-    ax.set_ylabel("Scaled Value (sum of row max SCED MW × average normalized)")
+    ax.set_ylabel("Scaled Value (Σ row-max SCED × normalized)")
     ax.legend(title="Fuel Type", bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0.)
     plt.tight_layout()
     out_png = day_out / "normalized_bids_by_stage.png"
@@ -741,21 +1049,24 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
     plt.close()
     print(f"[OK] Saved: {out_png}")
 
-    # ---------------- Per-fuel plots (KEEP HSL/BP dashed lines) ----------------
+    # ----- Plot: Per-fuel + shaded IQR + HSL/BP dashed lines -----
     per_fuel_dir = day_out / "per_fuel"
     per_fuel_dir.mkdir(parents=True, exist_ok=True)
 
     for f in fuels_sorted:
-        series = summary_scaled[f].values
-        if not np.isfinite(series).any():
-            # don't create empty charts
+        y  = pd.to_numeric(summary_scaled[f], errors="coerce").to_numpy(dtype=float)
+        if not np.isfinite(y).any():
             continue
+        yl = pd.to_numeric(summary_low[f],  errors="coerce").to_numpy(dtype=float)
+        yh = pd.to_numeric(summary_high[f], errors="coerce").to_numpy(dtype=float)
 
         fig, ax = plt.subplots(figsize=(10, 6))
-        x = summary_scaled.index.values
-        ax.plot(x, series, marker="o", linewidth=2, label=f)
+        ax.plot(x, y, marker="o", linewidth=2, label=f)
+        mask = np.isfinite(yl) & np.isfinite(yh)
+        if mask.any():
+            ax.fill_between(x[mask], yl[mask], yh[mask], alpha=0.2)
 
-        # dashed HSL / Base Point for this fuel
+        # dashed HSL / BP
         y_hsl = hsl_scaled.get(f, np.nan)
         y_bp  = bp_scaled.get(f, np.nan)
         if np.isfinite(y_hsl):
@@ -763,20 +1074,20 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
         if np.isfinite(y_bp):
             ax.axhline(y_bp,  linestyle="--", linewidth=1.75, color="#d62728", label="Base Point (rescaled)")
 
-        ax.set_title(f"{day} – Normalized & Rescaled SCED Curve (Fuel: {f})")
+        ax.set_title(f"{day} – Normalized & Rescaled SCED Curve (Fuel: {f}) with IQR shading")
         ax.set_xlabel("SCED Step")
-        ax.set_ylabel("Scaled Value (Σ row-max SCED × avg normalized)")
+        ax.set_ylabel("Scaled Value (Σ row-max SCED × normalized)")
         ax.set_xticks(x)
         ax.grid(True, alpha=0.3)
         ax.legend()
 
         out_pf = per_fuel_dir / f"{f}_normalized.png"
         fig.tight_layout()
-        fig.savefig(out_pf, dpi=150)
+        plt.savefig(out_pf, dpi=150)
         plt.close(fig)
         print(f"[OK] Saved: {out_pf}")
 
-    # Optional CSV: write combined wide table
+    # ----- Optional CSV (combined wide) -----
     if save_summary_csv:
         out_csv = day_out / "normalized_bids_by_stage.csv"
         try:
@@ -784,6 +1095,7 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
             print(f"[OK] Saved: {out_csv}")
         except Exception as e:
             print(f"[ERROR] {day}: failed to write summary CSV: {e}")
+
 
 
 def main():

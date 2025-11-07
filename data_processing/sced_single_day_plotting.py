@@ -341,6 +341,8 @@ def average_normalized_by_fuel(norm_df: pd.DataFrame) -> Dict[str, float]:
     return {str(k): float(v) for k, v in by_fuel.sort_index().items()}
 
 
+from typing import Optional, List, Tuple, Dict  # make sure this is imported
+
 def normalize_by_row_max_with_hsl_and_bp(
     step_dfs: Dict[int, pd.DataFrame],
     hsl_df: pd.DataFrame,
@@ -351,40 +353,26 @@ def normalize_by_row_max_with_hsl_and_bp(
 
     Goals implemented:
       1) Drop units (resources) that are empty across ALL steps (so a single bad unit does not nuke its fuel).
-      2) Keep units that only have SOME steps; missing steps simply contribute NaN and are ignored by later means.
+      2) Keep units that only have SOME steps; missing steps simply contribute NaN and are ignored in later means.
 
-    Alignment rules:
-      - Resource alignment: (Union of step resources) ∩ (HSL resources). We do NOT force presence in every step.
-      - Timestamp alignment: (HSL timestamps) ∩ (Union of step timestamps). We do NOT require a timestamp to exist in every step.
-      - Base Point is aligned to the same resources/timestamps (not required to exist in steps).
+    Alignment:
+      - Resources: (Union of step resources) ∩ (HSL resources).
+      - Timestamps: (HSL timestamps) ∩ (Union of step timestamps).
+      - Base Point is aligned to the same resources and timestamps; missing BP timestamps are allowed (become NaN).
 
     Returns:
-      norm_steps: dict[step_num] -> DataFrame normalized by M_all (see below), with ["Resource Name", "Resource Type"] + ts
-      hsl_norm:   HSL normalized by M_all
-      bp_norm:    Base Point normalized by M_all
-      max_sced_per_row: Series indexed by resource key with the row-wise MEAN across time of M_sced (used for rescaling)
-      fuel_per_row:      Series indexed by resource key giving the fuel for that row (used for groupby later)
-
-    Definitions:
-      - For each (resource, timestamp), M_sced = max across available step MWs (NaN if all steps are NaN).
-      - M_all  = max(M_sced, HSL) at that (resource, timestamp).
-      - Each step/HSL/BasePoint is normalized elementwise by M_all. Where M_all <= 0 or NaN, result is NaN.
-
-    Assumes helpers exist in your module:
-      - normalize_key_columns(df) -> (name_col, type_col)
-      - detect_timestamp_columns(df, (name_col, type_col)) -> list[str] sorted
+      norm_steps, hsl_norm, bp_norm, max_sced_per_row (row-mean of M_sced), fuel_per_row.
     """
-    # --- 1) Detect key columns in HSL and in one step (for "Resource Name" / "Resource Type") ---
+    # 1) Key columns
     h_name, h_type = normalize_key_columns(hsl_df)
-    # choose a representative step df to discover stage columns
     any_step_df = next(iter(step_dfs.values()))
     s_name, s_type = normalize_key_columns(any_step_df)
+    bp_name, bp_type = normalize_key_columns(bp_df)
 
-    # --- 2) Case/space-normalized keys for resource alignment (union of steps) & HSL/BP ---
+    # 2) Prepare indices (casefold/trim) and dedup
     def _key(s: pd.Series) -> pd.Series:
         return s.astype(str).str.strip().str.casefold()
 
-    # Deduplicate on key inside each DF to avoid double counting
     def _prep(df: pd.DataFrame, name_col: str) -> pd.DataFrame:
         d = df.copy()
         d["_key"] = _key(d[name_col])
@@ -393,103 +381,88 @@ def normalize_by_row_max_with_hsl_and_bp(
         return d
 
     hsl = _prep(hsl_df, h_name)
-    bp  = _prep(bp_df,  normalize_key_columns(bp_df)[0])
-
+    bp  = _prep(bp_df,  bp_name)
     steps_prepped: Dict[int, pd.DataFrame] = {k: _prep(df, s_name) for k, df in step_dfs.items()}
 
-    # --- 3) Timestamp alignment: HSL ∩ (Union of step timestamps) ---
+    # 3) Timestamps: HSL ∩ (Union of step timestamps)
     def _ts(df: pd.DataFrame, name_col: str, type_col: Optional[str]) -> List[str]:
         return detect_timestamp_columns(df.reset_index(), (name_col, type_col))
 
-    # Collect union of step timestamps
     union_step_ts: set = set()
     for df in steps_prepped.values():
         union_step_ts |= set(_ts(df, s_name, s_type))
 
-    h_ts = set(_ts(hsl, h_name, h_type))
-    bp_ts = set(_ts(bp, *normalize_key_columns(bp_df)))
+    h_ts_set  = set(_ts(hsl, h_name, h_type))
+    bp_ts_set = set(_ts(bp,  bp_name, bp_type))
 
-    # You can only normalize where HSL exists, but you don't require a given timestamp to be in every step.
-    common_ts = sorted(h_ts & union_step_ts, key=lambda c: pd.to_datetime(c))
+    common_ts = sorted(h_ts_set & union_step_ts, key=lambda c: pd.to_datetime(c))
     if not common_ts:
         raise ValueError("No overlapping timestamp columns between HSL and the union of SCED step timestamps.")
 
-    # --- 4) Resource alignment: (Union of step resources) ∩ (HSL resources)
+    # 4) Resources: (Union of step resources) ∩ (HSL resources)
     union_step_idx: set = set().union(*[set(df.index) for df in steps_prepped.values()])
     master_idx = sorted(union_step_idx & set(hsl.index))
     if not master_idx:
         raise ValueError("No overlapping Resource Names between HSL and SCED steps (after normalization).")
 
-    # --- 5) Build aligned numeric blocks for each step, HSL, BP (allowing partial NaN)
+    # 5) Numeric blocks (allow partial NaN)
     def _num_block(df: pd.DataFrame, idx: List[str], cols: List[str]) -> pd.DataFrame:
-        sub = df.reindex(master_idx)  # include all master rows; missing -> NaN
-        block = sub.reindex(columns=cols).apply(pd.to_numeric, errors="coerce")
+        sub = df.reindex(master_idx)                       # rows aligned; missing -> NaN
+        block = sub.reindex(columns=cols).apply(pd.to_numeric, errors="coerce")  # cols aligned; missing -> NaN
         return block
 
     step_blocks: Dict[int, pd.DataFrame] = {k: _num_block(df, master_idx, common_ts) for k, df in steps_prepped.items()}
     hsl_block = _num_block(hsl, master_idx, common_ts)
-    bp_block  = _num_block(bp,  master_idx, common_ts & bp_ts)  # if BP missing some ts, they’ll be NaN
-    # ensure bp_block has same columns (fill missing) for consistent downstream structure
-    bp_block  = bp_block.reindex(columns=common_ts)
 
-    # --- 6) Compute M_sced (max across available steps at each (row, ts)); may be NaN if all steps NaN ---
-    # Stack steps into (K, R, T) with NaNs preserved
-    K = len(step_blocks)
-    R = len(master_idx)
-    T = len(common_ts)
+    # FIX: intersect as sets, then sort (bp may have fewer timestamps)
+    bp_cols = sorted(set(common_ts) & bp_ts_set, key=lambda c: pd.to_datetime(c))
+    bp_block = _num_block(bp, master_idx, bp_cols).reindex(columns=common_ts)  # fill missing bp ts with NaN
+
+    # 6) M_sced = rowwise max over steps at each timestamp (K,R,T)
+    K, R, T = len(step_blocks), len(master_idx), len(common_ts)
     stack = np.empty((K, R, T), dtype=float)
     stack[:] = np.nan
     for i, k in enumerate(sorted(step_blocks.keys())):
         stack[i, :, :] = step_blocks[k].to_numpy(dtype=float)
 
     with np.errstate(all="ignore"):
-        M_sced = np.nanmax(stack, axis=0)  # (R, T)
+        M_sced = np.nanmax(stack, axis=0)  # (R,T)
 
-    # --- 7) Drop units that are empty across ALL steps (your rule #1) ---
-    # A unit is "empty across all steps" if its M_sced row is NaN for every timestamp.
+    # 7) Drop units empty across ALL steps (your rule #1)
     empty_unit_mask = np.isnan(M_sced).all(axis=1)  # (R,)
     if empty_unit_mask.any():
         keep_mask = ~empty_unit_mask
-        kept_rows = int(keep_mask.sum())
-        # slice arrays/frames down to kept resources only
-        M_sced = M_sced[keep_mask, :]
-        hsl_block = hsl_block.iloc[keep_mask, :]
-        bp_block  = bp_block.iloc[keep_mask, :]
+        M_sced     = M_sced[keep_mask, :]
+        hsl_block  = hsl_block.iloc[keep_mask, :]
+        bp_block   = bp_block.iloc[keep_mask, :]
         master_idx = [master_idx[i] for i, k in enumerate(keep_mask) if k]
-        # also shrink step blocks
         for k in list(step_blocks.keys()):
             step_blocks[k] = step_blocks[k].iloc[keep_mask, :]
-        # NOTE: partial-step units remain (some NaNs ok)
 
-    # --- 8) Build M_all = max(M_sced, HSL); denom <= 0 or NaN -> NaN ---
+    # 8) M_all and denominator
     with np.errstate(all="ignore"):
         M_all = np.nanmax(np.stack([M_sced, hsl_block.to_numpy(dtype=float)], axis=0), axis=0)
     denom = M_all.copy()
     denom[~np.isfinite(denom) | (denom <= 0.0)] = np.nan
 
-    # --- 9) Normalize each step/HSL/BP by M_all (rule #2: partial steps naturally become NaN where missing) ---
+    # 9) Normalize steps/HSL/BP by M_all (rule #2 allows partial NaNs)
     norm_steps: Dict[int, pd.DataFrame] = {}
     for k in sorted(step_blocks.keys()):
         num = step_blocks[k].to_numpy(dtype=float)
         with np.errstate(all="ignore"):
             vals = num / denom
-        out = pd.DataFrame(vals, index=master_idx, columns=common_ts)
-        norm_steps[k] = out
+        norm_steps[k] = pd.DataFrame(vals, index=master_idx, columns=common_ts)
 
     with np.errstate(all="ignore"):
         hsl_vals = hsl_block.to_numpy(dtype=float) / denom
         bp_vals  = bp_block.to_numpy(dtype=float)  / denom
 
-    # --- 10) Attach display columns (Resource Name, Resource Type) ---
-    # Prefer HSL for display/fuel; fallback to first non-null across steps.
+    # 10) Display columns
     def _pick_display_cols() -> Tuple[pd.Series, pd.Series]:
-        # resource names
         name_series = hsl.reindex(master_idx)[h_name]
         if name_series.isna().any():
-            # fill from first step where available
             for df in steps_prepped.values():
                 name_series = name_series.fillna(df.reindex(master_idx)[s_name])
-        # resource types (fuel)
         if h_type and (h_type in hsl.columns):
             fuel_series = hsl.reindex(master_idx)[h_type]
         else:
@@ -504,14 +477,12 @@ def normalize_by_row_max_with_hsl_and_bp(
 
     disp_names, fuels = _pick_display_cols()
 
-    # add display cols to each normalized step df
     for k in norm_steps.keys():
         df = norm_steps[k]
         df.insert(0, "Resource Type", fuels.values)
         df.insert(0, "Resource Name", disp_names.values)
         norm_steps[k] = df.reset_index(drop=True)
 
-    # HSL/BP normalized frames
     hsl_norm = pd.DataFrame(hsl_vals, index=master_idx, columns=common_ts)
     hsl_norm.insert(0, "Resource Type", fuels.values)
     hsl_norm.insert(0, "Resource Name", disp_names.values)
@@ -522,11 +493,11 @@ def normalize_by_row_max_with_hsl_and_bp(
     bp_norm.insert(0, "Resource Name", disp_names.values)
     bp_norm.reset_index(drop=True, inplace=True)
 
-    # --- 11) max_sced_per_row Series (mean across time of the per-row maxima) + fuel_per_row Series ---
+    # 11) Row-mean of M_sced for rescaling + fuel_per_row for grouping
     with np.errstate(all="ignore"):
-        row_mean_Msced = np.nanmean(M_sced, axis=1)  # shape (R,)
-    max_sced_per_row = pd.Series(row_mean_Msced, index=master_idx)           # index matches (pre-reset) row identity
-    fuel_per_row     = pd.Series(fuels.values, index=master_idx)             # same index; used for groupby later
+        row_mean_Msced = np.nanmean(M_sced, axis=1)
+    max_sced_per_row = pd.Series(row_mean_Msced, index=master_idx)
+    fuel_per_row     = pd.Series(fuels.values, index=master_idx)
 
     return norm_steps, hsl_norm, bp_norm, max_sced_per_row, fuel_per_row
 

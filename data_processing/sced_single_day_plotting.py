@@ -459,9 +459,9 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
       - Normalize each SCED step, HSL, and Base Point by M_all.
       - Aggregate by fuel, average over resources×timestamps.
       - Reapply magnitude by multiplying the averaged normalized values by SUM(M_sced) per fuel.
-      - Plot one line per fuel across steps; add dashed horizontal lines for HSL and Base Point (rescaled magnitudes).
-      - ALSO emit one plot per fuel using the exact same series used in the combined plot.
-      - NEW: Quick check to list all fuels present in the raw input data (saved to CSV).
+      - Plot one line per fuel across steps (combined chart).
+      - Keep per-fuel plots with dashed HSL and Base Point lines.
+      - Includes a quick check that lists all fuels found in raw input (saved to CSV).
     """
     day = day_dir.name
 
@@ -604,14 +604,13 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
     summary_scaled = pd.DataFrame.from_dict(scaled_by_step, orient="index", columns=fuels_sorted)
     summary_scaled.index.name = "SCED Step"
 
-    # Compute HSL and Base Point dashed lines (same normalization and rescaling)
+    # Compute HSL and Base Point dashed lines (same normalization and rescaling) — used only in per-fuel plots now
     hsl_avg = avg_over_rows_and_time(hsl_norm)
     bp_avg  = avg_over_rows_and_time(bp_norm)
-
     hsl_scaled = pd.Series({f: (hsl_avg.get(f, np.nan) * rescale_by_fuel.get(f, np.nan)) for f in fuels_sorted})
     bp_scaled  = pd.Series({f: (bp_avg.get(f, np.nan)  * rescale_by_fuel.get(f, np.nan)) for f in fuels_sorted})
 
-    # Plot combined
+    # ---------------- Combined plot (NO HSL/BP dashed lines) ----------------
     day_out = plots_root / day / "sced_normalized"
     day_out.mkdir(parents=True, exist_ok=True)
 
@@ -619,28 +618,7 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
     for f in fuels_sorted:
         ax.plot(summary_scaled.index.values, summary_scaled[f].values, marker="o", label=f)
 
-    # dashed horizontals on the combined chart (kept as-is)
-    for f in fuels_sorted:
-        y_hsl = hsl_scaled.get(f, np.nan)
-        y_bp  = bp_scaled.get(f, np.nan)
-        if np.isfinite(y_hsl):
-            ax.hlines(
-                y=y_hsl,
-                xmin=summary_scaled.index.min(),
-                xmax=summary_scaled.index.max(),
-                linestyles="dashed",
-                linewidth=1.5,
-                label=f"{f} – HSL",
-            )
-        if np.isfinite(y_bp):
-            ax.hlines(
-                y=y_bp,
-                xmin=summary_scaled.index.min(),
-                xmax=summary_scaled.index.max(),
-                linestyles="dashed",
-                linewidth=1.5,
-                label=f"{f} – Base Point",
-            )
+    # >>> HSL & Base Point lines intentionally removed from the combined chart <<<
 
     ax.set_title(f"{day} – SCED Steps normalized by row-wise max (rescaled by sum of row maxima)")
     ax.set_xlabel("SCED Step")
@@ -652,7 +630,7 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
     plt.close()
     print(f"[OK] Saved: {out_png}")
 
-    # ALSO: one plot per fuel using the SAME series as the combined plot
+    # ---------------- Per-fuel plots (KEEP HSL/BP dashed lines) ----------------
     per_fuel_dir = day_out / "per_fuel"
     per_fuel_dir.mkdir(parents=True, exist_ok=True)
 
@@ -664,7 +642,7 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
         y = summary_scaled[f].values
         ax.plot(x, y, marker="o", linewidth=2, label=f)
 
-        # dashed HSL / Base Point for this fuel (distinct colors)
+        # dashed HSL / Base Point for this fuel
         y_hsl = hsl_scaled.get(f, np.nan)
         y_bp  = bp_scaled.get(f, np.nan)
         if np.isfinite(y_hsl):

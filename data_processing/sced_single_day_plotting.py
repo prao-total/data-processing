@@ -270,202 +270,193 @@ def process_sced_violins_day(day_dir: Path, plots_root: Path, save_values_csv: b
     for step_csv in step_files:
         plot_violin_step(day, step_csv, day_out, save_values_csv)
 
-def process_sced_price_lines_day(
-    day_dir: Path,
-    plots_root: Path,
-    save_values_csv: bool,
-    per_fuel: bool = False,
-) -> None:
+def process_sced_price_lines_day(day_dir: Path, plots_root: Path, save_values_csv: bool) -> None:
     """
-    For each SCED price step CSV in `day_dir`, gather prices by fuel (across all resources×timestamps),
-    reduce to per-fuel statistics (median, 25th, 75th), then plot a combined
-    line chart over steps with shaded interquartile ranges (IQR).
+    Build SCED price line plots across steps, by fuel.
+      - For each price step CSV, flatten all resource×time prices per fuel and compute Q1, median, Q3.
+      - Combined chart (all fuels): median lines ONLY (no IQR shading).
+      - Per-fuel charts: median line with Q1–Q3 shaded band.
+      - Save wide CSVs for medians, Q1s, and Q3s.
 
-    - Combined plot: one median line per fuel; shaded band = [Q1, Q3].
-    - Optional: per-fuel plots if `per_fuel=True`.
-    - Optional: saves a wide CSV of per-step med/Q1/Q3 per fuel if `save_values_csv=True`.
-
-    Assumes:
-      - PRICE_STEP_PATTERN exists (e.g., r"Curve-Price(\d+)")
-      - normalize_key_columns, detect_timestamp_columns exist (like in your codebase)
+    Assumes helpers exist:
+      - normalize_key_columns(df) -> (name_col, type_col)
+      - detect_timestamp_columns(df, (name_col, type_col)) -> list[str] sorted
+      - PRICE_STEP_PATTERN: compiled regex extracting step number from filename.
     """
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    MIN_SAMPLES = 5  # per-step minimum samples per fuel to compute quartiles
+
     day = day_dir.name
-    day_out = (plots_root / day).resolve()
+    day_out = plots_root / day
     day_out.mkdir(parents=True, exist_ok=True)
 
-    # Find step price files
+    # find price step files
     step_files = list(day_dir.glob("aggregation_SCED1_Curve-Price*.csv"))
     if not step_files:
         step_files = list(day_dir.glob("*SCED*Curve*Price*.csv"))
     if not step_files:
-        print(f"[INFO] {day}: no SCED price files; skipping price lines.")
+        print(f"[INFO] {day}: no SCED price files; skipping price line plots.")
         return
 
-    def step_key(p: Path) -> int:
+    def step_key(p: Path):
         m = PRICE_STEP_PATTERN.search(p.name)
         return int(m.group(1)) if m else 1_000_000
 
     step_files = sorted(step_files, key=step_key)
 
-    # Helper: flatten prices across resources×timestamps for one step
-    def _load_prices_by_fuel(df: pd.DataFrame) -> Dict[str, np.ndarray]:
-        name_col, type_col = normalize_key_columns(df)
-        ts_cols = detect_timestamp_columns(df, (name_col, type_col))
-        if not ts_cols:
-            return {}
-        prices = df[ts_cols].apply(pd.to_numeric, errors="coerce")
-        fuels = df[type_col].astype(str).fillna("Unknown")
-        prices = prices.assign(__fuel__=fuels)
-        out: Dict[str, np.ndarray] = {}
-        for fuel, block in prices.groupby("__fuel__"):
-            vals = block[ts_cols].to_numpy().ravel()
-            vals = vals[np.isfinite(vals)]
-            out[str(fuel)] = vals.astype(float)
-        return out
+    # Hold per-step quartiles (Series indexed by fuel)
+    q1_by_step: dict[int, pd.Series] = {}
+    med_by_step: dict[int, pd.Series] = {}
+    q3_by_step: dict[int, pd.Series] = {}
+    fuels_seen: set[str] = set()
 
-    # Collect per-step stats
-    all_fuels: set[str] = set()
-    steps: list[int] = []
-    stats_by_fuel: Dict[str, Dict[str, list]] = {}  # fuel -> {"median": [], "q1": [], "q3": []}
-
-    # Minimum sample size to form a point (prices across resources×timestamps)
-    min_samples = int(os.environ.get("PRICE_MIN_SAMPLES", "10"))
-
-    for step_csv in step_files:
-        m = PRICE_STEP_PATTERN.search(step_csv.name)
+    for p in step_files:
+        m = PRICE_STEP_PATTERN.search(p.name)
         step_num = int(m.group(1)) if m else None
+        step_lbl = step_num if step_num is not None else 1_000_000
 
         try:
-            df = pd.read_csv(step_csv, dtype=str)
+            df = pd.read_csv(p, dtype=str)
         except Exception as e:
-            print(f"[ERROR] {day}: read failed for {step_csv.name}: {e}")
+            print(f"[ERROR] {day}: read failed for {p.name}: {e}")
             continue
 
-        data_by_fuel = _load_prices_by_fuel(df)
-        if not data_by_fuel:
-            print(f"[INFO] {day}: {step_csv.name} – no data; skipping step.")
-            continue
-
-        steps.append(step_num if step_num is not None else len(steps) + 1)
-        # Initialize placeholders (we will append in fuel loop)
-        for fuel in set(list(all_fuels) + list(data_by_fuel.keys())):
-            stats_by_fuel.setdefault(fuel, {}).setdefault("median", [])
-            stats_by_fuel.setdefault(fuel, {}).setdefault("q1", [])
-            stats_by_fuel.setdefault(fuel, {}).setdefault("q3", [])
-
-        skipped_here = []
-        for fuel, arr in data_by_fuel.items():
-            all_fuels.add(fuel)
-            if arr is None or arr.size < min_samples:
-                # maintain alignment with steps: append NaN for this fuel at this step
-                stats_by_fuel[fuel]["median"].append(np.nan)
-                stats_by_fuel[fuel]["q1"].append(np.nan)
-                stats_by_fuel[fuel]["q3"].append(np.nan)
-                skipped_here.append(fuel)
+        # Extract numeric prices and fuel
+        try:
+            name_col, type_col = normalize_key_columns(df)
+            ts_cols = detect_timestamp_columns(df, (name_col, type_col))
+            if not ts_cols or type_col is None:
+                print(f"[INFO] {day}: {p.name} – no timestamps or fuel column; skipping.")
                 continue
 
-            q1 = float(np.nanpercentile(arr, 25))
-            med = float(np.nanpercentile(arr, 50))
-            q3 = float(np.nanpercentile(arr, 75))
-            stats_by_fuel[fuel]["median"].append(med)
-            stats_by_fuel[fuel]["q1"].append(q1)
-            stats_by_fuel[fuel]["q3"].append(q3)
+            prices = df[ts_cols].apply(pd.to_numeric, errors="coerce")
+            fuels = df[type_col].astype(str).fillna("Unknown")
+            # long-ish aggregation by fuel: flatten resource×time to 1D per fuel
+            prices = prices.assign(__fuel__=fuels)
 
-        # Any fuels that didn’t appear in this step still need NaNs appended to keep arrays aligned
-        missing_fuels = (all_fuels - set(data_by_fuel.keys()))
-        for fuel in missing_fuels:
-            stats_by_fuel[fuel]["median"].append(np.nan)
-            stats_by_fuel[fuel]["q1"].append(np.nan)
-            stats_by_fuel[fuel]["q3"].append(np.nan)
+            q1_dict, med_dict, q3_dict = {}, {}, {}
+            skipped_fuels = []
+            for f, block in prices.groupby("__fuel__"):
+                vals = block[ts_cols].to_numpy().ravel()
+                vals = vals[np.isfinite(vals)]
+                if vals.size < MIN_SAMPLES:
+                    skipped_fuels.append(str(f))
+                    continue
+                q1_dict[str(f)]  = float(np.quantile(vals, 0.25))
+                med_dict[str(f)] = float(np.quantile(vals, 0.50))
+                q3_dict[str(f)]  = float(np.quantile(vals, 0.75))
 
-        if skipped_here:
-            print(f"[INFO] {day}: {step_csv.name} – skipped fuels (too few samples < {min_samples}): {', '.join(sorted(skipped_here))}")
+            if skipped_fuels:
+                print(f"[INFO] {day}: {p.name} – skipped empty/short fuels: {', '.join(skipped_fuels)}")
 
-    if not steps:
-        print(f"[INFO] {day}: no usable steps for price lines; stopping.")
+            if not med_dict:
+                print(f"[INFO] {day}: {p.name} – no fuels with enough samples; skipping step.")
+                continue
+
+            q1_by_step[step_lbl]  = pd.Series(q1_dict,  dtype="float64")
+            med_by_step[step_lbl] = pd.Series(med_dict, dtype="float64")
+            q3_by_step[step_lbl]  = pd.Series(q3_dict,  dtype="float64")
+            fuels_seen.update(med_dict.keys())
+
+        except Exception as e:
+            print(f"[ERROR] {day}: processing failed for {p.name}: {e}")
+            continue
+
+    if not med_by_step:
+        print(f"[INFO] {day}: no usable steps for price lines; done.")
         return
 
-    steps_arr = np.array(steps, dtype=float)
-    fuels_sorted = sorted(all_fuels)
+    # Build wide DataFrames (index = step, columns = fuel)
+    fuels_sorted = sorted(fuels_seen)
+    steps_sorted = sorted(med_by_step.keys())
 
-    # Build wide DataFrames (optional CSVs)
-    median_wide = pd.DataFrame({f: stats_by_fuel.get(f, {}).get("median", [np.nan]*len(steps_arr)) for f in fuels_sorted}, index=steps_arr)
-    q1_wide     = pd.DataFrame({f: stats_by_fuel.get(f, {}).get("q1",     [np.nan]*len(steps_arr)) for f in fuels_sorted}, index=steps_arr)
-    q3_wide     = pd.DataFrame({f: stats_by_fuel.get(f, {}).get("q3",     [np.nan]*len(steps_arr)) for f in fuels_sorted}, index=steps_arr)
-    median_wide.index.name = q1_wide.index.name = q3_wide.index.name = "SCED Step"
+    def _to_wide(dstep: dict[int, pd.Series]) -> pd.DataFrame:
+        wide = pd.DataFrame(index=steps_sorted, columns=fuels_sorted, dtype="float64")
+        for s in steps_sorted:
+            if s in dstep:
+                for f, v in dstep[s].items():
+                    wide.loc[s, f] = v
+        wide.index.name = "SCED Step"
+        return wide
 
-    # -------- Combined plot: one line per fuel + shaded IQR --------
-    out_dir = day_out / "sced_price_lines"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    med_wide = _to_wide(med_by_step)
+    q1_wide  = _to_wide(q1_by_step)
+    q3_wide  = _to_wide(q3_by_step)
+
+    # ---------------- Combined chart (all fuels): MEDIAN LINES ONLY ----------------
+    out_lines_dir = day_out / "sced_price_lines"
+    out_lines_dir.mkdir(parents=True, exist_ok=True)
 
     fig, ax = plt.subplots(figsize=(14, 7))
-    for fuel in fuels_sorted:
-        med = pd.to_numeric(median_wide[fuel], errors="coerce").to_numpy()
-        q1  = pd.to_numeric(q1_wide[fuel],     errors="coerce").to_numpy()
-        q3  = pd.to_numeric(q3_wide[fuel],     errors="coerce").to_numpy()
+    for f in fuels_sorted:
+        series = pd.to_numeric(med_wide[f], errors="coerce").to_numpy()
+        if np.isfinite(series).any():
+            ax.plot(med_wide.index.values, series, marker="o", linewidth=2, label=f)
 
-        # Only draw if at least one finite median exists
-        if np.isfinite(med).any():
-            ax.plot(steps_arr, med, marker="o", linewidth=2, label=fuel)
-            # Shaded IQR where both bounds are finite
-            mask = np.isfinite(q1) & np.isfinite(q3)
-            if mask.any():
-                ax.fill_between(steps_arr[mask], q1[mask], q3[mask], alpha=0.20)
-
-    ax.set_title(f"{day} – SCED Price by Fuel: Median with Interquartile Range")
+    ax.set_title(f"{day} – SCED Price (Median by Fuel) across Steps")
     ax.set_xlabel("SCED Step")
-    ax.set_ylabel("Price")
-    ax.legend(title="Fuel", bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0.)
+    ax.set_ylabel("Price (Median)")
+    ax.legend(title="Fuel Type", bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0.)
     ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    out_png = out_dir / "price_lines_iqr.png"
-    plt.savefig(out_png, dpi=150)
-    plt.close()
+    fig.tight_layout()
+    out_png = out_lines_dir / "price_lines_all_fuels.png"
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
     print(f"[OK] Saved: {out_png}")
 
-    # -------- Optional per-fuel small multiples --------
-    if per_fuel:
-        pf_dir = out_dir / "per_fuel"
-        pf_dir.mkdir(exist_ok=True)
-        for fuel in fuels_sorted:
-            med = pd.to_numeric(median_wide[fuel], errors="coerce").to_numpy()
-            q1  = pd.to_numeric(q1_wide[fuel],     errors="coerce").to_numpy()
-            q3  = pd.to_numeric(q3_wide[fuel],     errors="coerce").to_numpy()
+    # ---------------- Per-fuel charts: MEDIAN LINE + IQR (Q1–Q3) SHADED ----------------
+    per_fuel_dir = out_lines_dir / "per_fuel"
+    per_fuel_dir.mkdir(parents=True, exist_ok=True)
 
-            if not np.isfinite(med).any():
-                continue
+    x = med_wide.index.values
+    for f in fuels_sorted:
+        y_med = pd.to_numeric(med_wide[f], errors="coerce").to_numpy()
+        y_q1  = pd.to_numeric(q1_wide[f],  errors="coerce").to_numpy()
+        y_q3  = pd.to_numeric(q3_wide[f],  errors="coerce").to_numpy()
 
-            fig, ax = plt.subplots(figsize=(10, 6))
-            ax.plot(steps_arr, med, marker="o", linewidth=2, label=fuel)
-            mask = np.isfinite(q1) & np.isfinite(q3)
-            if mask.any():
-                ax.fill_between(steps_arr[mask], q1[mask], q3[mask], alpha=0.20)
+        if not (np.isfinite(y_med).any() or np.isfinite(y_q1).any() or np.isfinite(y_q3).any()):
+            continue  # nothing to plot
 
-            ax.set_title(f"{day} – {fuel}: SCED Price Median with IQR")
-            ax.set_xlabel("SCED Step")
-            ax.set_ylabel("Price")
-            ax.grid(True, alpha=0.3)
-            ax.legend()
-            plt.tight_layout()
-            out_pf = pf_dir / f"{fuel}_price_lines_iqr.png"
-            plt.savefig(out_pf, dpi=150)
-            plt.close()
-            print(f"[OK] Saved: {out_pf}")
+        fig, ax = plt.subplots(figsize=(10, 6))
+        # shaded IQR where both bounds are finite
+        mask = np.isfinite(y_q1) & np.isfinite(y_q3)
+        if mask.any():
+            ax.fill_between(x[mask], y_q1[mask], y_q3[mask], alpha=0.25, linewidth=0)
 
-    # -------- Optional CSV exports --------
+        # median line
+        if np.isfinite(y_med).any():
+            ax.plot(x, y_med, marker="o", linewidth=2, label=f)
+
+        ax.set_title(f"{day} – SCED Price (Fuel: {f}) — Median with IQR")
+        ax.set_xlabel("SCED Step")
+        ax.set_ylabel("Price")
+        ax.set_xticks(x)
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+        out_pf = per_fuel_dir / f"{f}_price_line_iqr.png"
+        fig.tight_layout()
+        fig.savefig(out_pf, dpi=150)
+        plt.close(fig)
+        print(f"[OK] Saved: {out_pf}")
+
+    # ---------------- Save CSVs ----------------
     if save_values_csv:
-        median_csv = out_dir / "price_lines_median_wide.csv"
-        q1_csv     = out_dir / "price_lines_q1_wide.csv"
-        q3_csv     = out_dir / "price_lines_q3_wide.csv"
+        med_csv = out_lines_dir / "price_median_wide.csv"
+        q1_csv  = out_lines_dir / "price_q1_wide.csv"
+        q3_csv  = out_lines_dir / "price_q3_wide.csv"
         try:
-            median_wide.to_csv(median_csv)
+            med_wide.to_csv(med_csv)
             q1_wide.to_csv(q1_csv)
             q3_wide.to_csv(q3_csv)
-            print(f"[OK] Saved: {median_csv}")
+            print(f"[OK] Saved: {med_csv}")
             print(f"[OK] Saved: {q1_csv}")
             print(f"[OK] Saved: {q3_csv}")
         except Exception as e:
-            print(f"[ERROR] {day}: failed writing price lines CSVs: {e}")
+            print(f"[ERROR] {day}: failed writing quartile CSVs: {e}")
 
 
 # =========================================

@@ -38,7 +38,7 @@ Assumptions:
 
 from __future__ import annotations
 from pathlib import Path
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Optional
 import re
 
 import pandas as pd
@@ -46,8 +46,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # ===================== EDIT THESE =====================
-ROOT_DIR  = r"/path/to/output_root"   # contains YYYY-MM-DD subfolders
-PLOTS_DIR = r"/path/to/plots_out"     # results written here, mirrored per-day
+ROOT_DIR  = r"C:/Users/L1165683/GitHub_Repos/data-processing/output/sced_single_day_data"   # contains YYYY-MM-DD subfolders
+PLOTS_DIR = r"C:/Users/L1165683/GitHub_Repos/data-processing/output/sced_single_day_plotting_update_2"     # results written here, mirrored per-day
 # Optional toggles (leave as-is unless you want different behavior)
 BP_AGG_MODE = "mean"                  # "mean" (MW) or "mwh" (energy)
 BP_SAVE_HOURLY_CSV = True             # write hourly pivot per day
@@ -340,8 +340,6 @@ def average_normalized_by_fuel(norm_df: pd.DataFrame) -> Dict[str, float]:
     by_fuel = vals.groupby("Resource Type", dropna=False).mean(numeric_only=True).mean(axis=1, numeric_only=True)
     return {str(k): float(v) for k, v in by_fuel.sort_index().items()}
 
-
-from typing import Optional, List, Tuple, Dict  # make sure this is imported
 
 def normalize_by_row_max_with_hsl_and_bp(
     step_dfs: Dict[int, pd.DataFrame],
@@ -1039,9 +1037,9 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
             if mask.any():
                 ax.fill_between(x[mask], yl[mask], yh[mask], alpha=0.2)
 
-    ax.set_title(f"{day} – SCED Steps normalized by row-wise max (rescaled) with IQR shading")
+    ax.set_title(f"{day} – Aggregate bidding behavior per fuel over SCED Steps")
     ax.set_xlabel("SCED Step")
-    ax.set_ylabel("Scaled Value (Σ row-max SCED × normalized)")
+    ax.set_ylabel("Aggregate MW bid (MW)")
     ax.legend(title="Fuel Type", bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0.)
     plt.tight_layout()
     out_png = day_out / "normalized_bids_by_stage.png"
@@ -1074,9 +1072,9 @@ def process_sced_normalized_lines_day(day_dir: Path, plots_root: Path, save_summ
         if np.isfinite(y_bp):
             ax.axhline(y_bp,  linestyle="--", linewidth=1.75, color="#d62728", label="Base Point (rescaled)")
 
-        ax.set_title(f"{day} – Normalized & Rescaled SCED Curve (Fuel: {f}) with IQR shading")
+        ax.set_title(f"{day} – Aggregate bidding behavior per SCED Step for Fuel: {f}")
         ax.set_xlabel("SCED Step")
-        ax.set_ylabel("Scaled Value (Σ row-max SCED × normalized)")
+        ax.set_ylabel("Aggregate MW bid (MW)")
         ax.set_xticks(x)
         ax.grid(True, alpha=0.3)
         ax.legend()

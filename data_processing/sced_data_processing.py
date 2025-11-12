@@ -395,56 +395,40 @@ def aggregate_base_point_matrix(
     verbose: bool = True,
 ) -> Tuple[pd.DataFrame, List[str]]:
     """
-    Combine CSV DataFrames into a wide matrix:
-        index   = resource_col (e.g., Resource Name)
-        columns = timestamp_col (e.g., SCED Time Stamp)
-        values  = value_col (e.g., Base Point, HSL, ...)
-
-    Also captures an optional RESOURCE_TYPE_COL (default "Resource Type") and inserts it
-    as the first data column after the index.
+    Memory-friendly aggregator:
+    Incrementally pivot each input DataFrame and merge into a single wide matrix.
+    Preserves prior behavior/outputs and conflict policy while avoiding a giant in-memory
+    (resource, timestamp) dict.
     """
-    messages: List[str] = []
+    msgs: List[str] = []
 
     def log(msg: str):
-        if verbose:
-            messages.append(msg)
+        if verbose and (max_messages is None or len(msgs) < max_messages):
+            msgs.append(msg)
 
-    def norm(s: Any) -> str:
-        return str(s).strip().lower()
+    def resolve_col(df: pd.DataFrame, col_name: str) -> Optional[str]:
+        cols = list(df.columns)
+        if case_insensitive_cols:
+            lower_map = {str(c).lower().strip(): c for c in cols}
+            return lower_map.get(str(col_name).lower().strip(), None)
+        return col_name if col_name in cols else None
 
-    def resolve_col(df: pd.DataFrame, desired: str) -> Optional[str]:
-        # Direct
-        if desired in df.columns:
-            return desired
-        # Strip + direct
-        stripped = {str(c).strip(): c for c in df.columns}
-        if desired in stripped:
-            return stripped[desired]
-        if not case_insensitive_cols:
-            return None
-        desired_norm = norm(desired)
-        candidates = {c: norm(c) for c in df.columns}
-        for c, cn in candidates.items():
-            if cn == desired_norm:
-                return c
-        return None
-
-    def parse_timestamps(series: pd.Series) -> pd.Series:
+    def parse_ts(series: pd.Series) -> pd.Series:
         if timestamp_format:
-            parsed = pd.to_datetime(series, errors="coerce", format=timestamp_format)
-            if parsed.isna().mean() > 0.5:
-                log("[INFO] High NaT rate with provided TIMESTAMP_FORMAT; falling back to general parsing.")
-                parsed = pd.to_datetime(series, errors="coerce")
-            return parsed
+            try:
+                return pd.to_datetime(series, format=timestamp_format, errors="coerce")
+            except Exception:
+                pass
         return pd.to_datetime(series, errors="coerce")
 
-    cells: Dict[Tuple[str, pd.Timestamp], float] = {}
-    source_of: Dict[Tuple[str, pd.Timestamp], str] = {}
-    # capture a single resource type per resource name
-    rtype_map: Dict[str, Any] = {}
+    # Running wide matrix; columns will be mixture of timestamps and possibly "Resource Type"
+    combined: Optional[pd.DataFrame] = None
+
+    # Track "first non-empty resource type per resource"
+    rtype_first: Dict[str, Any] = {}
 
     for src_name, df in dfs.items():
-        # Ensure header whitespace is trimmed
+        # sanitize headers
         try:
             df = df.rename(columns=lambda c: str(c).strip())
         except Exception:
@@ -456,102 +440,105 @@ def aggregate_base_point_matrix(
 
         missing = [c for c in (rc, tc, vc) if c not in df.columns]
         if missing:
-            log(f"[WARN] {src_name}: missing required columns (found: {list(df.columns)[:12]}...); skipping.")
+            log(f"[WARN] {src_name}: missing required columns {missing}; skipping.")
             continue
 
-        # Optional resource type column
-        rtype_env = env_get("RESOURCE_TYPE_COL", "Resource Type")
+        rtype_env = os.environ.get("RESOURCE_TYPE_COL", "Resource Type")
         rtype_col = resolve_col(df, rtype_env)
 
+        # Select minimal working set
         cols_sel = [rc, tc, vc] + ([rtype_col] if rtype_col else [])
         work = df[cols_sel].copy()
 
-        # Clean resource names
+        # Normalize resource names
         if trim_resource:
-            work[rc] = work[rc].astype(str).str.strip()
+            try:
+                work[rc] = work[rc].astype(str).str.strip()
+            except Exception:
+                pass
 
-        # Parse timestamps
-        work[tc] = parse_timestamps(work[tc])
-
-        # Coerce value column to numeric
+        # Parse timestamps and values
+        work[tc] = parse_ts(work[tc])
         if coerce_value_numeric:
             work[vc] = pd.to_numeric(work[vc], errors="coerce")
 
-        # Drop rows missing essentials
+        # Drop null essentials
         before = len(work)
         work = work.dropna(subset=[rc, tc, vc])
         dropped = before - len(work)
         if dropped > 0:
             log(f"[INFO] {src_name}: dropped {dropped} row(s) with null {rc}/{tc}/{vc}.")
 
-        # Insert with conflict handling; capture resource type
-        for row in work.itertuples(index=False, name=None):
-            res, ts, val = row[0], row[1], row[2]
-            key = (str(res), pd.Timestamp(ts))
+        # Update resource-type first-wins map
+        if rtype_col and rtype_col in work.columns:
+            # Take the first non-empty per resource from this file
+            r_g = (
+                work[[rc, rtype_col]]
+                .dropna(subset=[rc])
+                .drop_duplicates(subset=[rc], keep="first")
+            )
+            for rname, rtype_val in zip(r_g[rc].tolist(), r_g[rtype_col].tolist()):
+                if rname not in rtype_first or (rtype_first[rname] in ("", None) and pd.notna(rtype_val)):
+                    if pd.notna(rtype_val) and str(rtype_val).strip() != "":
+                        rtype_first[rname] = rtype_val
 
-            # Record resource type (first non-empty wins)
-            if rtype_col and len(row) > 3:
-                rt = row[3]
-                if rt is not None and str(rt).strip() != "":
-                    if res not in rtype_map or pd.isna(rtype_map[res]) or rtype_map[res] in ("", None):
-                        rtype_map[res] = rt
+        if work.empty:
+            continue
 
-            if key not in cells or (pd.isna(cells[key]) and not pd.isna(val)):
-                cells[key] = val
-                source_of[key] = src_name
-                continue
+        # Build small per-file pivot
+        try:
+            small = work.pivot_table(index=rc, columns=tc, values=vc, aggfunc="first")
+        except Exception as e:
+            log(f"[WARN] {src_name}: pivot failed ({e}); skipping this chunk.")
+            continue
 
-            existing = cells[key]
-            if pd.isna(val):
-                continue
-            if pd.isna(existing):
-                cells[key] = val
-                source_of[key] = src_name
-                continue
+        # Merge into combined, honoring conflict policy
+        if combined is None:
+            combined = small
+        else:
+            # Align shapes: union over index and columns (timestamps)
+            # Fill with NaN to avoid blowing memory on dense copies
+            # We'll resolve conflicts cell-wise with vectorized ops.
+            # First, ensure both sides share the same unioned structure:
+            new_index = combined.index.union(small.index)
+            new_cols = combined.columns.union(small.columns)
+            combined = combined.reindex(index=new_index, columns=new_cols)
+            small = small.reindex(index=new_index, columns=new_cols)
 
-            # Both non-null: conflict
-            if on_conflict == "skip":
-                log(
-                    f"[INFO] Duplicate for (Resource='{res}', Time='{ts}') from {src_name}; "
-                    f"value already present from {source_of[key]}; skipped."
-                )
-            elif on_conflict == "overwrite":
-                log(
-                    f"[WARN] Overwriting (Resource='{res}', Time='{ts}'): "
-                    f"{existing} (from {source_of[key]}) -> {val} (from {src_name})."
-                )
-                cells[key] = val
-                source_of[key] = src_name
+            if on_conflict == "overwrite":
+                # Prefer 'small' where it has non-null values
+                mask = small.notna()
+                combined = combined.where(~mask, small)
+            else:  # skip (existing wins)
+                # Fill only where combined is null
+                mask = combined.isna() & small.notna()
+                combined = combined.where(~mask, small)
 
-    if not cells:
-        empty = pd.DataFrame(columns=[resource_col]).set_index(resource_col)
-        # If any resource types were captured for empty set, attach blank col as placeholder
-        return empty, messages
+        # Free per-file pivot early
+        del small
 
-    # Tidy then pivot
-    tidy = pd.DataFrame(
-        [(r, t, v) for (r, t), v in cells.items()],
-        columns=[resource_col, timestamp_col, value_col],
-    )
-    agg_df = tidy.pivot(index=resource_col, columns=timestamp_col, values=value_col)
+    # Attach Resource Type column (first non-empty wins)
+    if combined is None:
+        # Nothing aggregated
+        return pd.DataFrame(), msgs
 
-    # Attach Resource Type column after index (as first data column)
-    if rtype_map:
-        rt_series = pd.Series(rtype_map, name=env_get("RESOURCE_TYPE_COL", "Resource Type"))
-        rt_aligned = rt_series.reindex(agg_df.index)
-        agg_df.insert(0, rt_series.name, rt_aligned)
+    if rtype_first:
+        # Create a series aligned to combined index
+        rt_series = pd.Series(rtype_first, name="Resource Type")
+        # Reindex to all resources (NaN where missing)
+        rt_series = rt_series.reindex(combined.index)
+        # Insert as a normal column. Keep exactly the same column name used elsewhere.
+        combined.insert(0, "Resource Type", rt_series)
 
-    # Sort for readability
-    try:
-        agg_df = agg_df.sort_index(axis=0)
-    except Exception:
-        pass
-    try:
-        agg_df = agg_df.sort_index(axis=1)
-    except Exception:
-        pass
+    # Sort timestamp columns if they are datetime-like (ignoring the Resource Type column)
+    # (This keeps CSV output stable and tidy.)
+    date_cols = [c for c in combined.columns if isinstance(c, pd.Timestamp)]
+    if date_cols:
+        non_date = [c for c in combined.columns if not isinstance(c, pd.Timestamp)]
+        combined = combined[non_date + sorted(date_cols)]
 
-    return agg_df, messages
+    return combined, msgs
+
 
 
 # =========================

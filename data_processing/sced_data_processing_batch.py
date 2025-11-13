@@ -1,20 +1,28 @@
 #!/usr/bin/env python
 """
-SCED data processing: Option A aggregator
+SCED data processing: Option A aggregator with nested ZIP support.
 
-Reads one or more ERCOT 60-day SCED generator CSVs and builds
-an "aggregated matrix" for each value column (e.g. Base Point, HSL).
-Each output CSV has Resource Name as rows and SCED timestamps as columns.
+Reads ERCOT 60-day SCED generator data stored as:
+- Plain CSV files, and/or
+- ZIP files containing CSVs, and possibly nested ZIPs
 
-Environment variables expected:
+For each value column in VALUE_COLS (e.g. "Base Point, HSL"),
+builds an "aggregated matrix" CSV:
 
-  ROOT_FOLDER       (required)  -> root directory containing SCED CSVs
+  rows    -> Resource Name
+  columns -> SCED timestamps
+  values  -> value column (e.g. Base Point or HSL)
+
+Env variables (in .env or environment):
+
+  ROOT_FOLDER       (required)  -> root directory of raw SCED data (zips & csvs)
   SAVE_AGG_DIR      (preferred) -> directory to write aggregated CSVs into
-  SAVE_AGG_PATH     (legacy)    -> if set, we use its *directory* as SAVE_AGG_DIR
+  SAVE_AGG_PATH     (legacy)    -> if set, its *directory* is used as SAVE_AGG_DIR
   VALUE_COLS                    -> comma-separated list of columns, e.g. "Base Point, HSL"
-  FILENAME_CONTAINS             -> optional filter substring for CSV names
+  FILENAME_CONTAINS             -> optional substring filter for filenames
                                    default: "SCED_Gen_Resource_Data"
-  TIMESTAMP_COLUMN              -> optional; default: "SCED Time Stamp"
+  TIMESTAMP_COLUMN              -> optional preferred timestamp column
+                                   default: "SCED Time Stamp"
   AGG_LOG_PATH                  -> optional log file path
   VERBOSE                       -> "0"/"false" to silence stdout logs (default on)
 
@@ -25,12 +33,14 @@ Usage:
 
 from __future__ import annotations
 
+import io
 import os
 import re
 import sys
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -63,11 +73,11 @@ def env_get(key: str, default: Optional[str] = None, *, required: bool = False) 
 
 
 def load_config() -> Config:
-    # Load .env if python-dotenv is installed
     if load_dotenv is not None:
         load_dotenv()
 
-    root_folder = Path(env_get("ROOT_FOLDER", required=True))  # type: ignore[arg-type]
+    root_folder_str = env_get("ROOT_FOLDER", required=True)
+    root_folder = Path(root_folder_str)  # type: ignore[arg-type]
 
     save_agg_dir_str = env_get("SAVE_AGG_DIR")
     save_agg_path_str = env_get("SAVE_AGG_PATH")
@@ -75,7 +85,7 @@ def load_config() -> Config:
     if save_agg_dir_str:
         save_agg_dir = Path(save_agg_dir_str)
     elif save_agg_path_str:
-        # Back-compat: if old single-file path is given, use its directory as SAVE_AGG_DIR
+        # backwards compatible: use parent directory of single-file path
         save_agg_dir = Path(save_agg_path_str).parent
     else:
         raise SystemExit("ERROR: either SAVE_AGG_DIR or SAVE_AGG_PATH must be set in the environment.")
@@ -107,7 +117,7 @@ def load_config() -> Config:
 
 
 # ---------------------------------------------------------------------------
-# Logging + file discovery
+# Logging
 # ---------------------------------------------------------------------------
 
 def log(msg: str, cfg: Config, *, end: str = "\n") -> None:
@@ -120,28 +130,8 @@ def log(msg: str, cfg: Config, *, end: str = "\n") -> None:
             f.write(msg + "\n")
 
 
-def find_input_csvs(cfg: Config) -> List[Path]:
-    if not cfg.root_folder.is_dir():
-        raise SystemExit(f"ERROR: ROOT_FOLDER {cfg.root_folder} does not exist or is not a directory.")
-
-    all_csvs = list(cfg.root_folder.rglob("*.csv"))
-    if cfg.filename_contains:
-        needle = cfg.filename_contains.lower()
-        csvs = [p for p in all_csvs if needle in p.name.lower()]
-    else:
-        csvs = all_csvs
-
-    if not csvs:
-        raise SystemExit(
-            f"ERROR: No CSV files found under {cfg.root_folder} matching '*.csv' "
-            f"and filter {cfg.filename_contains!r}."
-        )
-
-    return sorted(csvs)
-
-
 # ---------------------------------------------------------------------------
-# Core aggregation helpers
+# Input discovery: directories + nested ZIPs
 # ---------------------------------------------------------------------------
 
 def detect_timestamp_column(df: pd.DataFrame, preferred: str, fallback_substring: str = "time") -> Optional[str]:
@@ -154,6 +144,98 @@ def detect_timestamp_column(df: pd.DataFrame, preferred: str, fallback_substring
     return None
 
 
+def _filename_matches(name: str, needle: Optional[str]) -> bool:
+    if needle is None or needle == "":
+        return True
+    return needle.lower() in name.lower()
+
+
+def _iter_dataframes_from_zip(
+    zf: zipfile.ZipFile,
+    root_label: str,
+    needle: Optional[str],
+) -> Iterator[Tuple[str, pd.DataFrame]]:
+    """
+    Recursively iterate through ZIP contents.
+
+    Yields (source_label, df) for every CSV whose name contains `needle`,
+    including CSVs that live inside nested ZIPs.
+    """
+    for info in zf.infolist():
+        name = info.filename
+        if name.endswith("/"):
+            continue
+
+        lower = name.lower()
+        label_prefix = f"{root_label}::{name}"
+
+        # Nested ZIP: recurse
+        if lower.endswith(".zip"):
+            try:
+                with zf.open(info) as inner_fp:
+                    data = inner_fp.read()
+                with zipfile.ZipFile(io.BytesIO(data)) as inner_zf:
+                    yield from _iter_dataframes_from_zip(inner_zf, label_prefix, needle)
+            except Exception as e:
+                # Just log / skip bad nested zips
+                # We don't have cfg here, so caller should handle logging
+                continue
+
+        # CSV that matches our needle
+        elif lower.endswith(".csv") and _filename_matches(name, needle):
+            try:
+                with zf.open(info) as csv_fp:
+                    df = pd.read_csv(csv_fp)
+                yield label_prefix, df
+            except Exception:
+                # Caller logs; skip bad CSVs
+                continue
+
+
+def iter_input_dataframes(cfg: Config) -> Iterator[Tuple[str, pd.DataFrame]]:
+    """
+    Iterate over all input dataframes under ROOT_FOLDER, including:
+
+      - CSV files on disk whose names contain filename_contains
+      - CSV files inside ZIPs, including nested ZIPs, whose names contain filename_contains
+
+    Yields (source_label, df).
+    """
+    if not cfg.root_folder.is_dir():
+        raise SystemExit(f"ERROR: ROOT_FOLDER {cfg.root_folder} does not exist or is not a directory.")
+
+    needle = cfg.filename_contains
+
+    for path in cfg.root_folder.rglob("*"):
+        if not path.is_file():
+            continue
+
+        lower = path.name.lower()
+
+        # Plain CSVs
+        if lower.endswith(".csv") and _filename_matches(path.name, needle):
+            try:
+                df = pd.read_csv(path)
+            except Exception:
+                # Caller logs; skip bad file
+                continue
+            yield str(path), df
+
+        # ZIPs (possibly with nested zips)
+        elif lower.endswith(".zip"):
+            try:
+                with zipfile.ZipFile(path, "r") as zf:
+                    for label, df in _iter_dataframes_from_zip(zf, str(path), needle):
+                        yield label, df
+            except Exception:
+                # Skip corrupt or unreadable zips
+                continue
+
+
+# ---------------------------------------------------------------------------
+# Aggregation helpers
+# ---------------------------------------------------------------------------
+
 def safe_value_col_name(value_col: str) -> str:
     """Turn 'Base Point' into 'Base_Point', etc., for filenames."""
     out = re.sub(r"[^0-9A-Za-z]+", "_", value_col).strip("_")
@@ -161,10 +243,9 @@ def safe_value_col_name(value_col: str) -> str:
 
 
 def aggregate_for_value_col(
-    csv_paths: Sequence[Path],
     value_col: str,
     cfg: Config,
-) -> tuple[Optional[pd.DataFrame], List[str]]:
+) -> Tuple[Optional[pd.DataFrame], List[str]]:
     """
     Build a wide matrix for `value_col`:
 
@@ -172,52 +253,51 @@ def aggregate_for_value_col(
       columns -> SCED timestamps
       values  -> `value_col` values
 
+    We *stream* over all input dataframes under ROOT_FOLDER (including nested zips).
+
     Returns (matrix, messages).
     """
     msgs: List[str] = []
     series_list: List[pd.Series] = []
 
-    for path in csv_paths:
-        try:
-            df = pd.read_csv(path)
-        except Exception as e:
-            msgs.append(f"[WARN] Failed to read {path.name}: {e}")
-            continue
-
+    for source_label, df in iter_input_dataframes(cfg):
+        # Basic sanity checks
         if "Resource Name" not in df.columns:
-            msgs.append(f"[WARN] Skipping {path.name}: missing 'Resource Name' column.")
+            msgs.append(f"[WARN] {source_label}: missing 'Resource Name' column; skipping.")
             continue
 
         ts_col = detect_timestamp_column(df, cfg.timestamp_col)
         if ts_col is None:
-            msgs.append(f"[WARN] Skipping {path.name}: could not find timestamp column.")
+            msgs.append(f"[WARN] {source_label}: could not find timestamp column; skipping.")
             continue
 
         if value_col not in df.columns:
-            msgs.append(f"[WARN] {value_col!r} not found in {path.name}; skipping for this file.")
+            # Not an error; file just doesn't have this metric
+            msgs.append(f"[INFO] {source_label}: value column {value_col!r} not found; skipping.")
             continue
 
         tmp = df[["Resource Name", ts_col, value_col]].copy()
-        # Parse timestamps and drop bad rows
+
+        # Parse timestamps & clean
         tmp[ts_col] = pd.to_datetime(tmp[ts_col], errors="coerce")
         tmp = tmp[tmp[ts_col].notna()]
         tmp = tmp.dropna(subset=[value_col])
 
         if tmp.empty:
-            msgs.append(f"[INFO] No valid rows for {value_col!r} in {path.name}; all NaN or bad timestamps.")
+            msgs.append(f"[INFO] {source_label}: no valid rows for {value_col!r} after cleaning.")
             continue
 
         pivot = tmp.pivot_table(
             index="Resource Name",
             columns=ts_col,
             values=value_col,
-            aggfunc="mean",  # if duplicates, average
+            aggfunc="mean",  # average duplicates within file
         )
 
-        # Drop all-NaN rows/cols
+        # Drop all-NaN rows/columns
         pivot = pivot.dropna(how="all", axis=0).dropna(how="all", axis=1)
         if pivot.empty:
-            msgs.append(f"[INFO] Pivot for {value_col!r} in {path.name} was empty after cleaning.")
+            msgs.append(f"[INFO] {source_label}: pivot for {value_col!r} is empty after dropna.")
             continue
 
         s = pivot.stack(dropna=True)
@@ -229,17 +309,17 @@ def aggregate_for_value_col(
         return None, msgs
 
     combined = pd.concat(series_list)
-    # Deduplicate (Resource Name, timestamp) pairs: keep last seen value
+
+    # Deduplicate (Resource Name, timestamp) pairs: keep last seen
     combined = combined[~combined.index.duplicated(keep="last")]
 
     matrix = combined.unstack(level=1)
 
-    # Sort by resource then timestamp
+    # Sort
     matrix = matrix.sort_index(axis=0)
     try:
         matrix.columns = sorted(matrix.columns)
     except Exception:
-        # If timestamps can’t be sorted for some reason, leave them as is
         pass
 
     return matrix, msgs
@@ -261,14 +341,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if cfg.log_path:
         log(f"Logging to: {cfg.log_path}", cfg)
 
-    csv_paths = find_input_csvs(cfg)
-    log(f"Discovered {len(csv_paths)} CSV files to process.", cfg)
-
     for value_col in cfg.value_cols:
         log("", cfg)
         log(f"=== Aggregating column: {value_col!r} ===", cfg)
 
-        matrix, msgs = aggregate_for_value_col(csv_paths, value_col, cfg)
+        matrix, msgs = aggregate_for_value_col(value_col, cfg)
         for m in msgs:
             log(m, cfg)
 
@@ -280,6 +357,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         out_path = cfg.save_agg_dir / f"aggregated_{safe_name}.csv"
         matrix.to_csv(out_path, index=True)
         log(f"[OK] Wrote aggregated matrix for {value_col!r} to {out_path}", cfg)
+        log(f"      Shape: {matrix.shape[0]} resources x {matrix.shape[1]} timesteps", cfg)
 
     log("Done.", cfg)
     return 0

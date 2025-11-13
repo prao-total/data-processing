@@ -15,97 +15,113 @@ Features:
 Env keys (examples at bottom of file).
 """
 
-import os
+import csv
 import io
+import os
 import re
+import sys
 import zipfile
-import codecs
-from typing import Dict, Optional, Callable, Any, Tuple, List
+from dataclasses import dataclass
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
-import numpy as np
 
 
 # =========================
-# .env loader (no CLI args)
+# Env helpers
 # =========================
-
-def load_env_file(env_path: str = ".env") -> None:
-    """
-    Load key=value pairs from a .env file into os.environ.
-    Supports inline comments after # and strips surrounding quotes.
-    Uses python-dotenv if available; otherwise simple parser.
-    """
-    # Try python-dotenv if installed
-    try:
-        from dotenv import load_dotenv as _dotenv_load
-        _dotenv_load(env_path, override=False)
-        return
-    except Exception:
-        pass
-
-    # Fallback parser with inline-comment stripping
-    if not os.path.exists(env_path):
-        return
-    try:
-        with open(env_path, "r", encoding="utf-8") as f:
-            for raw in f:
-                line = raw.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, val = line.split("=", 1)
-                key = key.strip()
-                # strip inline comments
-                if "#" in val:
-                    val = val.split("#", 1)[0]
-                val = val.strip().strip('"').strip("'")
-                if key:
-                    os.environ.setdefault(key, val)
-    except Exception:
-        # best effort
-        pass
-
 
 def env_get(key: str, default: Optional[str] = None) -> Optional[str]:
-    return os.environ.get(key, default)
+    v = os.environ.get(key, default)
+    if v is None:
+        return None
+    return str(v).strip() if isinstance(v, str) else str(v)
 
 
 def env_get_bool(key: str, default: bool = False) -> bool:
-    s = os.environ.get(key)
-    if s is None:
+    v = os.environ.get(key, None)
+    if v is None:
         return default
-    return str(s).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+    v = str(v).strip().lower()
+    if v in ("1", "true", "yes", "y", "on"):
+        return True
+    if v in ("0", "false", "no", "n", "off"):
+        return False
+    return default
 
 
-def env_get_int(key: str, default: Optional[int] = None) -> Optional[int]:
-    s = os.environ.get(key)
-    if s is None or str(s).strip() == "":
-        return default
-    try:
-        return int(str(s).strip())
-    except Exception:
-        return default
-
-
-def sanitize_encoding(enc: Optional[str]) -> Optional[str]:
+def load_env_file(path: str) -> None:
     """
-    Returns a valid codec name or None.
-    Treats '', 'auto', 'none', 'null', 'na' as None.
-    Strips inline comments if present (defensive double-sanitize).
-    Validates using codecs.lookup.
+    Load key=value pairs from a .env style file into os.environ (without overriding existing).
     """
-    if enc is None:
-        return None
-    enc = enc.strip().strip('"').strip("'")
-    if "#" in enc:
-        enc = enc.split("#", 1)[0].strip()
-    if enc.lower() in {"", "auto", "none", "null", "na"}:
-        return None
-    try:
-        codecs.lookup(enc)
-        return enc
-    except Exception:
-        return None
+    if not path:
+        return
+    if not os.path.isfile(path):
+        return
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip()
+            if key and key not in os.environ:
+                os.environ[key] = val
+
+
+# =========================
+# CSV loading helpers
+# =========================
+
+@dataclass
+class CsvLoadResult:
+    df: Optional[pd.DataFrame]
+    msg: str
+
+
+def try_read_csv(
+    file_like: io.BytesIO,
+    path_ctx: str,
+    csv_read_kwargs: Optional[dict] = None,
+    verbose: bool = True,
+) -> CsvLoadResult:
+    """
+    Attempt to read CSV using a couple of strategies:
+    - user-provided kwargs (if any),
+    - default utf-8, sep=',',
+    - fallback engine/encoding combos.
+    """
+    csv_read_kwargs = csv_read_kwargs or {}
+    attempts = []
+
+    def log(msg: str):
+        if verbose:
+            print(msg)
+
+    # Strategy 1: user-provided kwargs first
+    attempts.append(("user_kwargs", csv_read_kwargs.copy()))
+
+    # Strategy 2: simple defaults
+    attempts.append(("utf8_comma", {"encoding": "utf-8", "sep": ","}))
+
+    # Strategy 3: latin-1 fallback
+    attempts.append(("latin1_comma", {"encoding": "latin-1", "sep": ","}))
+
+    for label, kwargs in attempts:
+        try:
+            file_like.seek(0)
+            df = pd.read_csv(file_like, **kwargs)
+            return CsvLoadResult(df=df, msg=f"[INFO] Loaded CSV ({label}) from {path_ctx}")
+        except MemoryError as e:
+            log(f"[WARN] Reading CSV: {path_ctx} -> {e}")
+            return CsvLoadResult(df=None, msg=f"[WARN] MemoryError while reading {path_ctx}: {e}")
+        except Exception as e:
+            log(f"[WARN] Reading CSV ({label}): {path_ctx} -> {e}")
+
+    return CsvLoadResult(df=None, msg=f"[ERROR] Failed to read CSV after multiple attempts: {path_ctx}")
 
 
 # =========================
@@ -123,138 +139,94 @@ def find_target_csvs_in_nested_zips(
 ) -> Tuple[Dict[str, pd.DataFrame], int, int]:
     """
     Recursively scan a folder of ZIP files (including ZIPs inside ZIPs), find CSV files whose
-    filename contains `pattern`, and return a dict of DataFrames.
+    filename contains `pattern`, and return a dict of DataFrames keyed by a unique path.
 
-    Returns (results, matched_count, loaded_count).
-    Keys in the returned dict are composite paths:
-        outer.zip::inner.zip::path/in/zip/SCED_Gen_Resource_Data-01-JAN-24.csv
+    Returns:
+        dfs, matched_count, loaded_count
     """
-    results: Dict[str, pd.DataFrame] = {}
+    pattern_cmp = pattern.lower() if ignore_case and pattern else pattern
+    dfs: Dict[str, pd.DataFrame] = {}
     matched = 0
     loaded = 0
 
-    base_kwargs = (csv_read_kwargs or {}).copy()
-    if "sep" not in base_kwargs:
-        base_kwargs["sep"] = None  # autodetect
-    if "engine" not in base_kwargs and base_kwargs.get("sep", None) is None:
-        base_kwargs["engine"] = "python"
-    if "dtype_backend" in base_kwargs and base_kwargs["dtype_backend"] is None:
-        base_kwargs.pop("dtype_backend")
+    def log(msg: str):
+        if verbose:
+            print(msg)
 
-    if "encoding" in base_kwargs:
-        enc = sanitize_encoding(base_kwargs["encoding"])
-        if enc is None:
-            base_kwargs.pop("encoding", None)
-        else:
-            base_kwargs["encoding"] = enc
+    def name_matches(name: str) -> bool:
+        if not pattern_cmp:
+            return True
+        if ignore_case:
+            return pattern_cmp in name.lower()
+        return pattern in name
 
-    def log_error(exc: Exception, context: str):
-        if on_error is not None:
-            try:
-                on_error(exc, context)
-            except Exception:
-                pass
-        elif verbose:
-            print(f"[WARN] {context} -> {exc}")
-
-    def matches(name: str) -> bool:
-        return (pattern.lower() in name.lower() if ignore_case else pattern in name) and name.lower().endswith(".csv")
-
-    def unique_key(proposed_key: str) -> str:
-        if proposed_key not in results:
-            return proposed_key
-        i = 2
-        while f"{proposed_key} ({i})" in results:
-            i += 1
-        return f"{proposed_key} ({i})"
-
-    def read_csv_with_fallbacks(buf: bytes) -> pd.DataFrame:
-        # As-is
-        try:
-            return pd.read_csv(io.BytesIO(buf), **base_kwargs)
-        except (UnicodeDecodeError, LookupError):
-            pass
-        # utf-8, utf-8-sig
-        for enc in ("utf-8", "utf-8-sig"):
-            try:
-                k = {k: v for k, v in base_kwargs.items() if k != "encoding"}
-                return pd.read_csv(io.BytesIO(buf), encoding=enc, **k)
-            except (UnicodeDecodeError, LookupError):
-                continue
-        # latin-1 fallback
-        k = {k: v for k, v in base_kwargs.items() if k != "encoding"}
-        return pd.read_csv(io.BytesIO(buf), encoding="latin-1", **k)
-
-    def process_zipfile_obj(zf: zipfile.ZipFile, composite_prefix: str, depth: int):
+    def walk_zip(zf: zipfile.ZipFile, parent_ctx: str, depth: int):
         nonlocal matched, loaded
         if max_depth is not None and depth > max_depth:
             return
 
         for info in zf.infolist():
-            if hasattr(info, "is_dir") and info.is_dir():
+            name = info.filename
+            ctx = f"{parent_ctx}::{name}"
+            if info.is_dir():
+                continue
+            if name.lower().endswith(".zip"):
+                # Nested zip
+                try:
+                    with zf.open(info) as nested_bytes:
+                        nested_data = nested_bytes.read()
+                    with zipfile.ZipFile(io.BytesIO(nested_data)) as nested_zf:
+                        walk_zip(nested_zf, ctx, depth + 1)
+                except Exception as e:
+                    if on_error:
+                        on_error(e, ctx)
+                    else:
+                        log(f"[WARN] Failed to open nested zip {ctx}: {e}")
+                continue
+            if not name.lower().endswith(".csv"):
+                continue
+            if not name_matches(name):
                 continue
 
-            inner_name = info.filename
-            inner_key = f"{composite_prefix}::{inner_name}"
-
+            matched += 1
             try:
-                with zf.open(info, "r") as fh:
-                    data = fh.read()
-
-                # Nested zip detection
-                is_nested = False
-                if inner_name.lower().endswith(".zip"):
-                    is_nested = True
-                else:
-                    try:
-                        is_nested = zipfile.is_zipfile(io.BytesIO(data))
-                    except Exception:
-                        is_nested = False
-
-                if is_nested:
-                    try:
-                        with zipfile.ZipFile(io.BytesIO(data)) as nested_zf:
-                            process_zipfile_obj(nested_zf, inner_key, depth + 1)
-                    except Exception as nested_exc:
-                        log_error(nested_exc, f"Opening nested zip: {inner_key}")
-                    continue
-
-                # CSV match?
-                base = os.path.basename(inner_name)
-                if matches(base):
-                    matched += 1
-                    try:
-                        df = read_csv_with_fallbacks(data)
-                        # Trim header whitespace
-                        try:
-                            df.rename(columns=lambda c: str(c).strip(), inplace=True)
-                        except Exception:
-                            pass
-                        results[unique_key(inner_key)] = df
-                        loaded += 1
-                    except Exception as read_exc:
-                        log_error(read_exc, f"Reading CSV: {inner_key}")
+                with zf.open(info) as csv_bytes:
+                    data = csv_bytes.read()
+                bio = io.BytesIO(data)
+                res = try_read_csv(bio, ctx, csv_read_kwargs=csv_read_kwargs, verbose=verbose)
+                if res.df is not None:
+                    dfs[ctx] = res.df
+                    loaded += 1
+                    if verbose:
+                        print(res.msg)
             except Exception as e:
-                log_error(e, f"Reading member: {inner_key}")
+                if on_error:
+                    on_error(e, ctx)
+                else:
+                    log(f"[WARN] Failed to load CSV {ctx}: {e}")
 
-    # Top-level scan
+    # Scan top-level zips
     for entry in os.scandir(root_folder):
         if not entry.is_file():
             continue
         if not entry.name.lower().endswith(".zip"):
             continue
-        top_key = entry.name
+        zip_path = entry.path
+        ctx_root = zip_path
         try:
-            with zipfile.ZipFile(entry.path, "r") as zf:
-                process_zipfile_obj(zf, top_key, depth=1)
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                walk_zip(zf, ctx_root, depth=1)
         except Exception as e:
-            log_error(e, f"Opening top-level zip: {entry.path}")
+            if on_error:
+                on_error(e, ctx_root)
+            else:
+                log(f"[WARN] Failed to open zip {ctx_root}: {e}")
 
-    return results, matched, loaded
+    return dfs, matched, loaded
 
 
 def find_target_csvs_in_given_zips(
-    zip_paths: List[str],
+    zip_paths: Iterable[str],
     pattern: str = "SCED_Gen_Resource_Data",
     ignore_case: bool = True,
     csv_read_kwargs: Optional[dict] = None,
@@ -262,160 +234,125 @@ def find_target_csvs_in_given_zips(
     on_error: Optional[Callable[[Exception, str], None]] = None,
     verbose: bool = True,
 ) -> Tuple[Dict[str, pd.DataFrame], int, int]:
-    """Same as above but restricted to a provided list of top-level zip paths."""
-    results: Dict[str, pd.DataFrame] = {}
+    """
+    Variant of find_target_csvs_in_nested_zips that only scans a given list of zip file paths.
+    """
+    pattern_cmp = pattern.lower() if ignore_case and pattern else pattern
+    dfs: Dict[str, pd.DataFrame] = {}
     matched = 0
     loaded = 0
 
-    base_kwargs = (csv_read_kwargs or {}).copy()
-    if "sep" not in base_kwargs:
-        base_kwargs["sep"] = None
-    if "engine" not in base_kwargs and base_kwargs.get("sep", None) is None:
-        base_kwargs["engine"] = "python"
-    if "dtype_backend" in base_kwargs and base_kwargs["dtype_backend"] is None:
-        base_kwargs.pop("dtype_backend")
+    def log(msg: str):
+        if verbose:
+            print(msg)
 
-    if "encoding" in base_kwargs:
-        enc = sanitize_encoding(base_kwargs["encoding"])
-        if enc is None:
-            base_kwargs.pop("encoding", None)
-        else:
-            base_kwargs["encoding"] = enc
+    def name_matches(name: str) -> bool:
+        if not pattern_cmp:
+            return True
+        if ignore_case:
+            return pattern_cmp in name.lower()
+        return pattern in name
 
-    def log_error(exc: Exception, context: str):
-        if on_error is not None:
-            try:
-                on_error(exc, context)
-            except Exception:
-                pass
-        elif verbose:
-            print(f"[WARN] {context} -> {exc}")
-
-    def matches(name: str) -> bool:
-        return (pattern.lower() in name.lower() if ignore_case else pattern in name) and name.lower().endswith(".csv")
-
-    def unique_key(proposed_key: str) -> str:
-        if proposed_key not in results:
-            return proposed_key
-        i = 2
-        while f"{proposed_key} ({i})" in results:
-            i += 1
-        return f"{proposed_key} ({i})"
-
-    def read_csv_with_fallbacks(buf: bytes) -> pd.DataFrame:
-        try:
-            return pd.read_csv(io.BytesIO(buf), **base_kwargs)
-        except (UnicodeDecodeError, LookupError):
-            pass
-        for enc in ("utf-8", "utf-8-sig"):
-            try:
-                k = {k: v for k, v in base_kwargs.items() if k != "encoding"}
-                return pd.read_csv(io.BytesIO(buf), encoding=enc, **k)
-            except (UnicodeDecodeError, LookupError):
-                continue
-        k = {k: v for k, v in base_kwargs.items() if k != "encoding"}
-        return pd.read_csv(io.BytesIO(buf), encoding="latin-1", **k)
-
-    def process_zipfile_obj(zf: zipfile.ZipFile, composite_prefix: str, depth: int):
+    def walk_zip(zf: zipfile.ZipFile, parent_ctx: str, depth: int):
         nonlocal matched, loaded
         if max_depth is not None and depth > max_depth:
             return
 
         for info in zf.infolist():
-            if hasattr(info, "is_dir") and info.is_dir():
+            name = info.filename
+            ctx = f"{parent_ctx}::{name}"
+            if info.is_dir():
                 continue
-            inner_name = info.filename
-            inner_key = f"{composite_prefix}::{inner_name}"
+            if name.lower().endswith(".zip"):
+                try:
+                    with zf.open(info) as nested_bytes:
+                        nested_data = nested_bytes.read()
+                    with zipfile.ZipFile(io.BytesIO(nested_data)) as nested_zf:
+                        walk_zip(nested_zf, ctx, depth + 1)
+                except Exception as e:
+                    if on_error:
+                        on_error(e, ctx)
+                    else:
+                        log(f"[WARN] Failed to open nested zip {ctx}: {e}")
+                continue
+            if not name.lower().endswith(".csv"):
+                continue
+            if not name_matches(name):
+                continue
 
+            matched += 1
             try:
-                with zf.open(info, "r") as fh:
-                    data = fh.read()
-
-                is_nested = False
-                if inner_name.lower().endswith(".zip"):
-                    is_nested = True
-                else:
-                    try:
-                        is_nested = zipfile.is_zipfile(io.BytesIO(data))
-                    except Exception:
-                        is_nested = False
-
-                if is_nested:
-                    try:
-                        with zipfile.ZipFile(io.BytesIO(data)) as nested_zf:
-                            process_zipfile_obj(nested_zf, inner_key, depth + 1)
-                    except Exception as nested_exc:
-                        log_error(nested_exc, f"Opening nested zip: {inner_key}")
-                    continue
-
-                base = os.path.basename(inner_name)
-                if matches(base):
-                    matched += 1
-                    try:
-                        df = read_csv_with_fallbacks(data)
-                        try:
-                            df.rename(columns=lambda c: str(c).strip(), inplace=True)
-                        except Exception:
-                            pass
-                        results[unique_key(inner_key)] = df
-                        loaded += 1
-                    except Exception as read_exc:
-                        log_error(read_exc, f"Reading CSV: {inner_key}")
+                with zf.open(info) as csv_bytes:
+                    data = csv_bytes.read()
+                bio = io.BytesIO(data)
+                res = try_read_csv(bio, ctx, csv_read_kwargs=csv_read_kwargs, verbose=verbose)
+                if res.df is not None:
+                    dfs[ctx] = res.df
+                    loaded += 1
+                    if verbose:
+                        print(res.msg)
             except Exception as e:
-                log_error(e, f"Reading member: {inner_key}")
+                if on_error:
+                    on_error(e, ctx)
+                else:
+                    log(f"[WARN] Failed to load CSV {ctx}: {e}")
 
-    for zp in zip_paths:
-        if not os.path.isfile(zp) or not zp.lower().endswith(".zip"):
-            continue
-        top_key = os.path.basename(zp)
+    for zip_path in zip_paths:
+        ctx_root = zip_path
         try:
-            with zipfile.ZipFile(zp, "r") as zf:
-                process_zipfile_obj(zf, top_key, depth=1)
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                walk_zip(zf, ctx_root, depth=1)
         except Exception as e:
-            log_error(e, f"Opening top-level zip: {zp}")
+            if on_error:
+                on_error(e, ctx_root)
+            else:
+                log(f"[WARN] Failed to open zip {ctx_root}: {e}")
 
-    return results, matched, loaded
+    return dfs, matched, loaded
 
 
 # =========================
-# Aggregator
+# Aggregation logic
 # =========================
 
 def aggregate_base_point_matrix(
     dfs: Dict[str, pd.DataFrame],
     resource_col: str = "Resource Name",
-    timestamp_col: str = "SCED Time Stamp",   # <- explicitly use this
+    timestamp_col: str = "SCED Time Stamp",
     value_col: str = "Base Point",
     case_insensitive_cols: bool = True,
     trim_resource: bool = True,
     coerce_value_numeric: bool = True,
     timestamp_format: Optional[str] = "%m/%d/%Y %H:%M",
-    on_conflict: str = "skip",               # "skip" or "overwrite"
+    on_conflict: str = "skip",
     max_messages: Optional[int] = 5000,
     verbose: bool = True,
 ) -> Tuple[pd.DataFrame, List[str]]:
     """
-    Memory-friendly aggregator for ERCOT SCED CSVs in *long* format.
+    Combine CSV DataFrames into a wide matrix:
+        index   = resource_col (e.g., Resource Name)
+        columns = timestamp_col (e.g., SCED Time Stamp, parsed as datetime)
+        values  = value_col (e.g., Base Point)
 
-    Assumes each DataFrame has at least:
-        - resource_col (default: "Resource Name")
-        - timestamp_col (default: "SCED Time Stamp")
-        - value_col (e.g., "Base Point", "Telemetered Net Output", "SCED2 Curve-MW1", etc.)
+    The main logic:
+        1) Normalize column names (case-insensitive if requested).
+        2) Extract (resource, timestamp, value) tuples into a dict.
+        3) Build a tidy DataFrame from these tuples.
+        4) Pivot to wide (resource x timestamp).
+        5) Attach a passthrough Resource Type column if present.
 
-    It:
-      * Parses timestamps from `timestamp_col`
-      * Pivots to wide: index = Resource Name, columns = SCED Time Stamp
-      * Merges each file's pivot into a single wide matrix
-      * Adds a single "Resource Type" column (first non-empty value per resource wins)
+    Note: On large batches, this can be memory heavy if called with many dfs at once.
+    In streaming mode we typically call it on *small groups* or single CSVs.
     """
-    msgs: List[str] = []
+    messages: List[str] = []
 
     def log(msg: str):
-        if verbose and (max_messages is None or len(msgs) < max_messages):
-            msgs.append(msg)
+        if verbose and (max_messages is None or len(messages) < max_messages):
+            messages.append(msg)
+            if verbose:
+                print(msg)
 
     def resolve_col(df: pd.DataFrame, col_name: str) -> Optional[str]:
-        """Find column by name, optionally case-insensitive."""
         cols = list(df.columns)
         if case_insensitive_cols:
             lower_map = {str(c).lower().strip(): c for c in cols}
@@ -423,23 +360,21 @@ def aggregate_base_point_matrix(
         return col_name if col_name in cols else None
 
     def parse_ts(series: pd.Series) -> pd.Series:
-        """Parse timestamp column into pandas datetime."""
         if timestamp_format:
             try:
                 return pd.to_datetime(series, format=timestamp_format, errors="coerce")
             except Exception:
-                # fall back to generic parsing
                 pass
         return pd.to_datetime(series, errors="coerce")
 
-    combined: Optional[pd.DataFrame] = None
-
-    # Track first non-empty resource type per resource across all files
-    rtype_first: Dict[str, Any] = {}
-    rtype_env = os.environ.get("RESOURCE_TYPE_COL", "Resource Type")
+    # Global dict of (resource, timestamp) -> value, with conflict resolution
+    cells: Dict[Tuple[str, pd.Timestamp], float] = {}
+    source_of: Dict[Tuple[str, pd.Timestamp], str] = {}
+    # capture a single resource type per resource name
+    rtype_map: Dict[str, Any] = {}
 
     for src_name, df in dfs.items():
-        # Normalize headers
+        # Ensure header whitespace is trimmed
         try:
             df = df.rename(columns=lambda c: str(c).strip())
         except Exception:
@@ -448,38 +383,41 @@ def aggregate_base_point_matrix(
         rc = resolve_col(df, resource_col) or resource_col
         tc = resolve_col(df, timestamp_col) or timestamp_col
         vc = resolve_col(df, value_col) or value_col
-        rtype_col = resolve_col(df, rtype_env)
 
-        # Ensure required columns exist
         missing = [c for c in (rc, tc, vc) if c not in df.columns]
         if missing:
-            log(f"[WARN] {src_name}: missing required columns {missing}; skipping file.")
+            log(f"[WARN] {src_name}: missing required columns (found: {list(df.columns)[:12]}...); skipping.")
             continue
 
-        # Select minimal relevant columns
+        # Optional resource type column
+        rtype_env = env_get("RESOURCE_TYPE_COL", "Resource Type")
+        rtype_col = resolve_col(df, rtype_env)
+
         cols_sel = [rc, tc, vc] + ([rtype_col] if rtype_col else [])
         work = df[cols_sel].copy()
 
-        # Normalize resource names
+        # Clean resource names
         if trim_resource:
             try:
                 work[rc] = work[rc].astype(str).str.strip()
             except Exception:
                 pass
 
-        # Parse timestamps & numeric values
+        # Parse timestamps
         work[tc] = parse_ts(work[tc])
+
+        # Coerce numeric
         if coerce_value_numeric:
             work[vc] = pd.to_numeric(work[vc], errors="coerce")
 
-        # Drop rows missing essentials
         before = len(work)
+        # Drop rows without resource/timestamp/value
         work = work.dropna(subset=[rc, tc, vc])
         dropped = before - len(work)
         if dropped > 0:
             log(f"[INFO] {src_name}: dropped {dropped} row(s) with null {rc}/{tc}/{vc}.")
 
-        # Update resource-type map (first non-empty per resource)
+        # Track resource type (first non-null wins)
         if rtype_col and rtype_col in work.columns:
             r_g = (
                 work[[rc, rtype_col]]
@@ -487,72 +425,57 @@ def aggregate_base_point_matrix(
                 .drop_duplicates(subset=[rc], keep="first")
             )
             for rname, rtype_val in zip(r_g[rc].tolist(), r_g[rtype_col].tolist()):
-                if rname not in rtype_first or (
-                    rtype_first[rname] in ("", None) and pd.notna(rtype_val)
-                ):
+                if rname not in rtype_map or (rtype_map[rname] in (None, "") and pd.notna(rtype_val)):
                     if pd.notna(rtype_val) and str(rtype_val).strip() != "":
-                        rtype_first[rname] = rtype_val
+                        rtype_map[rname] = rtype_val
 
-        if work.empty:
-            log(f"[INFO] {src_name}: no usable rows after cleaning; skipping file.")
-            continue
+        # Accumulate into cells
+        for row in work.itertuples(index=False):
+            rname = getattr(row, rc)
+            tstamp = getattr(row, tc)
+            val = getattr(row, vc)
+            if pd.isna(tstamp) or pd.isna(val):
+                continue
+            key = (rname, tstamp)
+            if key in cells:
+                # Resolve conflict based on policy
+                if on_conflict == "overwrite":
+                    cells[key] = val
+                    source_of[key] = src_name
+            else:
+                cells[key] = val
+                source_of[key] = src_name
 
-        # Pivot this file to wide (Resource Name × SCED Time Stamp)
-        try:
-            small = work.pivot_table(
-                index=rc,
-                columns=tc,
-                values=vc,
-                aggfunc="first",
-            )
-        except MemoryError as e:
-            log(f"[WARN] {src_name}: pivot MemoryError ({e}); skipping this file.")
-            continue
-        except Exception as e:
-            log(f"[WARN] {src_name}: pivot failed ({e}); skipping this file.")
-            continue
+    if not cells:
+        # No data aggregated
+        return pd.DataFrame(), messages
 
-        # Merge this file's matrix into the combined matrix
-        if combined is None:
-            combined = small
-        else:
-            # Union of resources and timestamps
-            new_index = combined.index.union(small.index)
-            new_cols = combined.columns.union(small.columns)
+    # Build tidy DataFrame from cells
+    tidy_rows = []
+    for (rname, tstamp), val in cells.items():
+        tidy_rows.append((rname, tstamp, val))
+    tidy = pd.DataFrame(tidy_rows, columns=[resource_col, timestamp_col, value_col])
 
-            combined = combined.reindex(index=new_index, columns=new_cols)
-            small = small.reindex(index=new_index, columns=new_cols)
+    # Pivot to wide
+    agg_df = tidy.pivot(index=resource_col, columns=timestamp_col, values=value_col)
 
-            if on_conflict == "overwrite":
-                # new values overwrite existing where not null
-                mask = small.notna()
-                combined = combined.where(~mask, small)
-            else:  # "skip": keep existing, fill only where currently NaN
-                mask = combined.isna() & small.notna()
-                combined = combined.where(~mask, small)
+    # Attach Resource Type column after index (as first data column)
+    if rtype_map:
+        rt_series = pd.Series(rtype_map, name=env_get("RESOURCE_TYPE_COL", "Resource Type"))
+        rt_aligned = rt_series.reindex(agg_df.index)
+        agg_df.insert(0, rt_series.name, rt_aligned)
 
-        del small  # free per-file pivot
+    # Sort for readability
+    try:
+        agg_df = agg_df.sort_index(axis=0)
+    except Exception:
+        pass
+    try:
+        agg_df = agg_df.sort_index(axis=1)
+    except Exception:
+        pass
 
-    # If we never got any data:
-    if combined is None:
-        return pd.DataFrame(), msgs
-
-    # Attach Resource Type as first column (if we saw any)
-    if rtype_first:
-        rt_series = pd.Series(rtype_first, name="Resource Type")
-        rt_series = rt_series.reindex(combined.index)
-        if "Resource Type" in combined.columns:
-            combined = combined.drop(columns=["Resource Type"])
-        combined.insert(0, "Resource Type", rt_series)
-
-    # Order columns: non-datetime first (e.g., Resource Type), then sorted timestamps
-    date_cols = [c for c in combined.columns if isinstance(c, pd.Timestamp)]
-    non_date = [c for c in combined.columns if not isinstance(c, pd.Timestamp)]
-    if date_cols:
-        combined = combined[non_date + sorted(date_cols)]
-
-    return combined, msgs
-
+    return agg_df, messages
 
 
 # =========================
@@ -563,11 +486,6 @@ def ensure_parent_dir(path: str) -> None:
     parent = os.path.dirname(os.path.abspath(path))
     if parent and not os.path.exists(parent):
         os.makedirs(parent, exist_ok=True)
-
-
-def safe_name(s: str) -> str:
-    out = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(s))
-    return re.sub(r"_+", "_", out).strip("_")
 
 
 def main():
@@ -586,32 +504,16 @@ def main():
     if not save_agg_path and not save_agg_dir:
         raise ValueError("Provide SAVE_AGG_PATH (single output) or SAVE_AGG_DIR (multiple outputs) in .env.")
     if save_agg_path and not save_agg_path.lower().endswith(".csv"):
-        save_agg_path = save_agg_path + ".csv"
+        raise ValueError("SAVE_AGG_PATH must end with .csv")
 
-    # Common env options
-    pattern = env_get("FILENAME_PATTERN", "SCED_Gen_Resource_Data")
+    # Config
+    pattern = env_get("CSV_PATTERN", "SCED_Gen_Resource_Data")
     ignore_case = env_get_bool("IGNORE_CASE", True)
-    verbose = env_get_bool("VERBOSE", True)
-    max_depth = env_get_int("MAX_NESTED_DEPTH", None)
-
-    # CSV reading
-    csv_engine = env_get("CSV_ENGINE", "python")
-    csv_sep = env_get("CSV_SEP", "auto")
-    raw_encoding = env_get("CSV_ENCODING", None)
-    csv_encoding = sanitize_encoding(raw_encoding)
-    csv_kwargs: Dict[str, Any] = {"engine": csv_engine}
-    if csv_sep and csv_sep.lower() != "auto":
-        csv_kwargs["sep"] = "\t" if str(csv_sep).strip().lower() in {"\\t", "tab", "tsv"} else csv_sep
-    else:
-        csv_kwargs["sep"] = None  # autodetect
-    if csv_encoding:
-        csv_kwargs["encoding"] = csv_encoding
-
-    # Aggregation/env options
     on_conflict = env_get("ON_CONFLICT", "skip").lower()
-    if on_conflict not in {"skip", "overwrite"}:
-        on_conflict = "skip"
-
+    if on_conflict not in ("skip", "overwrite"):
+        raise ValueError("ON_CONFLICT must be 'skip' or 'overwrite'")
+    max_depth_raw = env_get("MAX_DEPTH", None)
+    max_depth = int(max_depth_raw) if max_depth_raw not in (None, "", "None") else None
     case_insensitive_cols = env_get_bool("CASE_INSENSITIVE_COLS", True)
     trim_resource = env_get_bool("TRIM_RESOURCE", True)
     coerce_value_numeric = env_get_bool("COERCE_VALUE_NUMERIC", True)
@@ -619,17 +521,41 @@ def main():
     output_ts_fmt = env_get("OUTPUT_TIMESTAMP_FORMAT", "%Y-%m-%d %H:%M")
 
     # Value columns
-    value_cols_raw = env_get("VALUE_COLS", "").strip() if env_get("VALUE_COLS") is not None else ""
+    value_cols_raw = env_get("VALUE_COLS", "").strip()
+    value_col_single = env_get("VALUE_COL", "").strip()
     if value_cols_raw:
-        value_cols = [c.strip() for c in value_cols_raw.split(",") if c.strip()]
+        value_cols = [v.strip() for v in value_cols_raw.split(",") if v.strip()]
+    elif value_col_single:
+        value_cols = [value_col_single]
     else:
-        value_cols = [env_get("VALUE_COL", "Base Point")]
+        # Default
+        value_cols = ["Base Point"]
+
+    verbose = env_get_bool("VERBOSE", True)
 
     # Batching
     batch_size = int(env_get("BATCH_SIZE", "0") or "0")
     zip_sort = env_get("ZIP_SORT", "name").lower()  # name | mtime
 
-    # Merge helper
+
+    # Decide output path(s) for each value column (streaming mode)
+    if len(value_cols) == 1 and save_agg_path:
+        # Legacy single-output: one CSV for the single metric
+        out_paths: Dict[str, str] = {value_cols[0]: save_agg_path}
+    else:
+        if not save_agg_dir:
+            raise ValueError(
+                "Multiple value columns detected. Please set SAVE_AGG_DIR for per-column outputs."
+            )
+        os.makedirs(save_agg_dir, exist_ok=True)
+        base = save_agg_basename or "aggregation"
+        out_paths = {}
+        for vc in value_cols:
+            safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(vc))
+            safe = re.sub(r"_+", "_", safe).strip("_")
+            out_paths[vc] = os.path.join(save_agg_dir, f"{base}_{safe}.csv")
+
+    # Merge helper (kept for compatibility; not used in streaming mode)
     def merge_wide(existing: Optional[pd.DataFrame], incoming: pd.DataFrame) -> pd.DataFrame:
         if existing is None or len(existing) == 0:
             return incoming.copy()
@@ -654,33 +580,43 @@ def main():
     else:
         all_zips.sort(key=lambda p: os.path.basename(p).lower())
 
-    # Prepare per-column aggregation structures
+    # We no longer keep big agg_by_col matrices in memory – everything streams to disk.
     agg_by_col: Dict[str, Optional[pd.DataFrame]] = {vc: None for vc in value_cols}
     msgs_by_col: Dict[str, List[str]] = {vc: [] for vc in value_cols}
     total_matched = 0
     total_loaded = 0
 
     def process_dfs_and_merge(dfs: Dict[str, pd.DataFrame]):
+        """Process each CSV immediately and stream results to disk.
+
+        For each DataFrame in `dfs` and for each value column:
+          - Aggregate into a wide matrix for that single file
+          - Merge into the on-disk CSV for that metric
+        """
         nonlocal total_matched, total_loaded
         if not dfs:
             return
-        for vc in value_cols:
-            batch_agg, batch_msgs = aggregate_base_point_matrix(
-                dfs,
-                resource_col=env_get("RESOURCE_COL", "Resource Name"),
-                timestamp_col=env_get("TIMESTAMP_COL", "SCED Time Stamp"),
-                value_col=vc,
-                case_insensitive_cols=case_insensitive_cols,
-                trim_resource=trim_resource,
-                coerce_value_numeric=coerce_value_numeric,
-                timestamp_format=timestamp_format,
-                on_conflict=on_conflict,
-                max_messages=int(env_get("MAX_MESSAGES", "5000")),
-                verbose=verbose,
-            )
-            agg_by_col[vc] = merge_wide(agg_by_col[vc], batch_agg)
-            msgs_by_col[vc].extend(batch_msgs)
 
+        for src_name, df in dfs.items():
+            # Note: matched/loaded counters are already maintained by the
+            # zip-scanning helpers; we don't adjust them here.
+            single = {src_name: df}
+            for vc in value_cols:
+                batch_agg, batch_msgs = aggregate_base_point_matrix(
+                    single,
+                    resource_col=env_get("RESOURCE_COL", "Resource Name"),
+                    timestamp_col=env_get("TIMESTAMP_COL", "SCED Time Stamp"),
+                    value_col=vc,
+                    case_insensitive_cols=case_insensitive_cols,
+                    trim_resource=trim_resource,
+                    coerce_value_numeric=coerce_value_numeric,
+                    timestamp_format=timestamp_format,
+                    on_conflict=on_conflict,
+                    max_messages=int(env_get("MAX_MESSAGES", "5000")),
+                    verbose=verbose,
+                )
+                msgs_by_col[vc].extend(batch_msgs)
+                merge_and_save_incremental(vc, batch_agg)
     if not batch_size:
         # Single-shot path
         def log_error(exc: Exception, ctx: str):
@@ -690,7 +626,7 @@ def main():
             root_folder=root_folder,
             pattern=pattern,
             ignore_case=ignore_case,
-            csv_read_kwargs=csv_kwargs,
+            csv_read_kwargs={"engine": "c"},
             max_depth=max_depth,
             on_error=log_error,
             verbose=verbose,
@@ -705,10 +641,10 @@ def main():
             if verbose:
                 print(f"[INFO] Processing batch {i//batch_size + 1} with {len(batch_paths)} zip(s)")
             dfs, matched, loaded = find_target_csvs_in_given_zips(
-                batch_paths,
+                zip_paths=batch_paths,
                 pattern=pattern,
                 ignore_case=ignore_case,
-                csv_read_kwargs=csv_kwargs,
+                csv_read_kwargs={"engine": "c"},
                 max_depth=max_depth,
                 on_error=None,
                 verbose=verbose,
@@ -717,48 +653,73 @@ def main():
             total_loaded += loaded
             process_dfs_and_merge(dfs)
 
-    # Saving
     def finalize_cols_for_csv(df: pd.DataFrame) -> pd.DataFrame:
-        # Keep passthrough Resource Type as the first data column if present
-        if df is not None and "Resource Type" in df.columns:
+        """
+        Final cleanup for writing CSV:
+        - Keep "Resource Type" as the first column if present.
+        - Convert any Timestamp column labels using OUTPUT_TIMESTAMP_FORMAT.
+        """
+        if df is None or df.empty:
+            return df
+
+        if "Resource Type" in df.columns:
             cols = ["Resource Type"] + [c for c in df.columns if c != "Resource Type"]
             df = df[cols]
-        # Format datetime headers
-        cols = df.columns
-        if isinstance(cols, pd.DatetimeIndex):
-            try:
-                df.columns = cols.strftime(output_ts_fmt)
-            except Exception:
-                df.columns = cols.strftime("%Y-%m-%d %H:%M:%S")
+
+        # Convert datetime-like column labels to strings (even if not a DatetimeIndex)
+        new_cols = []
+        for c in df.columns:
+            if isinstance(c, pd.Timestamp):
+                try:
+                    new_cols.append(c.strftime(output_ts_fmt))
+                except Exception:
+                    new_cols.append(c.strftime("%Y-%m-%d %H:%M:%S"))
+            else:
+                new_cols.append(c)
+        df.columns = new_cols
         return df
 
-    if len(value_cols) == 1 and save_agg_path:
-        vc = value_cols[0]
-        ensure_parent_dir(save_agg_path)
-        df_out = finalize_cols_for_csv(agg_by_col[vc])
-        try:
-            df_out.to_csv(save_agg_path, index=True)
-            if verbose:
-                print(f"[INFO] Saved aggregated matrix to '{save_agg_path}'")
-        except Exception as e:
-            raise RuntimeError(f"Failed to save CSV to '{save_agg_path}': {e}")
-    else:
-        if not save_agg_dir:
-            raise ValueError("Multiple value columns detected. Please set SAVE_AGG_DIR for per-column outputs.")
-        os.makedirs(save_agg_dir, exist_ok=True)
-        base = save_agg_basename or "aggregation"
-        for vc in value_cols:
-            safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(vc))
-            safe = re.sub(r"_+", "_", safe).strip("_")
-            out_path = os.path.join(save_agg_dir, f"{base}_{safe}.csv")
-            ensure_parent_dir(out_path)
-            df_out = finalize_cols_for_csv(agg_by_col[vc])
-            try:
-                df_out.to_csv(out_path, index=True)
-                if verbose:
-                    print(f"[INFO] Saved aggregated matrix for '{vc}' to '{out_path}'")
-            except Exception as e:
-                raise RuntimeError(f"Failed to save CSV to '{out_path}': {e}")
+    def merge_and_save_incremental(vc: str, batch_agg: pd.DataFrame) -> None:
+        """
+        Merge a per-file wide matrix for value column `vc` into the on-disk
+        aggregated CSV.
+
+        - If no data in this batch: no-op.
+        - If output doesn't exist yet: write fresh file.
+        - If it exists: union index/columns and respect ON_CONFLICT policy.
+        """
+        if batch_agg is None or batch_agg.empty:
+            return
+
+        out_path = out_paths[vc]
+        ensure_parent_dir(out_path)
+
+        df_new = finalize_cols_for_csv(batch_agg)
+
+        if os.path.exists(out_path):
+            df_old = pd.read_csv(out_path, index_col=0)
+
+            # Align index & columns
+            all_index = df_old.index.union(df_new.index)
+            all_cols = df_old.columns.union(df_new.columns)
+
+            df_old = df_old.reindex(index=all_index, columns=all_cols)
+            df_new = df_new.reindex(index=all_index, columns=all_cols)
+
+            if on_conflict == "overwrite":
+                mask = df_new.notna()
+                df_old[mask] = df_new[mask]
+            else:  # "skip"
+                mask = df_old.isna() & df_new.notna()
+                df_old[mask] = df_new[mask]
+
+            df_out = df_old
+        else:
+            df_out = df_new
+
+        df_out.to_csv(out_path, index=True)
+        if verbose:
+            print(f"[INFO] Incrementally updated '{vc}' -> '{out_path}'")
 
     # Optional aggregation log (combined)
     agg_log_path = env_get("AGG_LOG_PATH", None)

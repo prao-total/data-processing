@@ -270,7 +270,7 @@ def process_sced_violins_day(day_dir: Path, plots_root: Path, save_values_csv: b
     for step_csv in step_files:
         plot_violin_step(day, step_csv, day_out, save_values_csv)
 
-def process_sced_price_lines_day(day_dir: Path, plots_root: Path, save_values_csv: bool, per_fuel: bool = True,) -> None:
+def process_sced_price_lines_day(day_dir: Path, plots_root: Path, save_values_csv: bool, per_fuel: bool = True,) -> Optional[Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]]:
     """
     Build SCED price line plots across steps, by fuel.
       - For each price step CSV, flatten all resource×time prices per fuel and compute Q1, median, Q3.
@@ -1011,6 +1011,8 @@ def plot_price_vs_mw_by_fuel(
     price_summary: pd.DataFrame,
     out_dir: Path,
     fuels: Optional[Iterable[str]] = None,
+    hsl_scaled: Optional[pd.Series] = None,
+    bp_scaled: Optional[pd.Series] = None,
 ) -> None:
     """
     Plot price (y-axis) vs aggregate MW (x-axis) for each fuel, using
@@ -1021,6 +1023,9 @@ def plot_price_vs_mw_by_fuel(
 
     Both should have index = SCED Step (or a 'SCED Step' column that can
     be set as the index) and fuel columns matching.
+
+    If hsl_scaled / bp_scaled are provided (Series indexed by fuel),
+    vertical lines will be drawn at those MW values.
     """
     import numpy as np
     import pandas as pd
@@ -1063,17 +1068,41 @@ def plot_price_vs_mw_by_fuel(
         steps_used = step_vals[mask]
 
         fig, ax = plt.subplots(figsize=(10, 6))
-        ax.plot(x, y, marker="o", linewidth=2)
+        ax.plot(x, y, marker="o", linewidth=2, label="SCED steps")
 
         # annotate with SCED step number so you know which kink is which
         for xx, yy, s in zip(x, y, steps_used):
             ax.annotate(str(int(s)), xy=(xx, yy),
                         textcoords="offset points", xytext=(4, 4), fontsize=8)
 
+        # Optional vertical lines for HSL / Base Point if provided
+        # (they are MW quantities, so they live on the x-axis)
+        if hsl_scaled is not None:
+            x_hsl = hsl_scaled.get(f, np.nan)
+            if np.isfinite(x_hsl):
+                ax.axvline(
+                    float(x_hsl),
+                    linestyle="--",
+                    linewidth=1.75,
+                    color="#1f77b4",
+                    label="HSL (rescaled)",
+                )
+        if bp_scaled is not None:
+            x_bp = bp_scaled.get(f, np.nan)
+            if np.isfinite(x_bp):
+                ax.axvline(
+                    float(x_bp),
+                    linestyle="--",
+                    linewidth=1.75,
+                    color="#d62728",
+                    label="Base Point (rescaled)",
+                )
+
         ax.set_title(f"{day} – Price vs MW (Fuel: {f})")
         ax.set_xlabel("Aggregate MW bid (MW)")
         ax.set_ylabel("Price (median)")
         ax.grid(True, alpha=0.3)
+        ax.legend()
 
         fig.tight_layout()
         out_png = out_dir / f"{f}_price_vs_mw.png"
@@ -1112,13 +1141,14 @@ def main():
         med_wide, q1_wide, q3_wide = price_result
         summary_scaled, summary_low, summary_high, hsl_scaled, bp_scaled = norm_result
 
-        # 5) Price (y-axis) vs MW (x-axis) per fuel
-        #    Uses MW from summary_scaled and Price from med_wide
+        # 5) Price vs MW per fuel, with HSL & Base Point verticals
         plot_price_vs_mw_by_fuel(
             day=day_dir.name,
             mw_summary=summary_scaled,
             price_summary=med_wide,
             out_dir=out / day_dir.name,
+            hsl_scaled=hsl_scaled,
+            bp_scaled=bp_scaled,
         )
 
 

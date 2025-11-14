@@ -180,16 +180,21 @@ def _iter_dataframes_from_zip(
                 # Just log / skip bad nested zips
                 # We don't have cfg here, so caller should handle logging
                 continue
-
-        # CSV that matches our needle
         elif lower.endswith(".csv") and _filename_matches(name, needle):
             try:
                 with zf.open(info) as csv_fp:
                     df = pd.read_csv(csv_fp)
+
+                df.rename(columns=lambda c: str(c).strip(), inplace=True)
+
+                # OPTIONAL: debug print of columns
+                # print(f"[DEBUG] Columns in nested CSV {label_prefix}: {list(df.columns)}")
+
                 yield label_prefix, df
             except Exception:
                 # Caller logs; skip bad CSVs
                 continue
+
 
 
 def iter_input_dataframes(cfg: Config) -> Iterator[Tuple[str, pd.DataFrame]]:
@@ -216,10 +221,18 @@ def iter_input_dataframes(cfg: Config) -> Iterator[Tuple[str, pd.DataFrame]]:
         if lower.endswith(".csv") and _filename_matches(path.name, needle):
             try:
                 df = pd.read_csv(path)
+
+                # NEW: trim whitespace from all column names
+                df.rename(columns=lambda c: str(c).strip(), inplace=True)
+
+                # OPTIONAL: debug print of columns
+                # print(f"[DEBUG] Columns in CSV {path}: {list(df.columns)}")
+
             except Exception:
                 # Caller logs; skip bad file
                 continue
             yield str(path), df
+
 
         # ZIPs (possibly with nested zips)
         elif lower.endswith(".zip"):
@@ -261,10 +274,14 @@ def aggregate_for_value_col(
     series_list: List[pd.Series] = []
 
     for source_label, df in iter_input_dataframes(cfg):
+        # NEW: ensure trimmed column names here as well
+        df.rename(columns=lambda c: str(c).strip(), inplace=True)
+
         # Basic sanity checks
         if "Resource Name" not in df.columns:
             msgs.append(f"[WARN] {source_label}: missing 'Resource Name' column; skipping.")
             continue
+
 
         ts_col = detect_timestamp_column(df, cfg.timestamp_col)
         if ts_col is None:

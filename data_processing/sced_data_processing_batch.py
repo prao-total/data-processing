@@ -353,14 +353,39 @@ def main(argv: Sequence[str] | None = None) -> int:
             log(f"[WARN] Skipping write for {value_col!r} because the aggregated matrix is empty.", cfg)
             continue
 
+        # ------------------------------------------------------------------
+        # NEW: Attach Resource Type column
+        # ------------------------------------------------------------------
+        if "Resource Name" in matrix.index.names:
+            type_series_list = []
+
+            for source_label, df in iter_input_dataframes(cfg):
+                if "Resource Name" in df.columns and "Resource Type" in df.columns:
+                    tmp = df.drop_duplicates("Resource Name")[["Resource Name", "Resource Type"]]
+                    tmp = tmp.set_index("Resource Name")["Resource Type"]
+                    type_series_list.append(tmp)
+
+            if type_series_list:
+                combined_types = pd.concat(type_series_list)
+                combined_types = combined_types[~combined_types.index.duplicated(keep="last")]
+
+                # Align to matrix index (matching resource names)
+                rt = combined_types.reindex(matrix.index)
+
+                # Insert Resource Type as first column
+                matrix.insert(0, "Resource Type", rt)
+
+        # ------------------------------------------------------------------
+
         safe_name = safe_value_col_name(value_col)
         out_path = cfg.save_agg_dir / f"aggregated_{safe_name}.csv"
         matrix.to_csv(out_path, index=True)
         log(f"[OK] Wrote aggregated matrix for {value_col!r} to {out_path}", cfg)
-        log(f"      Shape: {matrix.shape[0]} resources x {matrix.shape[1]} timesteps", cfg)
+        log(f"      Shape: {matrix.shape[0]} resources x {matrix.shape[1]} columns", cfg)
 
     log("Done.", cfg)
     return 0
+
 
 
 if __name__ == "__main__":

@@ -342,6 +342,69 @@ def process_base_point_telemetered_output(day_dir: Path, plots_root: Path) -> No
     except Exception as e:
         print(f"[WARN] {day}: failed to write telemetered error CSV: {e}")
 
+
+def process_average_bid_quantity(day_dir: Path, plots_root: Path) -> None:
+    """
+    Build a box/whisker plot of all SCED price values across steps, grouped by fuel.
+    Uses any aggregation_SCED1_Curve_Price*.csv (underscore variant) in the day folder.
+    Saves both the plot and the flattened values by fuel.
+    """
+    day = day_dir.name
+    price_files = list(day_dir.glob("aggregation_SCED1_Curve_Price*.csv"))
+    if not price_files:
+        price_files = list(day_dir.glob("*SCED*Curve*Price*.csv"))
+    if not price_files:
+        print(f"[INFO] {day}: no SCED price files found for average bid quantity plot.")
+        return
+
+    prices_by_fuel: Dict[str, List[float]] = {}
+
+    for p in sorted(price_files):
+        try:
+            df = pd.read_csv(p, dtype=str)
+        except Exception as e:
+            print(f"[WARN] {day}: failed to read {p.name}: {e}")
+            continue
+        try:
+            data_by_fuel = load_violin_data_by_fuel(df)
+        except Exception as e:
+            print(f"[WARN] {day}: failed processing {p.name}: {e}")
+            continue
+        for fuel, arr in data_by_fuel.items():
+            if arr is None or arr.size == 0:
+                continue
+            prices_by_fuel.setdefault(str(fuel), []).extend(arr.astype(float).tolist())
+
+    if not prices_by_fuel:
+        print(f"[INFO] {day}: no finite SCED prices to plot for average bid quantity.")
+        return
+
+    fuels_sorted = sorted(prices_by_fuel.keys())
+    datasets = [np.asarray(prices_by_fuel[f], dtype=float) for f in fuels_sorted]
+
+    day_out = plots_root / day / "average_bid_quantity"
+    day_out.mkdir(parents=True, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.boxplot(datasets, labels=fuels_sorted, showfliers=True)
+    ax.set_title(f"{day} – SCED Price distribution by Fuel")
+    ax.set_xlabel("Fuel Type")
+    ax.set_ylabel("Price")
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    out_png = day_out / "average_bid_price_boxplot.png"
+    plt.savefig(out_png, dpi=150)
+    plt.close(fig)
+    print(f"[OK] Saved: {out_png}")
+
+    rows = [{"fuel": f, "price": float(v)} for f, data in prices_by_fuel.items() for v in data]
+    out_csv = day_out / "average_bid_price_values.csv"
+    try:
+        pd.DataFrame(rows).to_csv(out_csv, index=False)
+        print(f"[OK] Saved: {out_csv}")
+    except Exception as e:
+        print(f"[WARN] {day}: failed to write average bid price CSV: {e}")
+
 # =========================
 # 2) SCED price violins
 # =========================
@@ -1295,6 +1358,8 @@ def main():
         process_base_point_day(day_dir, out, BP_AGG_MODE, BP_SAVE_HOURLY_CSV)
         # 1b) Base Point vs Telemetered error distribution by fuel
         process_base_point_telemetered_output(day_dir, out)
+        # 1c) SCED price distribution by fuel (boxplot)
+        process_average_bid_quantity(day_dir, out)
         # 2) SCED price violins
         process_sced_violins_day(day_dir, out, SCED_SAVE_VALUES_CSV)
 

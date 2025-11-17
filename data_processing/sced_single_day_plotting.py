@@ -224,6 +224,124 @@ def process_base_point_day(day_dir: Path, plots_root: Path, agg_mode: str, save_
     out_png = day_out / f"base_point_stacked_{agg_mode}.png"
     plot_base_point_day(day, hourly, out_png, agg_mode)
 
+def process_base_point_telemetered_output(day_dir: Path, plots_root: Path) -> None:
+    """
+    Compare Telemetered Net Output vs Base Point and plot error (tele - dispatch) by fuel.
+    Generates a box-and-whisker plot per day and saves the flattened values used to plot.
+    """
+    day = day_dir.name
+
+    bp_path = day_dir / "aggregation_Base_Point.csv"
+    if not bp_path.exists():
+        matches = list(day_dir.glob("aggregation_Base_Point*.csv")) or list(day_dir.glob("*Base*Point*.csv"))
+        if not matches:
+            print(f"[INFO] {day}: no Base Point file; skipping telemetered comparison.")
+            return
+        bp_path = matches[0]
+
+    tele_path = day_dir / "aggregation_Telemetered_Net_Output.csv"
+    if not tele_path.exists():
+        matches = list(day_dir.glob("*Telemetered*Net*Output*.csv"))
+        if not matches:
+            print(f"[INFO] {day}: no Telemetered Net Output file; skipping telemetered comparison.")
+            return
+        tele_path = matches[0]
+
+    try:
+        bp_df = pd.read_csv(bp_path, dtype=str)
+        tele_df = pd.read_csv(tele_path, dtype=str)
+    except Exception as e:
+        print(f"[ERROR] {day}: failed to read Base Point/Telemetered files: {e}")
+        return
+
+    try:
+        bp_name, bp_type = normalize_key_columns(bp_df)
+        tele_name, tele_type = normalize_key_columns(tele_df)
+        ts_bp   = detect_timestamp_columns(bp_df,   (bp_name,   bp_type))
+        ts_tele = detect_timestamp_columns(tele_df, (tele_name, tele_type))
+    except Exception as e:
+        print(f"[ERROR] {day}: column detection failed: {e}")
+        return
+
+    ts_common = sorted(set(ts_bp).intersection(ts_tele), key=lambda c: pd.to_datetime(c))
+    if not ts_common:
+        print(f"[INFO] {day}: no overlapping timestamp columns between Base Point and Telemetered; skipping.")
+        return
+
+    def _key_series(s: pd.Series) -> pd.Series:
+        return s.astype(str).str.strip().str.casefold()
+
+    def _prep(df: pd.DataFrame, name_col: str) -> pd.DataFrame:
+        d = df.copy()
+        d["_key"] = _key_series(d[name_col])
+        d = d.drop_duplicates(subset=["_key"], keep="first").set_index("_key")
+        return d
+
+    bp_prep = _prep(bp_df, bp_name)
+    tele_prep = _prep(tele_df, tele_name)
+    master_idx = sorted(set(bp_prep.index).intersection(set(tele_prep.index)))
+    if not master_idx:
+        print(f"[INFO] {day}: no overlapping resources between Base Point and Telemetered; skipping.")
+        return
+
+    def _numeric_block(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+        return df.reindex(master_idx).reindex(columns=cols).apply(pd.to_numeric, errors="coerce")
+
+    bp_block = _numeric_block(bp_prep, ts_common)
+    tele_block = _numeric_block(tele_prep, ts_common)
+    error_vals = tele_block - bp_block  # telemetered minus dispatched
+
+    # fuel/resource names for reporting
+    fuel_series = tele_prep.reindex(master_idx)[tele_type]
+    fuel_series = fuel_series.fillna(bp_prep.reindex(master_idx)[bp_type]).astype(str).replace("", "Unknown")
+    name_series = tele_prep.reindex(master_idx)[tele_name]
+    name_series = name_series.fillna(bp_prep.reindex(master_idx)[bp_name]).astype(str)
+
+    error_df = pd.DataFrame(error_vals, index=master_idx, columns=ts_common)
+    error_df.insert(0, "Resource Type", fuel_series.values)
+    error_df.insert(0, "Resource Name", name_series.values)
+    error_df.reset_index(drop=True, inplace=True)
+
+    # Aggregate error values by fuel
+    errors_by_fuel: Dict[str, np.ndarray] = {}
+    for fuel, block in error_df.groupby("Resource Type"):
+        vals = block[ts_common].apply(pd.to_numeric, errors="coerce").to_numpy().ravel()
+        vals = vals[np.isfinite(vals)]
+        if vals.size:
+            errors_by_fuel[str(fuel)] = vals.astype(float)
+
+    if not errors_by_fuel:
+        print(f"[INFO] {day}: no finite error values to plot; skipping telemetered comparison.")
+        return
+
+    fuels_sorted = sorted(errors_by_fuel.keys())
+    datasets = [errors_by_fuel[f] for f in fuels_sorted]
+
+    day_out = (plots_root / day / "base_point_telemetered")
+    day_out.mkdir(parents=True, exist_ok=True)
+
+    # Plot box/whisker
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.boxplot(datasets, labels=fuels_sorted, showfliers=True)
+    ax.set_title(f"{day} – Telemetered Output minus Base Point by Fuel")
+    ax.set_xlabel("Fuel Type")
+    ax.set_ylabel("Error (Telemetered - Base Point)")
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    out_png = day_out / "bp_telemetered_error_boxplot.png"
+    plt.savefig(out_png, dpi=150)
+    plt.close(fig)
+    print(f"[OK] Saved: {out_png}")
+
+    # Save flattened values used for the plot
+    long_rows = [{"fuel": f, "error": float(v)} for f, arr in errors_by_fuel.items() for v in arr]
+    out_csv = day_out / "bp_telemetered_error_values.csv"
+    try:
+        pd.DataFrame(long_rows).to_csv(out_csv, index=False)
+        print(f"[OK] Saved: {out_csv}")
+    except Exception as e:
+        print(f"[WARN] {day}: failed to write telemetered error CSV: {e}")
+
 # =========================
 # 2) SCED price violins
 # =========================
@@ -1175,6 +1293,8 @@ def main():
     for day_dir in day_dirs:
         # 1) Base Point (stacked bar)
         process_base_point_day(day_dir, out, BP_AGG_MODE, BP_SAVE_HOURLY_CSV)
+        # 1b) Base Point vs Telemetered error distribution by fuel
+        process_base_point_telemetered_output(day_dir, out)
         # 2) SCED price violins
         process_sced_violins_day(day_dir, out, SCED_SAVE_VALUES_CSV)
 

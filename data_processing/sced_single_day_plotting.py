@@ -116,20 +116,70 @@ def plot_base_point_day(day: str, hourly_df: pd.DataFrame, out_png: Path, agg_mo
     if hourly_df.empty:
         print(f"[WARN] {day}: no hourly data; skipping Base Point plot.")
         return
+
     day_start = pd.to_datetime(day)
     day_end   = day_start + pd.Timedelta(days=1)
+
+    # Filter to the exact day
     hourly_df = hourly_df[(hourly_df.index >= day_start) & (hourly_df.index < day_end)]
-    hourly_df = hourly_df.reindex(pd.date_range(day_start, day_end, freq="h", inclusive="left"), fill_value=0.0)
+    hourly_df = hourly_df.reindex(
+        pd.date_range(day_start, day_end, freq="h", inclusive="left"),
+        fill_value=0.0,
+    )
 
+    # Reindex so x-axis is 0..23
     plot_df = hourly_df.copy()
-    plot_df.index = plot_df.index.hour  # 0..23
+    plot_df.index = plot_df.index.hour
 
-    ax = plot_df.plot(kind="bar", stacked=True, figsize=(14, 7))
+    # Extract fuel names (columns)
+    fuels = list(plot_df.columns)
+
+    # ----- Assign unique consistent colors -----
+    # Use matplotlib’s largest categorical palette (20 colors)
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    base_colors = plt.get_cmap("tab20").colors  # length 20
+    # Expand if there are >20 fuels
+    n = len(fuels)
+    if n <= 20:
+        colors = base_colors[:n]
+    else:
+        # Interpolate more colors if needed
+        expanded = plt.get_cmap("tab20")
+        colors = expanded(np.linspace(0, 1, n))
+
+    fuel_to_color = {fuel: colors[i] for i, fuel in enumerate(fuels)}
+
+    # Plot with explicit colors
+    fig, ax = plt.subplots(figsize=(14, 7))
+
+    bottom = np.zeros(len(plot_df))
+    x = plot_df.index.values
+
+    for fuel in fuels:
+        ax.bar(
+            x,
+            plot_df[fuel].values,
+            bottom=bottom,
+            color=fuel_to_color[fuel],
+            label=fuel,
+            width=0.9,
+        )
+        bottom += plot_df[fuel].values
+
+    # ----- Labels & formatting -----
     ylabel = "Average MW" if agg_mode.lower() == "mean" else "MWh"
     ax.set_title(f"{day} – Base Point by Fuel Type (Hourly {ylabel})")
     ax.set_xlabel("Hour of Day")
     ax.set_ylabel(ylabel)
-    ax.legend(title="Fuel Type", bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0.)
+    ax.legend(
+        title="Fuel Type",
+        bbox_to_anchor=(1.02, 1),
+        loc="upper left",
+        borderaxespad=0.,
+    )
+
     out_png.parent.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()
     plt.savefig(out_png, dpi=150)

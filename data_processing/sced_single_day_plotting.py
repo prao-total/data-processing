@@ -405,6 +405,51 @@ def process_average_bid_quantity(day_dir: Path, plots_root: Path) -> None:
     except Exception as e:
         print(f"[WARN] {day}: failed to write average bid price CSV: {e}")
 
+
+def process_average_mw_bid(summary_scaled: pd.DataFrame, day_dir: Path, plots_root: Path) -> None:
+    """
+    Given summary_scaled (index: SCED Step, columns: fuels), plot average MW per fuel (skip first row).
+    Saves both the bar chart and the numeric averages.
+    """
+    day = day_dir.name
+    if summary_scaled is None or summary_scaled.shape[0] < 2:
+        print(f"[INFO] {day}: not enough rows in summary_scaled to compute average MW bid (need >=2).")
+        return
+
+    df = summary_scaled.copy()
+    df_numeric = df.apply(pd.to_numeric, errors="coerce")
+    mean_by_fuel = df_numeric.iloc[1:].mean(axis=0, skipna=True)  # ignore first row
+    mean_by_fuel = mean_by_fuel.dropna()
+    if mean_by_fuel.empty:
+        print(f"[INFO] {day}: no finite averages for MW bid; skipping bar chart.")
+        return
+
+    fuels = mean_by_fuel.index.tolist()
+    vals = mean_by_fuel.to_numpy(dtype=float)
+
+    day_out = plots_root / day / "average_mw_bid"
+    day_out.mkdir(parents=True, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.bar(fuels, vals)
+    ax.set_title(f"{day} – Average MW bid by Fuel (excluding first SCED step)")
+    ax.set_xlabel("Fuel Type")
+    ax.set_ylabel("Average MW bid")
+    ax.set_xticklabels(fuels, rotation=30, ha="right")
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    out_png = day_out / "average_mw_bid_bar.png"
+    plt.savefig(out_png, dpi=150)
+    plt.close(fig)
+    print(f"[OK] Saved: {out_png}")
+
+    out_csv = day_out / "average_mw_bid_values.csv"
+    try:
+        mean_by_fuel.to_csv(out_csv, header=["average_mw_bid"])
+        print(f"[OK] Saved: {out_csv}")
+    except Exception as e:
+        print(f"[WARN] {day}: failed to write average MW bid CSV: {e}")
+
 # =========================
 # 2) SCED price violins
 # =========================
@@ -1375,6 +1420,9 @@ def main():
 
         med_wide, q1_wide, q3_wide = price_result
         summary_scaled, summary_low, summary_high, hsl_scaled, bp_scaled = norm_result
+
+        # 4b) Average MW bid per fuel (skip first SCED step)
+        process_average_mw_bid(summary_scaled, day_dir, out)
 
         # 5) Price vs MW per fuel, with HSL & Base Point verticals
         plot_price_vs_mw_by_fuel(

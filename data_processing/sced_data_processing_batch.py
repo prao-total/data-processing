@@ -397,7 +397,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # ------------------------------------------------------------------
 
         safe_name = safe_value_col_name(value_col)
-        out_path = cfg.save_agg_dir / f"aggregated_{safe_name}.csv"
+        out_path = cfg.save_agg_dir / f"aggregation_{safe_name}.csv"
         matrix.to_csv(out_path, index=True)
         log(f"[OK] Wrote aggregated matrix for {value_col!r} to {out_path}", cfg)
         log(f"      Shape: {matrix.shape[0]} resources x {matrix.shape[1]} columns", cfg)

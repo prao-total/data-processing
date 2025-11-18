@@ -451,6 +451,173 @@ def process_average_mw_bid(summary_scaled: pd.DataFrame, day_dir: Path, plots_ro
         print(f"[WARN] {day}: failed to write average MW bid CSV: {e}")
 
 # =========================
+# Hourly normalized MW (shapes)
+# =========================
+def process_sced_normalized_lines_hour(day_dir: Path, plots_root: Path, save_summary_csv: bool) -> Optional[Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
+    """
+    Hourly version of normalized MW aggregation:
+      - Uses the same normalization as process_sced_normalized_lines_day (row-max vs HSL/Base Point).
+      - Aggregates normalized values by hour-of-day across all SCED steps to capture hourly shapes.
+      - Saves a combined fuel plot (with IQR shading) plus optional CSV of hourly means.
+    """
+    day = day_dir.name
+
+    # ----- Load inputs -----
+    hsl_path = day_dir / "aggregation_HSL.csv"
+    if not hsl_path.exists():
+        matches = list(day_dir.glob("*HSL*.csv"))
+        if not matches:
+            print(f"[INFO] {day}: no HSL file; skipping hourly normalized MW.")
+            return None
+        hsl_path = matches[0]
+    try:
+        hsl_df = pd.read_csv(hsl_path, dtype=str)
+    except Exception as e:
+        print(f"[ERROR] {day}: failed to read HSL {hsl_path.name}: {e}")
+        return None
+
+    bp_path = day_dir / "aggregation_Base_Point.csv"
+    if not bp_path.exists():
+        matches = list(day_dir.glob("*Base*Point*.csv"))
+        if not matches:
+            print(f"[INFO] {day}: no Base Point file; skipping hourly normalized MW.")
+            return None
+        bp_path = matches[0]
+    try:
+        bp_df = pd.read_csv(bp_path, dtype=str)
+    except Exception as e:
+        print(f"[ERROR] {day}: failed to read Base Point {bp_path.name}: {e}")
+        return None
+
+    mw_files = list(day_dir.glob("aggregation_SCED1_Curve-MW*.csv"))
+    if not mw_files:
+        mw_files = list(day_dir.glob("*SCED*Curve*MW*.csv"))
+    if not mw_files:
+        print(f"[INFO] {day}: no SCED MW step files; skipping hourly normalized MW.")
+        return None
+
+    def step_key(p: Path):
+        m = MW_STEP_PATTERN.search(p.name)
+        return int(m.group(1)) if m else 1_000_000
+    mw_files = sorted(mw_files, key=step_key)
+
+    step_dfs: Dict[int, pd.DataFrame] = {}
+    for p in mw_files:
+        m = MW_STEP_PATTERN.search(p.name)
+        step_num = int(m.group(1)) if m else None
+        if step_num is None:
+            continue
+        try:
+            step_dfs[step_num] = pd.read_csv(p, dtype=str)
+        except Exception as e:
+            print(f"[WARN] {day}: failed to read {p.name}: {e}")
+
+    if not step_dfs:
+        print(f"[INFO] {day}: no readable SCED MW step files; skipping hourly normalized MW.")
+        return None
+
+    # ----- Normalize (same core as daily version) -----
+    try:
+        norm_steps, hsl_norm, bp_norm, max_sced_per_row, fuel_per_row = normalize_by_row_max_with_hsl_and_bp(
+            step_dfs, hsl_df, bp_df
+        )
+    except Exception as e:
+        print(f"[ERROR] {day}: hourly normalization by row-max failed: {e}")
+        return None
+
+    fuel_series = fuel_per_row.astype(str).fillna("Unknown")
+    rescale_by_fuel = max_sced_per_row.groupby(fuel_series).sum(min_count=1)
+    candidate_fuels = sorted(rescale_by_fuel.index.astype(str))
+
+    # ----- Collect normalized values by fuel and hour-of-day across steps -----
+    fuel_hour_vals: Dict[str, Dict[int, List[float]]] = {f: {h: [] for h in range(24)} for f in candidate_fuels}
+
+    for df in norm_steps.values():
+        try:
+            name_col, type_col = normalize_key_columns(df)
+            ts_cols = detect_timestamp_columns(df, (name_col, type_col))
+            if not ts_cols or type_col is None:
+                continue
+        except Exception:
+            continue
+
+        fuels_here = df[type_col].astype(str).fillna("Unknown").str.strip().replace("", "Unknown")
+        vals = df[ts_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+        hours = [pd.to_datetime(c, errors="coerce").hour for c in ts_cols]
+
+        for row_vals, fuel in zip(vals, fuels_here):
+            if fuel not in fuel_hour_vals:
+                fuel_hour_vals[fuel] = {h: [] for h in range(24)}
+            for v, h in zip(row_vals, hours):
+                if np.isfinite(v) and pd.notna(h):
+                    fuel_hour_vals[fuel][int(h)].append(float(v))
+
+    # ----- Mean + IQR per hour, rescaled -----
+    hours_list = list(range(24))
+    mean_data, q25_data, q75_data = {}, {}, {}
+    for f in candidate_fuels:
+        scale = rescale_by_fuel.get(f, np.nan)
+        mean_row, q25_row, q75_row = [], [], []
+        for h in hours_list:
+            arr = np.asarray(fuel_hour_vals.get(f, {}).get(h, []), dtype=float)
+            arr = arr[np.isfinite(arr)]
+            if arr.size == 0 or not np.isfinite(scale):
+                mean_row.append(np.nan); q25_row.append(np.nan); q75_row.append(np.nan)
+                continue
+            mean_row.append(float(np.nanmean(arr) * scale))
+            q25_row.append(float(np.nanpercentile(arr, 25) * scale))
+            q75_row.append(float(np.nanpercentile(arr, 75) * scale))
+        mean_data[f] = mean_row
+        q25_data[f]  = q25_row
+        q75_data[f]  = q75_row
+
+    mean_df = pd.DataFrame(mean_data, index=hours_list)
+    q25_df  = pd.DataFrame(q25_data,  index=hours_list)
+    q75_df  = pd.DataFrame(q75_data,  index=hours_list)
+    mean_df.index.name = "Hour"
+    q25_df.index.name  = "Hour"
+    q75_df.index.name  = "Hour"
+
+    # ----- Plot combined hourly shapes -----
+    day_out = plots_root / day / "sced_normalized_hourly"
+    day_out.mkdir(parents=True, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+    x = mean_df.index.values
+    for f in candidate_fuels:
+        y  = pd.to_numeric(mean_df[f], errors="coerce").to_numpy(dtype=float)
+        yl = pd.to_numeric(q25_df[f], errors="coerce").to_numpy(dtype=float)
+        yh = pd.to_numeric(q75_df[f], errors="coerce").to_numpy(dtype=float)
+        if np.isfinite(y).any():
+            ax.plot(x, y, marker="o", linewidth=2, label=f)
+            mask = np.isfinite(yl) & np.isfinite(yh)
+            if mask.any():
+                ax.fill_between(x[mask], yl[mask], yh[mask], alpha=0.2)
+
+    ax.set_title(f"{day} – Aggregate bidding behavior by Hour (all SCED steps)")
+    ax.set_xlabel("Hour of Day")
+    ax.set_ylabel("Aggregate MW bid (MW)")
+    ax.set_xticks(hours_list)
+    ax.grid(True, alpha=0.3)
+    ax.legend(title="Fuel Type", bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0.)
+    fig.tight_layout()
+    out_png = day_out / "normalized_bids_by_hour.png"
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+    print(f"[OK] Saved: {out_png}")
+
+    if save_summary_csv:
+        out_csv = day_out / "normalized_bids_by_hour.csv"
+        try:
+            mean_df.to_csv(out_csv)
+            print(f"[OK] Saved: {out_csv}")
+        except Exception as e:
+            print(f"[WARN] {day}: failed to write hourly normalized CSV: {e}")
+
+    return mean_df, q25_df, q75_df
+
+
+# =========================
 # 2) SCED price violins
 # =========================
 def load_violin_data_by_fuel(df: pd.DataFrame) -> Dict[str, np.ndarray]:
@@ -1525,6 +1692,8 @@ def main():
 
         # 4b) Average MW bid per fuel (skip first SCED step)
         process_average_mw_bid(summary_scaled, day_dir, out)
+        # 4c) Hourly normalized MW shapes
+        process_sced_normalized_lines_hour(day_dir, out, SAVE_NORMALIZED_SUMMARY_CSV)
 
         # 5) Price vs MW per fuel, with HSL & Base Point verticals
         plot_price_vs_mw_by_fuel(

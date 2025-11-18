@@ -47,7 +47,7 @@ import matplotlib.pyplot as plt
 
 # ===================== EDIT THESE =====================
 ROOT_DIR  = r"C:/Users/L1165683/GitHub_Repos/data-processing/output/sced_single_day_data"   # contains YYYY-MM-DD subfolders
-PLOTS_DIR = r"C:/Users/L1165683/GitHub_Repos/data-processing/output/sced_single_day_plotting_update_2"     # results written here, mirrored per-day
+PLOTS_DIR = r"C:/Users/L1165683/GitHub_Repos/data-processing/output/sced_single_day_plotting_sced1"     # results written here, mirrored per-day
 # Optional toggles (leave as-is unless you want different behavior)
 BP_AGG_MODE = "mean"                  # "mean" (MW) or "mwh" (energy)
 BP_SAVE_HOURLY_CSV = True             # write hourly pivot per day
@@ -1788,7 +1788,8 @@ def process_counts_fuel_per_step(root_dir: Path, out_dir: Path) -> None:
     Produces one bar chart per file plus a counts CSV.
     """
     root = Path(root_dir)
-    out_dir = Path(out_dir)
+    out_base = Path(out_dir)
+    day_out = out_base / root.name
     files = sorted(root.glob("aggregation_SCED1_Curve-MW*.csv"))
     if not files:
         files = sorted(root.glob("*SCED*Curve*MW*.csv"))
@@ -1814,7 +1815,7 @@ def process_counts_fuel_per_step(root_dir: Path, out_dir: Path) -> None:
                 ts_cols.append(c)
         return ts_cols
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+    day_out.mkdir(parents=True, exist_ok=True)
     step_pattern = re.compile(r"_MW(\d+)", re.IGNORECASE)
 
     for path in files:
@@ -1866,12 +1867,12 @@ def process_counts_fuel_per_step(root_dir: Path, out_dir: Path) -> None:
         ax.grid(True, axis="y", alpha=0.3)
         fig.tight_layout()
 
-        out_png = out_dir / f"{path.stem}_fuel_counts.png"
+        out_png = day_out / f"{path.stem}_fuel_counts.png"
         fig.savefig(out_png, dpi=150)
         plt.close(fig)
         print(f"[OK] Saved: {out_png}")
 
-        out_csv = out_dir / f"{path.stem}_fuel_counts.csv"
+        out_csv = day_out / f"{path.stem}_fuel_counts.csv"
         try:
             counts.to_csv(out_csv, header=["count"])
             print(f"[OK] Saved: {out_csv}")

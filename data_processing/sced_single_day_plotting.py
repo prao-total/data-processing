@@ -1565,9 +1565,11 @@ def process_counts_fuel_per_step(root_dir: Path, out_dir: Path) -> None:
     """
     root = Path(root_dir)
     out_dir = Path(out_dir)
-    files = sorted(root.glob("aggregation_SCED1_Curve_MW*.csv"))
+    files = sorted(root.glob("aggregation_SCED1_Curve-MW*.csv"))
     if not files:
-        print(f"[INFO] No aggregation_SCED1_Curve_MW*.csv files found in {root}")
+        files = sorted(root.glob("*SCED*Curve*MW*.csv"))
+    if not files:
+        print(f"[INFO] No SCED MW step files found in {root}")
         return
 
     def _key_cols(df: pd.DataFrame) -> tuple[str, str]:

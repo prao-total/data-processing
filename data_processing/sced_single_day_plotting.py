@@ -1387,6 +1387,105 @@ def plot_price_vs_mw_by_fuel(
         print(f"[OK] Saved: {out_png}")
 
 
+# ---------------------------------------------------------------------------
+# Fuel counts per SCED MW step
+# ---------------------------------------------------------------------------
+
+def process_counts_fuel_per_step(root_dir: Path, out_dir: Path) -> None:
+    """
+    For each aggregation_SCED1_Curve_MW*.csv in root_dir, plot the number of plants per fuel.
+    Produces one bar chart per file plus a counts CSV.
+    """
+    root = Path(root_dir)
+    out_dir = Path(out_dir)
+    files = sorted(root.glob("aggregation_SCED1_Curve_MW*.csv"))
+    if not files:
+        print(f"[INFO] No aggregation_SCED1_Curve_MW*.csv files found in {root}")
+        return
+
+    def _key_cols(df: pd.DataFrame) -> tuple[str, str]:
+        col_map = {str(c).strip().lower(): c for c in df.columns}
+        name_col = col_map.get("resource name")
+        type_col = col_map.get("resource type")
+        if not name_col or not type_col:
+            raise ValueError("Expected columns 'Resource Name' and 'Resource Type'.")
+        return name_col, type_col
+
+    def _timestamp_cols(df: pd.DataFrame, name_col: str, type_col: str) -> list[str]:
+        ts_cols: list[str] = []
+        for c in df.columns:
+            if c in (name_col, type_col):
+                continue
+            ts = pd.to_datetime(c, errors="coerce")
+            if ts is not pd.NaT:
+                ts_cols.append(c)
+        return ts_cols
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    step_pattern = re.compile(r"_MW(\d+)", re.IGNORECASE)
+
+    for path in files:
+        try:
+            df = pd.read_csv(path, dtype=str)
+        except Exception as e:
+            print(f"[WARN] Failed to read {path.name}: {e}")
+            continue
+
+        try:
+            name_col, type_col = _key_cols(df)
+            ts_cols = _timestamp_cols(df, name_col, type_col)
+            if not ts_cols:
+                print(f"[INFO] {path.name}: no timestamp columns detected; skipping.")
+                continue
+        except Exception as e:
+            print(f"[WARN] {path.name}: column detection failed: {e}")
+            continue
+
+        numeric = df[ts_cols].apply(pd.to_numeric, errors="coerce")
+        active_mask = np.isfinite(numeric.to_numpy()).any(axis=1)
+        fuels = (
+            df.loc[active_mask, type_col]
+            .astype(str)
+            .fillna("Unknown")
+            .str.strip()
+            .replace("", "Unknown")
+        )
+        if fuels.empty:
+            print(f"[INFO] {path.name}: no active rows to count; skipping.")
+            continue
+
+        counts = fuels.value_counts().sort_index()
+
+        match = step_pattern.search(path.name)
+        step_label = match.group(1) if match else path.stem
+        title = f"SCED Step {step_label}"
+
+        labels = counts.index.tolist()
+        xpos = np.arange(len(labels))
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.bar(xpos, counts.to_numpy(dtype=float))
+        ax.set_title(title)
+        ax.set_xlabel("ERCOT Fuel Type")
+        ax.set_ylabel("Number of Plants")
+        ax.set_xticks(xpos)
+        ax.set_xticklabels(labels, rotation=30, ha="right")
+        ax.grid(True, axis="y", alpha=0.3)
+        fig.tight_layout()
+
+        out_png = out_dir / f"{path.stem}_fuel_counts.png"
+        fig.savefig(out_png, dpi=150)
+        plt.close(fig)
+        print(f"[OK] Saved: {out_png}")
+
+        out_csv = out_dir / f"{path.stem}_fuel_counts.csv"
+        try:
+            counts.to_csv(out_csv, header=["count"])
+            print(f"[OK] Saved: {out_csv}")
+        except Exception as e:
+            print(f"[WARN] Failed to write counts CSV for {path.name}: {e}")
+
+
 
 def main():
     root = Path(ROOT_DIR).resolve()
@@ -1407,6 +1506,9 @@ def main():
         process_average_bid_quantity(day_dir, out)
         # 2) SCED price violins
         process_sced_violins_day(day_dir, out, SCED_SAVE_VALUES_CSV)
+
+        # Fuel counts per SCED MW step
+        process_counts_fuel_per_step(day_dir, out)
 
         # 3) SCED price lines
         price_result = process_sced_price_lines_day(day_dir, out, save_values_csv=True, per_fuel=True)

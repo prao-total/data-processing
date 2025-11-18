@@ -453,16 +453,19 @@ def process_average_mw_bid(summary_scaled: pd.DataFrame, day_dir: Path, plots_ro
 # =========================
 # Hourly normalized MW (shapes)
 # =========================
-def process_sced_normalized_lines_hour(day_dir: Path, plots_root: Path, save_summary_csv: bool) -> Optional[Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
+def process_sced_normalized_lines_hour(day_dir: Path, plots_root: Path, save_summary_csv: bool) -> Optional[Dict[int, pd.DataFrame]]:
     """
-    Hourly version of normalized MW aggregation:
-      - Uses the same normalization as process_sced_normalized_lines_day (row-max vs HSL/Base Point).
-      - Aggregates normalized values by hour-of-day across all SCED steps to capture hourly shapes.
-      - Saves a combined fuel plot (with IQR shading) plus optional CSV of hourly means.
+    Hourly shapes for normalized MW:
+      - Normalize each resource row by its max across ALL SCED steps (same scalar used for BP/HSL).
+      - Sum those max scalars per fuel (magnitude).
+      - For each step, compute normalized mean per fuel per timestamp; align timestamps by hour-of-day,
+        then scale by the fuel's summed maxima to recover MW shape.
+      - Emit 24 plots (one per hour) with SCED Step on x-axis, MW on y-axis, lines per fuel.
+      - Save one CSV per hour (step x fuel) with the scaled values.
     """
     day = day_dir.name
 
-    # ----- Load inputs -----
+    # ----- Load inputs (unchanged) -----
     hsl_path = day_dir / "aggregation_HSL.csv"
     if not hsl_path.exists():
         matches = list(day_dir.glob("*HSL*.csv"))
@@ -516,105 +519,326 @@ def process_sced_normalized_lines_hour(day_dir: Path, plots_root: Path, save_sum
         print(f"[INFO] {day}: no readable SCED MW step files; skipping hourly normalized MW.")
         return None
 
-    # ----- Normalize (same core as daily version) -----
-    try:
-        norm_steps, hsl_norm, bp_norm, max_sced_per_row, fuel_per_row = normalize_by_row_max_with_hsl_and_bp(
-            step_dfs, hsl_df, bp_df
-        )
-    except Exception as e:
-        print(f"[ERROR] {day}: hourly normalization by row-max failed: {e}")
+    # ----- Prep columns/keys -----
+    any_step = next(iter(step_dfs.values()))
+    name_col, type_col = normalize_key_columns(any_step)
+    ts_cols_per_step: Dict[int, List[str]] = {}
+    for k, df in step_dfs.items():
+        ts_cols_per_step[k] = detect_timestamp_columns(df, (name_col, type_col))
+
+    # Build master key for resources (case/trim)
+    def _key_series(s: pd.Series) -> pd.Series:
+        return s.astype(str).str.strip().str.casefold()
+
+    step_blocks: Dict[int, pd.DataFrame] = {}
+    fuel_by_key: pd.Series | None = None
+    for step, df in step_dfs.items():
+        df = df.copy()
+        df["_key"] = _key_series(df[name_col])
+        df = df.drop_duplicates(subset=["_key"], keep="first").set_index("_key")
+        fuel_col = df[type_col].astype(str).fillna("Unknown").str.strip().replace("", "Unknown")
+        if fuel_by_key is None:
+            fuel_by_key = fuel_col
+        # ensure consistent ordering of ts
+        ts_cols = sorted(ts_cols_per_step[step], key=lambda c: pd.to_datetime(c))
+        step_blocks[step] = df.reindex(columns=ts_cols).apply(pd.to_numeric, errors="coerce")
+
+    if fuel_by_key is None or fuel_by_key.empty:
+        print(f"[INFO] {day}: no fuels found after preprocessing; skipping hourly normalized MW.")
         return None
 
-    fuel_series = fuel_per_row.astype(str).fillna("Unknown")
-    rescale_by_fuel = max_sced_per_row.groupby(fuel_series).sum(min_count=1)
-    candidate_fuels = sorted(rescale_by_fuel.index.astype(str))
+    # ----- Row-wise maxima across all steps (scalar per resource) -----
+    all_keys = sorted(set().union(*[set(df.index) for df in step_blocks.values()]))
+    max_per_key = pd.Series(index=all_keys, dtype="float64")
+    for key in all_keys:
+        vals_list = []
+        for df in step_blocks.values():
+            if key in df.index:
+                arr = df.loc[key].to_numpy(dtype=float)
+                vals_list.append(arr)
+        if vals_list:
+            stacked = np.concatenate(vals_list)
+            finite = stacked[np.isfinite(stacked)]
+            max_per_key.loc[key] = np.nanmax(finite) if finite.size else np.nan
+    max_per_key.replace({np.inf: np.nan, -np.inf: np.nan}, inplace=True)
+    if max_per_key.isna().all():
+        print(f"[INFO] {day}: no finite maxima across steps; skipping hourly normalized MW.")
+        return None
 
-    # ----- Collect normalized values by fuel and hour-of-day across steps -----
-    fuel_hour_vals: Dict[str, Dict[int, List[float]]] = {f: {h: [] for h in range(24)} for f in candidate_fuels}
+    # Sum of maxima per fuel
+    fuel_lookup = fuel_by_key.reindex(all_keys).fillna("Unknown")
+    sum_max_by_fuel = max_per_key.groupby(fuel_lookup).sum(min_count=1)
+    fuels_sorted = sorted(sum_max_by_fuel.index.astype(str))
 
-    for df in norm_steps.values():
+    # ----- Normalize steps by row max, then average per fuel per timestamp -----
+    # per_step_fuel_mean: step -> DataFrame (index=fuel, columns=ts, normalized mean)
+    per_step_fuel_mean: Dict[int, pd.DataFrame] = {}
+    for step, df in step_blocks.items():
+        denom = max_per_key.reindex(df.index)
+        with np.errstate(all="ignore"):
+            norm_vals = df.to_numpy(dtype=float) / denom.to_numpy(dtype=float)[:, None]
+        norm_df = pd.DataFrame(norm_vals, index=df.index, columns=df.columns)
+        fuel_this = fuel_lookup.reindex(df.index)
+        norm_df.insert(0, "__fuel__", fuel_this.values)
+        fuel_means = norm_df.groupby("__fuel__", dropna=False).mean(numeric_only=True)
+        per_step_fuel_mean[step] = fuel_means
+
+    # ----- Build per-hour tables: step x fuel (scaled by sum of maxima) -----
+    hours = list(range(24))
+    per_hour_tables: Dict[int, pd.DataFrame] = {}
+    for h in hours:
+        table = pd.DataFrame(index=sorted(per_step_fuel_mean.keys()), columns=fuels_sorted, dtype="float64")
+        for step, fuel_mean_df in per_step_fuel_mean.items():
+            for f in fuels_sorted:
+                row = fuel_mean_df.loc[f] if f in fuel_mean_df.index else None
+                if row is None:
+                    continue
+                # pick columns for this hour
+                cols_for_hour = [c for c in row.index if pd.to_datetime(c, errors="coerce").hour == h]
+                if not cols_for_hour:
+                    continue
+                vals = pd.to_numeric(row[cols_for_hour], errors="coerce")
+                finite = vals[np.isfinite(vals)]
+                if finite.empty:
+                    continue
+                mean_norm = float(finite.mean())
+                scale = sum_max_by_fuel.get(f, np.nan)
+                if np.isfinite(scale):
+                    table.loc[step, f] = mean_norm * float(scale)
+        per_hour_tables[h] = table
+
+    # ----- Plot & save per hour -----
+    out_dir = plots_root / day / "sced_normalized_hourly"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for h, table in per_hour_tables.items():
+        if table.dropna(how="all").empty:
+            continue
+        fig, ax = plt.subplots(figsize=(12, 7))
+        x_steps = table.index.values
+        for f in fuels_sorted:
+            y = pd.to_numeric(table[f], errors="coerce").to_numpy(dtype=float)
+            if np.isfinite(y).any():
+                ax.plot(x_steps, y, marker="o", linewidth=2, label=f)
+        ax.set_title(f"{day} – Hour {h:02d} normalized MW by SCED Step")
+        ax.set_xlabel("SCED Step")
+        ax.set_ylabel("Aggregate MW bid (MW)")
+        ax.set_xticks(x_steps)
+        ax.grid(True, alpha=0.3)
+        ax.legend(title="Fuel Type", bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0.)
+        fig.tight_layout()
+        out_png = out_dir / f"hour_{h:02d}_normalized_bids.png"
+        fig.savefig(out_png, dpi=150)
+        plt.close(fig)
+        print(f"[OK] Saved: {out_png}")
+
+        if save_summary_csv:
+            out_csv = out_dir / f"hour_{h:02d}_normalized_bids.csv"
+            try:
+                table.to_csv(out_csv)
+                print(f"[OK] Saved: {out_csv}")
+            except Exception as e:
+                print(f"[WARN] {day}: failed to write hourly normalized CSV for hour {h:02d}: {e}")
+
+    return per_hour_tables
+
+
+# =========================
+# Hourly price lines (shapes)
+# =========================
+def process_sced_price_lines_hour(day_dir: Path, plots_root: Path, save_values_csv: bool, per_fuel: bool = True,) -> Optional[Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
+    """
+    Hourly version of price lines: aggregates SCED step price CSVs into hourly shapes by fuel.
+      - For each price step CSV, flatten resource×time prices per fuel, bucket by hour-of-day.
+      - Combined chart: hourly median per fuel (across steps/resources/times), with optional per-fuel charts
+        using median line + IQR shading.
+    """
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    MIN_SAMPLES = 5  # per hour minimum samples per fuel to compute quartiles
+
+    day = day_dir.name
+    day_out = plots_root / day
+    day_out.mkdir(parents=True, exist_ok=True)
+
+    # find price step files
+    step_files = list(day_dir.glob("aggregation_SCED1_Curve-Price*.csv"))
+    if not step_files:
+        step_files = list(day_dir.glob("*SCED*Curve*Price*.csv"))
+    if not step_files:
+        print(f"[INFO] {day}: no SCED price files; skipping hourly price line plots.")
+        return None
+
+    def step_key(p: Path):
+        m = PRICE_STEP_PATTERN.search(p.name)
+        return int(m.group(1)) if m else 1_000_000
+
+    step_files = sorted(step_files, key=step_key)
+
+    # Hold per-hour quartiles (Series indexed by fuel)
+    q1_by_hour: dict[int, pd.Series] = {}
+    med_by_hour: dict[int, pd.Series] = {}
+    q3_by_hour: dict[int, pd.Series] = {}
+    fuels_seen: set[str] = set()
+
+    for p in step_files:
+        try:
+            df = pd.read_csv(p, dtype=str)
+        except Exception as e:
+            print(f"[ERROR] {day}: read failed for {p.name}: {e}")
+            continue
+
         try:
             name_col, type_col = normalize_key_columns(df)
             ts_cols = detect_timestamp_columns(df, (name_col, type_col))
             if not ts_cols or type_col is None:
+                print(f"[INFO] {day}: {p.name} – no timestamps or fuel column; skipping.")
                 continue
-        except Exception:
+
+            prices = df[ts_cols].apply(pd.to_numeric, errors="coerce")
+            fuels = df[type_col].astype(str).fillna("Unknown")
+            hours = [pd.to_datetime(c, errors="coerce").hour for c in ts_cols]
+
+            prices = prices.assign(__fuel__=fuels)
+            # For each fuel, gather values by hour
+            by_fuel = {}
+            for f, block in prices.groupby("__fuel__"):
+                vals = block[ts_cols].to_numpy().ravel()
+                hrs_rep = np.repeat(hours, block.shape[0])
+                mask = np.isfinite(vals)
+                vals = vals[mask]
+                hrs_rep = np.asarray(hrs_rep)[mask]
+                by_fuel[str(f)] = {"vals": vals, "hours": hrs_rep}
+
+            # For each hour, compute quartiles per fuel
+            hour_groups: dict[int, dict[str, np.ndarray]] = {}
+            for fuel, data in by_fuel.items():
+                vals = data["vals"]
+                hrs = data["hours"]
+                for v, h in zip(vals, hrs):
+                    if pd.isna(h):
+                        continue
+                    h_int = int(h)
+                    hour_groups.setdefault(h_int, {}).setdefault(fuel, []).append(float(v))
+
+            for h, fuels_dict in hour_groups.items():
+                q1_dict, med_dict, q3_dict = {}, {}, {}
+                skipped_fuels = []
+                for f, arr in fuels_dict.items():
+                    arr_np = np.asarray(arr, dtype=float)
+                    arr_np = arr_np[np.isfinite(arr_np)]
+                    if arr_np.size < MIN_SAMPLES:
+                        skipped_fuels.append(str(f))
+                        continue
+                    q1_dict[str(f)] = float(np.quantile(arr_np, 0.25))
+                    med_dict[str(f)] = float(np.quantile(arr_np, 0.50))
+                    q3_dict[str(f)] = float(np.quantile(arr_np, 0.75))
+
+                if skipped_fuels:
+                    print(f"[INFO] {day}: {p.name} hour {h:02d} – skipped short fuels: {', '.join(skipped_fuels)}")
+
+                if med_dict:
+                    q1_by_hour[h] = pd.Series(q1_dict, dtype="float64")
+                    med_by_hour[h] = pd.Series(med_dict, dtype="float64")
+                    q3_by_hour[h] = pd.Series(q3_dict, dtype="float64")
+                    fuels_seen.update(med_dict.keys())
+
+        except Exception as e:
+            print(f"[ERROR] {day}: processing failed for {p.name}: {e}")
             continue
 
-        fuels_here = df[type_col].astype(str).fillna("Unknown").str.strip().replace("", "Unknown")
-        vals = df[ts_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
-        hours = [pd.to_datetime(c, errors="coerce").hour for c in ts_cols]
+    if not med_by_hour:
+        print(f"[INFO] {day}: no usable hours for price lines; done.")
+        return None
 
-        for row_vals, fuel in zip(vals, fuels_here):
-            if fuel not in fuel_hour_vals:
-                fuel_hour_vals[fuel] = {h: [] for h in range(24)}
-            for v, h in zip(row_vals, hours):
-                if np.isfinite(v) and pd.notna(h):
-                    fuel_hour_vals[fuel][int(h)].append(float(v))
+    fuels_sorted = sorted(fuels_seen)
+    hours_sorted = sorted(med_by_hour.keys())
 
-    # ----- Mean + IQR per hour, rescaled -----
-    hours_list = list(range(24))
-    mean_data, q25_data, q75_data = {}, {}, {}
-    for f in candidate_fuels:
-        scale = rescale_by_fuel.get(f, np.nan)
-        mean_row, q25_row, q75_row = [], [], []
-        for h in hours_list:
-            arr = np.asarray(fuel_hour_vals.get(f, {}).get(h, []), dtype=float)
-            arr = arr[np.isfinite(arr)]
-            if arr.size == 0 or not np.isfinite(scale):
-                mean_row.append(np.nan); q25_row.append(np.nan); q75_row.append(np.nan)
-                continue
-            mean_row.append(float(np.nanmean(arr) * scale))
-            q25_row.append(float(np.nanpercentile(arr, 25) * scale))
-            q75_row.append(float(np.nanpercentile(arr, 75) * scale))
-        mean_data[f] = mean_row
-        q25_data[f]  = q25_row
-        q75_data[f]  = q75_row
+    def _to_wide(dhour: dict[int, pd.Series]) -> pd.DataFrame:
+        wide = pd.DataFrame(index=hours_sorted, columns=fuels_sorted, dtype="float64")
+        for h in hours_sorted:
+            if h in dhour:
+                for f, v in dhour[h].items():
+                    wide.loc[h, f] = v
+        wide.index.name = "Hour"
+        return wide
 
-    mean_df = pd.DataFrame(mean_data, index=hours_list)
-    q25_df  = pd.DataFrame(q25_data,  index=hours_list)
-    q75_df  = pd.DataFrame(q75_data,  index=hours_list)
-    mean_df.index.name = "Hour"
-    q25_df.index.name  = "Hour"
-    q75_df.index.name  = "Hour"
+    med_wide = _to_wide(med_by_hour)
+    q1_wide  = _to_wide(q1_by_hour)
+    q3_wide  = _to_wide(q3_by_hour)
 
-    # ----- Plot combined hourly shapes -----
-    day_out = plots_root / day / "sced_normalized_hourly"
-    day_out.mkdir(parents=True, exist_ok=True)
+    # ---------------- Combined chart (all fuels): MEDIAN LINES ONLY ----------------
+    out_lines_dir = day_out / "sced_price_lines_hourly"
+    out_lines_dir.mkdir(parents=True, exist_ok=True)
 
     fig, ax = plt.subplots(figsize=(14, 7))
-    x = mean_df.index.values
-    for f in candidate_fuels:
-        y  = pd.to_numeric(mean_df[f], errors="coerce").to_numpy(dtype=float)
-        yl = pd.to_numeric(q25_df[f], errors="coerce").to_numpy(dtype=float)
-        yh = pd.to_numeric(q75_df[f], errors="coerce").to_numpy(dtype=float)
-        if np.isfinite(y).any():
-            ax.plot(x, y, marker="o", linewidth=2, label=f)
-            mask = np.isfinite(yl) & np.isfinite(yh)
-            if mask.any():
-                ax.fill_between(x[mask], yl[mask], yh[mask], alpha=0.2)
+    for f in fuels_sorted:
+        series = pd.to_numeric(med_wide[f], errors="coerce").to_numpy()
+        if np.isfinite(series).any():
+            ax.plot(med_wide.index.values, series, marker="o", linewidth=2, label=f)
 
-    ax.set_title(f"{day} – Aggregate bidding behavior by Hour (all SCED steps)")
+    ax.set_title(f"{day} – SCED Price (Median by Fuel) across Hours")
     ax.set_xlabel("Hour of Day")
-    ax.set_ylabel("Aggregate MW bid (MW)")
-    ax.set_xticks(hours_list)
-    ax.grid(True, alpha=0.3)
+    ax.set_ylabel("Price (Median)")
     ax.legend(title="Fuel Type", bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0.)
+    ax.grid(True, alpha=0.3)
     fig.tight_layout()
-    out_png = day_out / "normalized_bids_by_hour.png"
+    out_png = out_lines_dir / "price_lines_all_fuels_hourly.png"
     fig.savefig(out_png, dpi=150)
     plt.close(fig)
     print(f"[OK] Saved: {out_png}")
 
-    if save_summary_csv:
-        out_csv = day_out / "normalized_bids_by_hour.csv"
-        try:
-            mean_df.to_csv(out_csv)
-            print(f"[OK] Saved: {out_csv}")
-        except Exception as e:
-            print(f"[WARN] {day}: failed to write hourly normalized CSV: {e}")
+    # ---------------- Per-fuel charts: MEDIAN LINE + IQR (Q1–Q3) SHADED ----------------
+    if per_fuel:
+        per_fuel_dir = out_lines_dir / "per_fuel"
+        per_fuel_dir.mkdir(parents=True, exist_ok=True)
 
-    return mean_df, q25_df, q75_df
+        x = med_wide.index.values
+        for f in fuels_sorted:
+            y_med = pd.to_numeric(med_wide[f], errors="coerce").to_numpy()
+            y_q1  = pd.to_numeric(q1_wide[f],  errors="coerce").to_numpy()
+            y_q3  = pd.to_numeric(q3_wide[f],  errors="coerce").to_numpy()
+
+            if not (np.isfinite(y_med).any() or np.isfinite(y_q1).any() or np.isfinite(y_q3).any()):
+                continue  # nothing to plot
+
+            fig, ax = plt.subplots(figsize=(10, 6))
+            mask = np.isfinite(y_q1) & np.isfinite(y_q3)
+            if mask.any():
+                ax.fill_between(x[mask], y_q1[mask], y_q3[mask], alpha=0.25, linewidth=0)
+            if np.isfinite(y_med).any():
+                ax.plot(x, y_med, marker="o", linewidth=2, label=f)
+
+            ax.set_title(f"{day} – SCED Price (Fuel: {f}) — Median with IQR by Hour")
+            ax.set_xlabel("Hour of Day")
+            ax.set_ylabel("Price")
+            ax.set_xticks(x)
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+
+            out_pf = per_fuel_dir / f"{f}_price_line_iqr_hourly.png"
+            fig.tight_layout()
+            fig.savefig(out_pf, dpi=150)
+            plt.close(fig)
+            print(f"[OK] Saved: {out_pf}")
+
+    # ---------------- Save CSVs ----------------
+    if save_values_csv:
+        med_csv = out_lines_dir / "price_median_wide_hourly.csv"
+        q1_csv  = out_lines_dir / "price_q1_wide_hourly.csv"
+        q3_csv  = out_lines_dir / "price_q3_wide_hourly.csv"
+        try:
+            med_wide.to_csv(med_csv)
+            q1_wide.to_csv(q1_csv)
+            q3_wide.to_csv(q3_csv)
+            print(f"[OK] Saved: {med_csv}")
+            print(f"[OK] Saved: {q1_csv}")
+            print(f"[OK] Saved: {q3_csv}")
+        except Exception as e:
+            print(f"[ERROR] {day}: failed writing hourly quartile CSVs: {e}")
+
+    return med_wide, q1_wide, q3_wide
 
 
 # =========================
@@ -1691,6 +1915,9 @@ def main():
 
         med_wide, q1_wide, q3_wide = price_result
         summary_scaled, summary_low, summary_high, hsl_scaled, bp_scaled = norm_result
+
+        # Hourly price lines (median/IQR by hour)
+        process_sced_price_lines_hour(day_dir, out, save_values_csv=True, per_fuel=True)
 
         # 4b) Average MW bid per fuel (skip first SCED step)
         process_average_mw_bid(summary_scaled, day_dir, out)

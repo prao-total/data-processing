@@ -1611,13 +1611,8 @@ def main():
         med_wide, q1_wide, q3_wide = price_result
         summary_scaled, summary_low, summary_high, hsl_scaled, bp_scaled = norm_result
 
-        # Hourly price lines (median/IQR by hour)
-        process_sced_price_lines_hour(day_dir, out, save_values_csv=True, per_fuel=True)
-
         # 4b) Average MW bid per fuel (skip first SCED step)
         process_average_mw_bid(summary_scaled, day_dir, out)
-        # 4c) Hourly normalized MW shapes
-        process_sced_normalized_lines_hour(day_dir, out, SAVE_NORMALIZED_SUMMARY_CSV)
 
         # 5) Price vs MW per fuel, with HSL & Base Point verticals
         plot_price_vs_mw_by_fuel(

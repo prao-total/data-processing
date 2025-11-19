@@ -343,6 +343,91 @@ def process_base_point_telemetered_output(day_dir: Path, plots_root: Path) -> No
         print(f"[WARN] {day}: failed to write telemetered error CSV: {e}")
 
 
+def process_base_point_monthlies(day_dir: Path, plots_root: Path, resource_type: str, save_values_csv: bool) -> None:
+    """
+    Aggregate Base Point for a specific Resource Type:
+      - Filter rows matching `resource_type`.
+      - Sum across units per timestamp, then aggregate by hour-of-day.
+      - Plot MW vs hour-of-day and optionally save the hourly values.
+    """
+    day = day_dir.name
+    csv_path = day_dir / "aggregation_Base_Point.csv"
+    if not csv_path.exists():
+        matches = list(day_dir.glob("aggregation_Base_Point*.csv")) or list(day_dir.glob("*Base*Point*.csv"))
+        if not matches:
+            print(f"[INFO] {day}: no Base Point file; skipping monthlies for {resource_type}.")
+            return
+        csv_path = matches[0]
+
+    try:
+        df = pd.read_csv(csv_path, dtype=str)
+    except Exception as e:
+        print(f"[ERROR] {day}: failed to read Base Point {csv_path.name}: {e}")
+        return
+
+    try:
+        name_col, type_col = normalize_key_columns(df)
+        ts_cols = detect_timestamp_columns(df, (name_col, type_col))
+    except Exception as e:
+        print(f"[ERROR] {day}: column detection failed for Base Point: {e}")
+        return
+
+    resource_norm = str(resource_type).strip().casefold()
+    fuels = df[type_col].astype(str).fillna("Unknown").str.strip()
+    mask = fuels.str.casefold() == resource_norm
+    if not mask.any():
+        print(f"[INFO] {day}: no rows with Resource Type '{resource_type}' in Base Point.")
+        return
+
+    filtered = df.loc[mask, ts_cols]
+    numeric = filtered.apply(pd.to_numeric, errors="coerce")
+    if numeric.empty:
+        print(f"[INFO] {day}: filtered Base Point data empty for {resource_type}.")
+        return
+
+    totals = numeric.sum(axis=0, skipna=True)
+    ts_index = pd.to_datetime(totals.index, errors="coerce")
+    valid_mask = ts_index.notna()
+    totals = totals[valid_mask]
+    ts_index = ts_index[valid_mask]
+    if totals.empty:
+        print(f"[INFO] {day}: no valid timestamps for Base Point monthlies ({resource_type}).")
+        return
+
+    series = pd.Series(totals.values, index=ts_index).sort_index()
+    hourly = series.groupby(series.index.hour).mean()
+    hours = list(range(24))
+    hourly = hourly.reindex(hours, fill_value=np.nan)
+
+    day_out = Path(plots_root) / day / "sced_base_point_monthlies"
+    day_out.mkdir(parents=True, exist_ok=True)
+
+    slug = re.sub(r"[^0-9A-Za-z]+", "_", resource_type).strip("_") or "fuel"
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    x = np.array(hours)
+    y = hourly.to_numpy(dtype=float)
+    ax.plot(x, y, marker="o", linewidth=2)
+    ax.set_title(f"{day} – Base Point (Fuel: {resource_type}) by Hour")
+    ax.set_xlabel("Hour of Day")
+    ax.set_ylabel("Aggregate MW")
+    ax.set_xticks(hours)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    out_png = day_out / f"{slug}_base_point_hourly.png"
+    plt.savefig(out_png, dpi=150)
+    plt.close(fig)
+    print(f"[OK] Saved: {out_png}")
+
+    if save_values_csv:
+        out_csv = day_out / f"{slug}_base_point_hourly.csv"
+        try:
+            pd.DataFrame({"hour": hours, "mw": y}).to_csv(out_csv, index=False)
+            print(f"[OK] Saved: {out_csv}")
+        except Exception as e:
+            print(f"[WARN] {day}: failed to write Base Point monthlies CSV: {e}")
+
+
 def process_average_bid_quantity(day_dir: Path, plots_root: Path) -> None:
     """
     Build a box/whisker plot of all SCED price values across steps, grouped by fuel.

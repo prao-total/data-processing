@@ -1979,6 +1979,14 @@ def main():
         process_base_point_telemetered_output(day_dir, out)
         # 1c) SCED price distribution by fuel (boxplot)
         process_average_bid_quantity(day_dir, out)
+        # 1d) Base Point monthlies
+        process_base_point_monthlies(day_dir, out, "CCGT90", save_values_csv=True, y_axis_max=33000.0, y_axis_min=10000.0)
+
+        rep_quantity_df = process_representative_quantity_curves(day_dir, out,resource_type="CCGT90",save_summary=True)
+        rep_price_df = process_representative_price_curves(day_dir, out,resource_type="CCGT90",save_summary=True)
+
+        # Plot the representative bid quantity pair
+        process_representative_bid_quantity_curves(day_dir, out, rep_quantity_df, rep_price_df)
         # 2) SCED price violins
         process_sced_violins_day(day_dir, out, SCED_SAVE_VALUES_CSV)
 

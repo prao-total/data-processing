@@ -428,7 +428,7 @@ def process_base_point_monthlies(day_dir: Path, plots_root: Path, resource_type:
             print(f"[WARN] {day}: failed to write Base Point monthlies CSV: {e}")
 
 
-def process_representative_quantity_curves(day_dir: Path, plots_root: Path, resource_type: str, save_summary: bool) -> None:
+def process_representative_quantity_curves(day_dir: Path, plots_root: Path, resource_type: str, save_summary: bool) -> Optional[pd.DataFrame]:
     """
     Build representative SCED quantity curves for a specific fuel:
       - Filter Base Point, HSL, and SCED MW steps to the requested resource_type (case-insensitive).
@@ -590,22 +590,25 @@ def process_representative_quantity_curves(day_dir: Path, plots_root: Path, reso
     plt.close(fig)
     print(f"[OK] Saved: {out_png}")
 
+    rep_df = pd.DataFrame({
+        "SCED Step": step_index.values,
+        "Representative MW": representative.values,
+        "Base Point MW": [bp_level] * len(representative),
+        "HSL MW": [hsl_level] * len(representative),
+    })
+
     if save_summary:
         rep_csv = out_dir / f"{slug}_representative_curve.csv"
         try:
-            rep_df = pd.DataFrame({
-                "SCED Step": step_index.values,
-                "Representative MW": representative.values,
-                "Base Point MW": [bp_level] * len(representative),
-                "HSL MW": [hsl_level] * len(representative),
-            })
             rep_df.to_csv(rep_csv, index=False)
             print(f"[OK] Saved: {rep_csv}")
         except Exception as e:
             print(f"[WARN] {day}: failed to write representative curve CSV: {e}")
 
+    return rep_df
 
-def process_representative_price_curves(day_dir: Path, plots_root: Path, resource_type: str, save_summary: bool) -> None:
+
+def process_representative_price_curves(day_dir: Path, plots_root: Path, resource_type: str, save_summary: bool) -> Optional[pd.DataFrame]:
     """
     Representative SCED price curve for a given fuel:
       - Filter all SCED price steps to the specified Resource Type.
@@ -711,17 +714,20 @@ def process_representative_price_curves(day_dir: Path, plots_root: Path, resourc
     plt.close(fig)
     print(f"[OK] Saved: {out_png}")
 
+    rep_df = pd.DataFrame({
+        "SCED Step": step_index.values,
+        "Representative Price": representative.values,
+    })
+
     if save_summary:
         rep_csv = out_dir / f"{slug}_representative_price_curve.csv"
         try:
-            rep_df = pd.DataFrame({
-                "SCED Step": step_index.values,
-                "Representative Price": representative.values,
-            })
             rep_df.to_csv(rep_csv, index=False)
             print(f"[OK] Saved: {rep_csv}")
         except Exception as e:
             print(f"[WARN] {day}: failed to write representative price curve CSV: {e}")
+
+    return rep_df
 
 def process_average_bid_quantity(day_dir: Path, plots_root: Path) -> None:
     """

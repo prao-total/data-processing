@@ -343,7 +343,13 @@ def process_base_point_telemetered_output(day_dir: Path, plots_root: Path) -> No
         print(f"[WARN] {day}: failed to write telemetered error CSV: {e}")
 
 
-def process_base_point_monthlies(day_dir: Path, plots_root: Path, resource_type: str, save_values_csv: bool) -> None:
+def process_base_point_monthlies(
+    day_dir: Path,
+    plots_root: Path,
+    resource_type: str,
+    save_values_csv: bool,
+    y_axis_max: Optional[float] = None,
+) -> None:
     """
     Aggregate Base Point for a specific Resource Type:
       - Filter rows matching `resource_type`.
@@ -411,6 +417,8 @@ def process_base_point_monthlies(day_dir: Path, plots_root: Path, resource_type:
     ax.set_title(f"{day} – Base Point (Fuel: {resource_type}) by Hour")
     ax.set_xlabel("Hour of Day")
     ax.set_ylabel("Aggregate MW")
+    if y_axis_max is not None:
+        ax.set_ylim(0.0, float(y_axis_max))
     ax.set_xticks(hours)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()

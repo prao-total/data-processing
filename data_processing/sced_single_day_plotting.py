@@ -729,6 +729,78 @@ def process_representative_price_curves(day_dir: Path, plots_root: Path, resourc
 
     return rep_df
 
+
+def process_representative_bid_quantity_curves(
+    day_dir: Path,
+    plots_root: Path,
+    rep_quantity_df: Optional[pd.DataFrame],
+    rep_price_df: Optional[pd.DataFrame],
+) -> Optional[pd.DataFrame]:
+    """
+    Join representative MW and price curves; plot Bid Price vs MW for matching SCED steps.
+    Base Point / HSL are plotted as vertical lines when available.
+    """
+    if rep_quantity_df is None or rep_price_df is None:
+        print("[INFO] Representative bid-quantity curves skipped (missing inputs).")
+        return None
+
+    required_qty = {"SCED Step", "Representative MW", "Base Point MW", "HSL MW"}
+    required_price = {"SCED Step", "Representative Price"}
+    if not required_qty.issubset(rep_quantity_df.columns) or not required_price.issubset(rep_price_df.columns):
+        print("[INFO] Representative bid-quantity curves skipped (missing required columns).")
+        return None
+
+    merged = (
+        rep_quantity_df[list(required_qty)]
+        .merge(rep_price_df[list(required_price)], on="SCED Step", how="inner")
+    )
+    merged = merged.dropna(subset=["Representative MW", "Representative Price"])
+    if merged.empty:
+        print("[INFO] Representative bid-quantity curves skipped (no matching SCED steps with data).")
+        return None
+
+    bp_level = pd.to_numeric(merged["Base Point MW"], errors="coerce").mean()
+    hsl_level = pd.to_numeric(merged["HSL MW"], errors="coerce").mean()
+
+    day = day_dir.name
+    out_dir = Path(plots_root) / day / "sced_representative_bid_curves"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    x = pd.to_numeric(merged["Representative MW"], errors="coerce").to_numpy(dtype=float)
+    y = pd.to_numeric(merged["Representative Price"], errors="coerce").to_numpy(dtype=float)
+    ax.plot(x, y, marker="o", linewidth=2)
+    for mw_val, price_val, step in zip(x, y, merged["SCED Step"].astype(int)):
+        if np.isfinite(mw_val) and np.isfinite(price_val):
+            ax.annotate(str(step), xy=(mw_val, price_val),
+                        textcoords="offset points", xytext=(4, 4), fontsize=8)
+
+    if np.isfinite(bp_level):
+        ax.axvline(bp_level, linestyle="--", linewidth=1.5, color="#1f77b4", label="Base Point (MW)")
+    if np.isfinite(hsl_level):
+        ax.axvline(hsl_level, linestyle="--", linewidth=1.5, color="#ff7f0e", label="HSL (MW)")
+
+    ax.set_title(f"{day} – Representative Bid Quantity Curve")
+    ax.set_xlabel("Aggregate MW")
+    ax.set_ylabel("Bid Price ($/MWh)")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    out_png = out_dir / "representative_bid_curve.png"
+    plt.savefig(out_png, dpi=150)
+    plt.close(fig)
+    print(f"[OK] Saved: {out_png}")
+
+    out_csv = out_dir / "representative_bid_curve.csv"
+    try:
+        merged.to_csv(out_csv, index=False)
+        print(f"[OK] Saved: {out_csv}")
+    except Exception as e:
+        print(f"[WARN] {day}: failed to write representative bid curve CSV: {e}")
+
+    return merged
+
+
 def process_average_bid_quantity(day_dir: Path, plots_root: Path) -> None:
     """
     Build a box/whisker plot of all SCED price values across steps, grouped by fuel.

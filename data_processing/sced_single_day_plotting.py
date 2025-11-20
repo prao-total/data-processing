@@ -562,7 +562,8 @@ def process_representative_quantity_curves(day_dir: Path, plots_root: Path, reso
     hsl_scaled = np.nanmean(hsl_norm, axis=0) * avg_max
 
     ts_index = pd.to_datetime(common_ts)
-    curves_only = pd.DataFrame(scaled, index=ts_index, columns=steps_sorted)
+    step_index = pd.Index(steps_sorted, name="SCED Step")
+    curves_only = pd.DataFrame(scaled, index=ts_index, columns=step_index)
     representative = curves_only.mean(axis=0, skipna=True)
     bp_level = float(np.nanmean(bp_scaled)) if np.isfinite(bp_scaled).any() else np.nan
     hsl_level = float(np.nanmean(hsl_scaled)) if np.isfinite(hsl_scaled).any() else np.nan
@@ -572,7 +573,7 @@ def process_representative_quantity_curves(day_dir: Path, plots_root: Path, reso
     slug = re.sub(r"[^0-9A-Za-z]+", "_", resource_type).strip("_") or "fuel"
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(representative.index.values, representative.to_numpy(dtype=float), marker="o", linewidth=2)
+    ax.plot(step_index.values, representative.to_numpy(dtype=float), marker="o", linewidth=2)
     if np.isfinite(bp_level):
         ax.axhline(bp_level, linestyle="--", linewidth=1.5, color="#1f77b4", label="Base Point")
     if np.isfinite(hsl_level):
@@ -580,7 +581,7 @@ def process_representative_quantity_curves(day_dir: Path, plots_root: Path, reso
     ax.set_title(f"{day} – Representative Quantity Curve (Fuel: {resource_type})")
     ax.set_xlabel("SCED Step")
     ax.set_ylabel("MW")
-    ax.set_xticks(representative.index.values)
+    ax.set_xticks(step_index.values)
     ax.grid(True, alpha=0.3)
     ax.legend()
     fig.tight_layout()
@@ -593,7 +594,7 @@ def process_representative_quantity_curves(day_dir: Path, plots_root: Path, reso
         rep_csv = out_dir / f"{slug}_representative_curve.csv"
         try:
             rep_df = pd.DataFrame({
-                "SCED Step": representative.index.values,
+                "SCED Step": step_index.values,
                 "Representative MW": representative.values,
                 "Base Point MW": [bp_level] * len(representative),
                 "HSL MW": [hsl_level] * len(representative),
@@ -689,7 +690,8 @@ def process_representative_price_curves(day_dir: Path, plots_root: Path, resourc
         return
 
     ts_index = pd.to_datetime(common_ts)
-    curves_df = pd.DataFrame(mean_curves, index=ts_index, columns=steps_sorted)
+    step_index = pd.Index(steps_sorted, name="SCED Step")
+    curves_df = pd.DataFrame(mean_curves, index=ts_index, columns=step_index)
     representative = curves_df.mean(axis=0, skipna=True)
 
     out_dir = Path(plots_root) / day / "sced_price_curve_representative"
@@ -697,11 +699,11 @@ def process_representative_price_curves(day_dir: Path, plots_root: Path, resourc
     slug = re.sub(r"[^0-9A-Za-z]+", "_", resource_type).strip("_") or "fuel"
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(representative.index.values, representative.to_numpy(dtype=float), marker="o", linewidth=2)
+    ax.plot(step_index.values, representative.to_numpy(dtype=float), marker="o", linewidth=2)
     ax.set_title(f"{day} – Representative Price Curve (Fuel: {resource_type})")
     ax.set_xlabel("SCED Step")
     ax.set_ylabel("Bid Price")
-    ax.set_xticks(representative.index.values)
+    ax.set_xticks(step_index.values)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     out_png = out_dir / f"{slug}_representative_price_curve.png"
@@ -713,7 +715,7 @@ def process_representative_price_curves(day_dir: Path, plots_root: Path, resourc
         rep_csv = out_dir / f"{slug}_representative_price_curve.csv"
         try:
             rep_df = pd.DataFrame({
-                "SCED Step": representative.index.values,
+                "SCED Step": step_index.values,
                 "Representative Price": representative.values,
             })
             rep_df.to_csv(rep_csv, index=False)

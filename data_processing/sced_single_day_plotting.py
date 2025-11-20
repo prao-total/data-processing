@@ -349,6 +349,7 @@ def process_base_point_monthlies(
     resource_type: str,
     save_values_csv: bool,
     y_axis_max: Optional[float] = None,
+    y_axis_min: Optional[float] = None,
 ) -> None:
     """
     Aggregate Base Point for a specific Resource Type:
@@ -417,8 +418,13 @@ def process_base_point_monthlies(
     ax.set_title(f"{day} – Base Point (Fuel: {resource_type}) by Hour")
     ax.set_xlabel("Hour of Day")
     ax.set_ylabel("Aggregate MW")
-    if y_axis_max is not None:
-        ax.set_ylim(0.0, float(y_axis_max))
+    if y_axis_min is not None or y_axis_max is not None:
+        ylim = [ax.get_ylim()[0], ax.get_ylim()[1]]
+        if y_axis_min is not None:
+            ylim[0] = float(y_axis_min)
+        if y_axis_max is not None:
+            ylim[1] = float(y_axis_max)
+        ax.set_ylim(ylim)
     ax.set_xticks(hours)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()

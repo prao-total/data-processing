@@ -16,6 +16,8 @@ OUTPUT:
       OUTPUT_DIR/<YYYY-MM-DD>/<original_filename>
 - For each requested MONTH (YYYY-MM), write:
       OUTPUT_DIR/<YYYY-MM>/<original_filename>
+- For each requested HOUR (e.g., "2025-01-15 07:00 AM"), write:
+      OUTPUT_DIR/<YYYY-MM-DD_HHMM>/<original_filename>
 - Only the timestamp columns within the chosen period are kept, in chronological order.
 
 USAGE (hardcoded variables or CLI flags):
@@ -23,7 +25,8 @@ USAGE (hardcoded variables or CLI flags):
       --input-dir "/path/to/input" \
       --output-dir "/path/to/output" \
       --days 2025-01-15 2025-01-16 \
-      --months 2025-01 2025-02
+      --months 2025-01 2025-02 \
+      --hours "2025-01-15 07:00 AM"
 """
 
 from __future__ import annotations
@@ -41,6 +44,7 @@ INPUT_DIR  = r"/path/to/input_dir"     # folder containing aggregate_*.csv or ag
 OUTPUT_DIR = r"/path/to/output_dir"    # destination root folder
 DAYS       = []                        # e.g. ["2025-01-15", "2025-01-16"]
 MONTHS     = []                        # e.g. ["2025-01", "2025-02"]
+HOURS      = []                        # e.g. ["2025-01-15 07:00 AM"]
 # -----------------------------------------------------------------------------------
 
 
@@ -116,6 +120,22 @@ def subset_for_month(df: pd.DataFrame, key_cols: Tuple[str, str], ts_map: Dict[p
     return df.loc[:, cols]
 
 
+def subset_for_hour(
+    df: pd.DataFrame,
+    key_cols: Tuple[str, str],
+    ts_map: Dict[pd.Timestamp, str],
+    hour_start: pd.Timestamp,
+) -> pd.DataFrame:
+    """
+    Select only the timestamp columns that fall within the one-hour period starting at hour_start.
+    """
+    hour_end = hour_start + pd.Timedelta(hours=1)
+    cols = [key_cols[0], key_cols[1]]
+    hour_ts = sorted([ts for ts in ts_map.keys() if hour_start <= ts < hour_end])
+    cols += [ts_map[ts] for ts in hour_ts if ts_map[ts] in df.columns]
+    return df.loc[:, cols]
+
+
 def write_subset(out_folder: Path, filename: str, subset_df: pd.DataFrame, period_label: str) -> None:
     """
     Write the subset DataFrame to out_folder/filename.
@@ -139,12 +159,14 @@ def process_directory(
     output_dir: Path,
     days: List[str],
     months: List[str],
+    hours: List[str],
     patterns: List[str] = None,
 ) -> None:
     """
     For each CSV in input_dir matching patterns (default: aggregate_*.csv and aggregation_*.csv),
     write one output per requested day into output_dir/<YYYY-MM-DD>/ with the same filename,
-    and one output per requested month into output_dir/<YYYY-MM>/ with the same filename.
+    one output per requested month into output_dir/<YYYY-MM>/, and one output per requested hour into
+    output_dir/<YYYY-MM-DD_HHMM>/.
     """
     input_dir = input_dir.resolve()
     output_dir = output_dir.resolve()
@@ -165,6 +187,14 @@ def process_directory(
     days_norm = [pd.to_datetime(d).strftime("%Y-%m-%d") for d in days] if days else []
     # Normalize months: keep as YYYY-MM
     months_norm = [pd.to_datetime(f"{m}-01").strftime("%Y-%m") for m in months] if months else []
+    # Normalize hours: store as naive pd.Timestamp (minute resolution preserved)
+    hours_norm = []
+    if hours:
+        for h in hours:
+            ts = pd.to_datetime(h)
+            if getattr(ts, "tzinfo", None) is not None:
+                ts = ts.tz_localize(None)
+            hours_norm.append(pd.Timestamp(ts))
 
     for csv_path in csv_paths:
         # Read as strings to preserve exact values/headers
@@ -198,13 +228,22 @@ def process_directory(
             month_folder = output_dir / month
             write_subset(month_folder, csv_path.name, month_df, period_label=f"month {month}")
 
+        # Per-hour outputs
+        for hour_start in hours_norm:
+            hour_df = subset_for_hour(df, key_cols, ts_map, hour_start)
+            hour_label = hour_start.strftime("%Y-%m-%d_%H%M")
+            hour_folder = output_dir / hour_label
+            pretty_label = hour_start.strftime("%Y-%m-%d %I:%M %p")
+            write_subset(hour_folder, csv_path.name, hour_df, period_label=f"hour starting {pretty_label}")
+
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Extract selected days and/or months from wide 5-minute CSVs.")
+    p = argparse.ArgumentParser(description="Extract selected days, months, or hours from wide 5-minute CSVs.")
     p.add_argument("--input-dir", type=str, default=INPUT_DIR, help="Folder with aggregate_*.csv or aggregation_*.csv")
     p.add_argument("--output-dir", type=str, default=OUTPUT_DIR, help="Destination root folder")
     p.add_argument("--days", type=str, nargs="*", default=DAYS, help='Days to extract (YYYY-MM-DD), e.g., 2025-01-15 2025-01-16')
     p.add_argument("--months", type=str, nargs="*", default=MONTHS, help='Months to extract (YYYY-MM), e.g., 2025-01 2025-02')
+    p.add_argument("--hours", type=str, nargs="*", default=HOURS, help='Hour-long windows to extract, e.g., "2025-01-15 07:00 AM"')
     return p.parse_args()
 
 
@@ -222,6 +261,7 @@ def main():
         output_dir=output_dir,
         days=args.days,
         months=args.months,
+        hours=args.hours,
     )
 
 

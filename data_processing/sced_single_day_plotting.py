@@ -428,6 +428,299 @@ def process_base_point_monthlies(day_dir: Path, plots_root: Path, resource_type:
             print(f"[WARN] {day}: failed to write Base Point monthlies CSV: {e}")
 
 
+def process_representative_quantity_curves(day_dir: Path, plots_root: Path, resource_type: str, save_summary: bool) -> None:
+    """
+    Build representative SCED quantity curves for a specific fuel:
+      - Filter Base Point, HSL, and SCED MW steps to the requested resource_type (case-insensitive).
+      - For each resource, assemble its SCED curve across steps per timestamp, normalize by its max, and
+        keep the max for scaling.
+      - Average normalized curves across resources per timestamp → multiply by averaged max → representative curve.
+      - Plot MW vs SCED Step; optionally save the per-timestamp curves and representative curve to CSV.
+    """
+    day = day_dir.name
+
+    # Base Point + HSL (only to validate presence)
+    bp_path = day_dir / "aggregation_Base_Point.csv"
+    if not bp_path.exists():
+        matches = list(day_dir.glob("aggregation_Base_Point*.csv")) or list(day_dir.glob("*Base*Point*.csv"))
+        if not matches:
+            print(f"[INFO] {day}: no Base Point file; skipping representative curve for {resource_type}.")
+            return
+        bp_path = matches[0]
+    hsl_path = day_dir / "aggregation_HSL.csv"
+    if not hsl_path.exists():
+        matches = list(day_dir.glob("*HSL*.csv"))
+        if not matches:
+            print(f"[INFO] {day}: no HSL file; skipping representative curve for {resource_type}.")
+            return
+        hsl_path = matches[0]
+    try:
+        bp_df = pd.read_csv(bp_path, dtype=str)
+        hsl_df = pd.read_csv(hsl_path, dtype=str)
+    except Exception as e:
+        print(f"[ERROR] {day}: failed to read Base Point/HSL: {e}")
+        return
+
+    resource_norm = str(resource_type).strip().casefold()
+
+    def _prep_filtered_matrix(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+        name_col, type_col = normalize_key_columns(df)
+        ts_cols = detect_timestamp_columns(df, (name_col, type_col))
+        mask = df[type_col].astype(str).fillna("Unknown").str.strip().str.casefold() == resource_norm
+        filt = df.loc[mask].copy()
+        if filt.empty:
+            return pd.DataFrame(), []
+        filt["_key"] = filt[name_col].astype(str).str.strip().str.casefold()
+        filt = filt.drop_duplicates(subset=["_key"], keep="first").set_index("_key")
+        ts_cols_sorted = sorted(ts_cols, key=lambda c: pd.to_datetime(c))
+        return filt.reindex(columns=ts_cols_sorted), ts_cols_sorted
+
+    bp_filtered, bp_ts_cols = _prep_filtered_matrix(bp_df)
+    hsl_filtered, hsl_ts_cols = _prep_filtered_matrix(hsl_df)
+    if bp_filtered.empty or hsl_filtered.empty:
+        print(f"[INFO] {day}: No Base Point/HSL rows for Resource Type '{resource_type}'.")
+        return
+
+    mw_files = list(day_dir.glob("aggregation_SCED1_Curve-MW*.csv"))
+    if not mw_files:
+        mw_files = list(day_dir.glob("*SCED*Curve*MW*.csv"))
+    if not mw_files:
+        print(f"[INFO] {day}: no SCED MW step files; skipping representative curve for {resource_type}.")
+        return
+
+    def step_key(p: Path):
+        m = MW_STEP_PATTERN.search(p.name)
+        return int(m.group(1)) if m else 1_000_000
+    mw_files = sorted(mw_files, key=step_key)
+
+    filtered_steps: Dict[int, pd.DataFrame] = {}
+    ts_by_step: Dict[int, List[str]] = {}
+    for p in mw_files:
+        try:
+            df = pd.read_csv(p, dtype=str)
+        except Exception as e:
+            print(f"[WARN] {day}: failed to read {p.name}: {e}")
+            continue
+        filt, ts_cols_sorted = _prep_filtered_matrix(df)
+        if filt.empty:
+            continue
+        step = step_key(p)
+        filtered_steps[step] = filt
+        ts_by_step[step] = ts_cols_sorted
+
+    if not filtered_steps:
+        print(f"[INFO] {day}: no SCED rows for Resource Type '{resource_type}'.")
+        return
+
+    steps_sorted = sorted(filtered_steps.keys())
+    bp_keys = set(bp_filtered.index)
+    hsl_keys = set(hsl_filtered.index)
+    step_key_sets = [set(df.index) for df in filtered_steps.values()]
+    common_keys = sorted(set.intersection(*(step_key_sets + [bp_keys, hsl_keys])))
+    if not common_keys:
+        print(f"[INFO] {day}: no overlapping resources across SCED steps for '{resource_type}'.")
+        return
+    common_ts = sorted(
+        set.intersection(
+            *( [set(ts_by_step[s]) for s in steps_sorted] + [set(bp_ts_cols), set(hsl_ts_cols)] )
+        ),
+        key=lambda c: pd.to_datetime(c)
+    )
+    if not common_ts:
+        print(f"[INFO] {day}: no common timestamps across SCED steps for '{resource_type}'.")
+        return
+
+    # Build 3D array: steps x keys x times
+    n_steps = len(steps_sorted)
+    n_keys = len(common_keys)
+    n_times = len(common_ts)
+    curves = np.full((n_steps, n_keys, n_times), np.nan, dtype=float)
+    for i, step in enumerate(steps_sorted):
+        df = filtered_steps[step].reindex(index=common_keys, columns=common_ts)
+        curves[i, :, :] = df.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+
+    # Max per resource/timestamp
+    with np.errstate(all="ignore"):
+        max_vals = np.nanmax(curves, axis=0)  # (keys, times)
+    max_vals[~np.isfinite(max_vals)] = np.nan
+    if np.isnan(max_vals).all():
+        print(f"[INFO] {day}: SCED curves all NaN for '{resource_type}'.")
+        return
+
+    # Normalize curves per resource per timestamp
+    with np.errstate(all="ignore"):
+        norm_curves = curves / max_vals[np.newaxis, :, :]
+        bp_norm = bp_filtered.reindex(index=common_keys, columns=common_ts).apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float) / max_vals
+        hsl_norm = hsl_filtered.reindex(index=common_keys, columns=common_ts).apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float) / max_vals
+
+    # Average normalized curves across resources per timestamp (times x steps)
+    mean_norm = np.nanmean(norm_curves, axis=1).transpose(1, 0)  # (times, steps)
+    avg_max = np.nanmean(max_vals, axis=0)  # (times,)
+    scaled = mean_norm * avg_max[:, None]
+
+    bp_scaled = np.nanmean(bp_norm, axis=0) * avg_max
+    hsl_scaled = np.nanmean(hsl_norm, axis=0) * avg_max
+
+    ts_index = pd.to_datetime(common_ts)
+    curves_only = pd.DataFrame(scaled, index=ts_index, columns=steps_sorted)
+    representative = curves_only.mean(axis=0, skipna=True)
+    bp_level = float(np.nanmean(bp_scaled)) if np.isfinite(bp_scaled).any() else np.nan
+    hsl_level = float(np.nanmean(hsl_scaled)) if np.isfinite(hsl_scaled).any() else np.nan
+
+    out_dir = Path(plots_root) / day / "sced_quantity_curve_representative"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    slug = re.sub(r"[^0-9A-Za-z]+", "_", resource_type).strip("_") or "fuel"
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(representative.index.values, representative.to_numpy(dtype=float), marker="o", linewidth=2)
+    if np.isfinite(bp_level):
+        ax.axhline(bp_level, linestyle="--", linewidth=1.5, color="#1f77b4", label="Base Point")
+    if np.isfinite(hsl_level):
+        ax.axhline(hsl_level, linestyle="--", linewidth=1.5, color="#ff7f0e", label="HSL")
+    ax.set_title(f"{day} – Representative Quantity Curve (Fuel: {resource_type})")
+    ax.set_xlabel("SCED Step")
+    ax.set_ylabel("MW")
+    ax.set_xticks(representative.index.values)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    out_png = out_dir / f"{slug}_representative_curve.png"
+    plt.savefig(out_png, dpi=150)
+    plt.close(fig)
+    print(f"[OK] Saved: {out_png}")
+
+    if save_summary:
+        rep_csv = out_dir / f"{slug}_representative_curve.csv"
+        try:
+            rep_df = pd.DataFrame({
+                "SCED Step": representative.index.values,
+                "Representative MW": representative.values,
+                "Base Point MW": [bp_level] * len(representative),
+                "HSL MW": [hsl_level] * len(representative),
+            })
+            rep_df.to_csv(rep_csv, index=False)
+            print(f"[OK] Saved: {rep_csv}")
+        except Exception as e:
+            print(f"[WARN] {day}: failed to write representative curve CSV: {e}")
+
+
+def process_representative_price_curves(day_dir: Path, plots_root: Path, resource_type: str, save_summary: bool) -> None:
+    """
+    Representative SCED price curve for a given fuel:
+      - Filter all SCED price steps to the specified Resource Type.
+      - Construct per-resource SCED price curves across steps and average them per timestamp.
+      - Average across timestamps to obtain a single SCED-step price curve.
+      - Plot Bid Price vs SCED Step and optionally save the curve to CSV.
+    """
+    day = day_dir.name
+
+    # find price step files (same discovery as process_sced_price_lines_day)
+    step_files = list(day_dir.glob("aggregation_SCED1_Curve-Price*.csv"))
+    if not step_files:
+        step_files = list(day_dir.glob("*SCED*Curve*Price*.csv"))
+    if not step_files:
+        print(f"[INFO] {day}: no SCED price files; skipping representative price curves.")
+        return
+
+    def step_key(p: Path):
+        m = PRICE_STEP_PATTERN.search(p.name)
+        return int(m.group(1)) if m else 1_000_000
+    step_files = sorted(step_files, key=step_key)
+
+    resource_norm = str(resource_type).strip().casefold()
+
+    def _prep_filtered_matrix(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+        name_col, type_col = normalize_key_columns(df)
+        ts_cols = detect_timestamp_columns(df, (name_col, type_col))
+        mask = df[type_col].astype(str).fillna("Unknown").str.strip().str.casefold() == resource_norm
+        filt = df.loc[mask].copy()
+        if filt.empty:
+            return pd.DataFrame(), []
+        filt["_key"] = filt[name_col].astype(str).str.strip().str.casefold()
+        filt = filt.drop_duplicates(subset=["_key"], keep="first").set_index("_key")
+        ts_cols_sorted = sorted(ts_cols, key=lambda c: pd.to_datetime(c))
+        return filt.reindex(columns=ts_cols_sorted), ts_cols_sorted
+
+    filtered_steps: Dict[int, pd.DataFrame] = {}
+    ts_by_step: Dict[int, List[str]] = {}
+    for p in step_files:
+        try:
+            df = pd.read_csv(p, dtype=str)
+        except Exception as e:
+            print(f"[WARN] {day}: failed to read {p.name}: {e}")
+            continue
+        filt, ts_cols_sorted = _prep_filtered_matrix(df)
+        if filt.empty:
+            continue
+        step = step_key(p)
+        filtered_steps[step] = filt
+        ts_by_step[step] = ts_cols_sorted
+
+    if not filtered_steps:
+        print(f"[INFO] {day}: no SCED price rows for Resource Type '{resource_type}'.")
+        return
+
+    steps_sorted = sorted(filtered_steps.keys())
+    common_keys = sorted(set.intersection(*(set(df.index) for df in filtered_steps.values())))
+    if not common_keys:
+        print(f"[INFO] {day}: no overlapping resources across SCED price steps for '{resource_type}'.")
+        return
+
+    common_ts = sorted(
+        set.intersection(*(set(ts_by_step[s]) for s in steps_sorted)),
+        key=lambda c: pd.to_datetime(c)
+    )
+    if not common_ts:
+        print(f"[INFO] {day}: no common timestamps across SCED price steps for '{resource_type}'.")
+        return
+
+    n_steps = len(steps_sorted)
+    n_keys = len(common_keys)
+    n_times = len(common_ts)
+    curves = np.full((n_steps, n_keys, n_times), np.nan, dtype=float)
+    for i, step in enumerate(steps_sorted):
+        df = filtered_steps[step].reindex(index=common_keys, columns=common_ts)
+        curves[i, :, :] = df.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+
+    with np.errstate(all="ignore"):
+        mean_curves = np.nanmean(curves, axis=1).transpose(1, 0)  # (times, steps)
+    if np.isnan(mean_curves).all():
+        print(f"[INFO] {day}: SCED price curves all NaN for '{resource_type}'.")
+        return
+
+    ts_index = pd.to_datetime(common_ts)
+    curves_df = pd.DataFrame(mean_curves, index=ts_index, columns=steps_sorted)
+    representative = curves_df.mean(axis=0, skipna=True)
+
+    out_dir = Path(plots_root) / day / "sced_price_curve_representative"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    slug = re.sub(r"[^0-9A-Za-z]+", "_", resource_type).strip("_") or "fuel"
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(representative.index.values, representative.to_numpy(dtype=float), marker="o", linewidth=2)
+    ax.set_title(f"{day} – Representative Price Curve (Fuel: {resource_type})")
+    ax.set_xlabel("SCED Step")
+    ax.set_ylabel("Bid Price")
+    ax.set_xticks(representative.index.values)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    out_png = out_dir / f"{slug}_representative_price_curve.png"
+    plt.savefig(out_png, dpi=150)
+    plt.close(fig)
+    print(f"[OK] Saved: {out_png}")
+
+    if save_summary:
+        rep_csv = out_dir / f"{slug}_representative_price_curve.csv"
+        try:
+            rep_df = pd.DataFrame({
+                "SCED Step": representative.index.values,
+                "Representative Price": representative.values,
+            })
+            rep_df.to_csv(rep_csv, index=False)
+            print(f"[OK] Saved: {rep_csv}")
+        except Exception as e:
+            print(f"[WARN] {day}: failed to write representative price curve CSV: {e}")
+
 def process_average_bid_quantity(day_dir: Path, plots_root: Path) -> None:
     """
     Build a box/whisker plot of all SCED price values across steps, grouped by fuel.

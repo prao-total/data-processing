@@ -116,7 +116,7 @@ def hourly_by_fuel_from_wide(df: pd.DataFrame, agg_mode: str) -> pd.DataFrame:
 def plot_base_point_day(day: str, hourly_df: pd.DataFrame, out_png: Path, agg_mode: str) -> None:
     if hourly_df.empty:
         print(f"[WARN] {day}: no hourly data; skipping Base Point plot.")
-        return
+        return None
 
     day_start = pd.to_datetime(day)
     day_end   = day_start + pd.Timedelta(days=1)
@@ -498,7 +498,13 @@ def process_base_point_monthlies(
             print(f"[WARN] {day}: failed to write Base Point monthlies CSV: {e}")
 
 
-def process_representative_quantity_curves(day_dir: Path, plots_root: Path, resource_type: str, save_summary: bool) -> Optional[pd.DataFrame]:
+def process_representative_quantity_curves(
+    day_dir: Path,
+    plots_root: Path,
+    resource_type: str,
+    save_summary: bool,
+    price_location: Optional[str] = None,
+) -> Optional[pd.DataFrame]:
     """
     Build representative SCED quantity curves for a specific fuel:
       - Filter Base Point, HSL, and SCED MW steps to the requested resource_type (case-insensitive).
@@ -515,14 +521,14 @@ def process_representative_quantity_curves(day_dir: Path, plots_root: Path, reso
         matches = list(day_dir.glob("aggregation_Base_Point*.csv")) or list(day_dir.glob("*Base*Point*.csv"))
         if not matches:
             print(f"[INFO] {day}: no Base Point file; skipping representative curve for {resource_type}.")
-            return
+        return None
         bp_path = matches[0]
     hsl_path = day_dir / "aggregation_HSL.csv"
     if not hsl_path.exists():
         matches = list(day_dir.glob("*HSL*.csv"))
         if not matches:
             print(f"[INFO] {day}: no HSL file; skipping representative curve for {resource_type}.")
-            return
+        return None
         hsl_path = matches[0]
     try:
         bp_df = pd.read_csv(bp_path, dtype=str)
@@ -665,6 +671,8 @@ def process_representative_quantity_curves(day_dir: Path, plots_root: Path, reso
         "Representative MW": representative.values,
         "Base Point MW": [bp_level] * len(representative),
         "HSL MW": [hsl_level] * len(representative),
+        "Min Timestamp": [ts_index.min()] * len(representative),
+        "Max Timestamp": [ts_index.max()] * len(representative),
     })
 
     if save_summary:
@@ -787,6 +795,8 @@ def process_representative_price_curves(day_dir: Path, plots_root: Path, resourc
     rep_df = pd.DataFrame({
         "SCED Step": step_index.values,
         "Representative Price": representative.values,
+        "Min Timestamp": [ts_index.min()] * len(representative),
+        "Max Timestamp": [ts_index.max()] * len(representative),
     })
 
     if save_summary:
@@ -805,6 +815,7 @@ def process_representative_bid_quantity_curves(
     plots_root: Path,
     rep_quantity_df: Optional[pd.DataFrame],
     rep_price_df: Optional[pd.DataFrame],
+    price_location: Optional[str] = None,
 ) -> Optional[pd.DataFrame]:
     """
     Join representative MW and price curves; plot Bid Price vs MW for matching SCED steps.
@@ -832,6 +843,40 @@ def process_representative_bid_quantity_curves(
     bp_level = pd.to_numeric(merged["Base Point MW"], errors="coerce").mean()
     hsl_level = pd.to_numeric(merged["HSL MW"], errors="coerce").mean()
 
+    # Determine time window for price overlay
+    min_ts = max_ts = None
+    if "Min Timestamp" in rep_quantity_df.columns and "Max Timestamp" in rep_quantity_df.columns:
+        min_ts = pd.to_datetime(rep_quantity_df["Min Timestamp"].min(), errors="coerce")
+        max_ts = pd.to_datetime(rep_quantity_df["Max Timestamp"].max(), errors="coerce")
+    if "Min Timestamp" in rep_price_df.columns and "Max Timestamp" in rep_price_df.columns:
+        min_ts_price = pd.to_datetime(rep_price_df["Min Timestamp"].min(), errors="coerce")
+        max_ts_price = pd.to_datetime(rep_price_df["Max Timestamp"].max(), errors="coerce")
+        if pd.notna(min_ts_price):
+            min_ts = min_ts_price if (min_ts is None or min_ts_price > min_ts) else min_ts
+        if pd.notna(max_ts_price):
+            max_ts = max_ts_price if (max_ts is None or max_ts_price < max_ts) else max_ts
+
+    price_avg = price_q1 = price_q3 = np.nan
+    price_series = None
+    if price_location and min_ts is not None and max_ts is not None:
+        price_files = list(Path(PRICE_DIR).glob(f"{price_location}_rtlmp_bus*_hourly*.csv"))
+        if price_files:
+            price_path = price_files[0]
+            try:
+                price_df = pd.read_csv(price_path, dtype=str)
+                price_df["DATETIME"] = pd.to_datetime(price_df["DATETIME"], errors="coerce")
+                price_df["AVGVALUE"] = pd.to_numeric(price_df["AVGVALUE"], errors="coerce")
+                mask = (price_df["DATETIME"] >= min_ts) & (price_df["DATETIME"] <= max_ts)
+                subset = price_df.loc[mask, "AVGVALUE"]
+                subset = subset[np.isfinite(subset)]
+                if not subset.empty:
+                    price_avg = float(subset.mean())
+                    price_q1 = float(subset.quantile(0.25))
+                    price_q3 = float(subset.quantile(0.75))
+                    price_series = subset
+            except Exception as e:
+                print(f"[WARN] Failed to process price overlay for {price_location}: {e}")
+
     day = day_dir.name
     out_dir = Path(plots_root) / day / "sced_representative_bid_curves"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -849,6 +894,17 @@ def process_representative_bid_quantity_curves(
         ax.axvline(bp_level, linestyle="--", linewidth=1.5, color="#1f77b4", label="Base Point (MW)")
     if np.isfinite(hsl_level):
         ax.axvline(hsl_level, linestyle="--", linewidth=1.5, color="#ff7f0e", label="HSL (MW)")
+    if np.isfinite(price_avg):
+        ax.axhline(price_avg, linestyle="--", linewidth=1.5, color="black", label="Avg Price")
+        if np.isfinite(price_q1) and np.isfinite(price_q3):
+            ax.fill_between(
+                [x.min(), x.max()],
+                price_q1,
+                price_q3,
+                color="gray",
+                alpha=0.15,
+                linewidth=0,
+            )
 
     ax.set_title(f"{day} – Representative Bid Quantity Curve")
     ax.set_xlabel("Aggregate MW")

@@ -48,7 +48,7 @@ import matplotlib.pyplot as plt
 # ===================== EDIT THESE =====================
 ROOT_DIR  = r"C:/Users/L1165683/GitHub_Repos/data-processing/output/sced_single_day_data"   # contains YYYY-MM-DD subfolders
 PLOTS_DIR = r"C:/Users/L1165683/GitHub_Repos/data-processing/output/sced_single_day_plotting_sced1"     # results written here, mirrored per-day
-PRICE_DIR = r"C:/Users/L1165683/GitHub_Repos/data-processing/output/sced_price_data"        # optional directory for price-specific inputs
+PRICE_DIR = r"C:/Users/L1165683/GitHub_Repos/yes-energy-extract/tests/outputs"        # optional directory for price-specific inputs
 # Optional toggles (leave as-is unless you want different behavior)
 BP_AGG_MODE = "mean"                  # "mean" (MW) or "mwh" (energy)
 BP_SAVE_HOURLY_CSV = True             # write hourly pivot per day
@@ -2036,7 +2036,7 @@ def main():
         # 1c) SCED price distribution by fuel (boxplot)
         process_average_bid_quantity(day_dir, out)
         # 1d) Base Point monthlies
-        process_base_point_monthlies(day_dir, out, "CCGT90", save_values_csv=True, y_axis_max=33000.0, y_axis_min=10000.0)
+        process_base_point_monthlies(day_dir, out, ["CCGT90", "CCLE90", "SCLE90", "SCGT90"], save_values_csv=True, price_location="HB_HUBAVG") # y_axis_max=33000.0, y_axis_min=10000.0
 
         rep_quantity_df = process_representative_quantity_curves(day_dir, out,resource_type="CCGT90",save_summary=True)
         rep_price_df = process_representative_price_curves(day_dir, out,resource_type="CCGT90",save_summary=True)

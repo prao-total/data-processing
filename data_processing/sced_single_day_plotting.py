@@ -48,6 +48,7 @@ import matplotlib.pyplot as plt
 # ===================== EDIT THESE =====================
 ROOT_DIR  = r"C:/Users/L1165683/GitHub_Repos/data-processing/output/sced_single_day_data"   # contains YYYY-MM-DD subfolders
 PLOTS_DIR = r"C:/Users/L1165683/GitHub_Repos/data-processing/output/sced_single_day_plotting_sced1"     # results written here, mirrored per-day
+PRICE_DIR = r"C:/Users/L1165683/GitHub_Repos/data-processing/output/sced_price_data"        # optional directory for price-specific inputs
 # Optional toggles (leave as-is unless you want different behavior)
 BP_AGG_MODE = "mean"                  # "mean" (MW) or "mwh" (energy)
 BP_SAVE_HOURLY_CSV = True             # write hourly pivot per day
@@ -350,19 +351,17 @@ def process_base_point_monthlies(
     save_values_csv: bool,
     y_axis_max: Optional[float] = None,
     y_axis_min: Optional[float] = None,
+    price_location: Optional[str] = None,
 ) -> None:
     """
-    Aggregate Base Point for a specific Resource Type:
-      - Filter rows matching `resource_type`.
-      - Sum across units per timestamp, then aggregate by hour-of-day.
-      - Plot MW vs hour-of-day and optionally save the hourly values.
+    Aggregate Base Point by fuel and hour; optional overlay of hourly price series.
     """
     day = day_dir.name
     csv_path = day_dir / "aggregation_Base_Point.csv"
     if not csv_path.exists():
         matches = list(day_dir.glob("aggregation_Base_Point*.csv")) or list(day_dir.glob("*Base*Point*.csv"))
         if not matches:
-            print(f"[INFO] {day}: no Base Point file; skipping monthlies for {resource_type}.")
+            print(f"[INFO] {day}: no Base Point file; skipping monthlies.")
             return
         csv_path = matches[0]
 
@@ -409,13 +408,36 @@ def process_base_point_monthlies(
             continue
 
         series = pd.Series(totals.values, index=ts_index).sort_index()
-        hourly = series.groupby(series.index.hour).mean()
-        hourly = hourly.reindex(hours, fill_value=np.nan)
-        hourly_data[resource_type] = hourly
+        hourly = series.groupby(series.index.hour).mean().reindex(hours, fill_value=np.nan)
+        hourly_data[str(resource_type)] = hourly
 
     if not hourly_data:
         print(f"[INFO] {day}: no Base Point monthlies generated (no matching fuels).")
         return
+
+    price_series: Optional[pd.Series] = None
+    if price_location:
+        price_files = list(Path(PRICE_DIR).glob(f"{price_location}_rtlmp_bus*_hourly*.csv"))
+        if not price_files:
+            print(f"[INFO] {day}: no price file found for {price_location}; skipping price overlay.")
+        else:
+            price_path = price_files[0]
+            try:
+                price_df = pd.read_csv(price_path, dtype=str)
+                price_df["DATETIME"] = pd.to_datetime(price_df["DATETIME"], errors="coerce")
+                price_df["AVGVALUE"] = pd.to_numeric(price_df["AVGVALUE"], errors="coerce")
+                day_dt = pd.to_datetime(day).date()
+                subset = price_df[price_df["DATETIME"].dt.date == day_dt]
+                if subset.empty:
+                    print(f"[INFO] {day}: no price rows for {price_location}; skipping price overlay.")
+                else:
+                    price_series = (
+                        subset.groupby(subset["DATETIME"].dt.hour)["AVGVALUE"]
+                        .mean()
+                        .reindex(hours, fill_value=np.nan)
+                    )
+            except Exception as e:
+                print(f"[WARN] {day}: failed to process price file {price_path.name}: {e}")
 
     fig, ax = plt.subplots(figsize=(10, 6))
     x = np.array(hours)
@@ -434,7 +456,28 @@ def process_base_point_monthlies(
         ax.set_ylim(ylim)
     ax.set_xticks(hours)
     ax.grid(True, alpha=0.3)
-    ax.legend()
+
+    price_handles = []
+    if price_series is not None and price_series.notna().any():
+        ax2 = ax.twinx()
+        ax2.bar(
+            x,
+            price_series.to_numpy(dtype=float),
+            color="black",
+            alpha=0.15,
+            label=f"{price_location} RTLMP",
+        )
+        ax2.set_ylabel("Price ($/MWh)")
+        price_handles = ax2.get_legend_handles_labels()
+
+    fuel_handles = ax.get_legend_handles_labels()
+    if fuel_handles:
+        handles, labels = fuel_handles
+        if price_handles:
+            handles += price_handles[0]
+            labels += price_handles[1]
+        ax.legend(handles, labels, loc="upper left")
+
     fig.tight_layout()
     out_png = day_out / "base_point_hourly.png"
     plt.savefig(out_png, dpi=150)
@@ -445,6 +488,8 @@ def process_base_point_monthlies(
         df_out = pd.DataFrame({"hour": hours})
         for fuel, ser in hourly_data.items():
             df_out[str(fuel)] = ser.to_numpy(dtype=float)
+        if price_series is not None:
+            df_out[str(price_location or "Price")] = price_series.to_numpy(dtype=float)
         out_csv = day_out / "base_point_hourly.csv"
         try:
             df_out.to_csv(out_csv, index=False)

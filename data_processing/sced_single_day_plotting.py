@@ -346,7 +346,7 @@ def process_base_point_telemetered_output(day_dir: Path, plots_root: Path) -> No
 def process_base_point_monthlies(
     day_dir: Path,
     plots_root: Path,
-    resource_type: str,
+    resource_types: Iterable[str],
     save_values_csv: bool,
     y_axis_max: Optional[float] = None,
     y_axis_min: Optional[float] = None,
@@ -379,43 +379,50 @@ def process_base_point_monthlies(
         print(f"[ERROR] {day}: column detection failed for Base Point: {e}")
         return
 
-    resource_norm = str(resource_type).strip().casefold()
-    fuels = df[type_col].astype(str).fillna("Unknown").str.strip()
-    mask = fuels.str.casefold() == resource_norm
-    if not mask.any():
-        print(f"[INFO] {day}: no rows with Resource Type '{resource_type}' in Base Point.")
-        return
-
-    filtered = df.loc[mask, ts_cols]
-    numeric = filtered.apply(pd.to_numeric, errors="coerce")
-    if numeric.empty:
-        print(f"[INFO] {day}: filtered Base Point data empty for {resource_type}.")
-        return
-
-    totals = numeric.sum(axis=0, skipna=True)
-    ts_index = pd.to_datetime(totals.index, errors="coerce")
-    valid_mask = ts_index.notna()
-    totals = totals[valid_mask]
-    ts_index = ts_index[valid_mask]
-    if totals.empty:
-        print(f"[INFO] {day}: no valid timestamps for Base Point monthlies ({resource_type}).")
-        return
-
-    series = pd.Series(totals.values, index=ts_index).sort_index()
-    hourly = series.groupby(series.index.hour).mean()
-    hours = list(range(24))
-    hourly = hourly.reindex(hours, fill_value=np.nan)
-
     day_out = Path(plots_root) / day / "sced_base_point_monthlies"
     day_out.mkdir(parents=True, exist_ok=True)
 
-    slug = re.sub(r"[^0-9A-Za-z]+", "_", resource_type).strip("_") or "fuel"
+    fuels_series = df[type_col].astype(str).fillna("Unknown").str.strip()
+    hours = list(range(24))
+    hourly_data: Dict[str, pd.Series] = {}
+
+    for resource_type in resource_types:
+        resource_norm = str(resource_type).strip().casefold()
+        mask = fuels_series.str.casefold() == resource_norm
+        if not mask.any():
+            print(f"[INFO] {day}: no rows with Resource Type '{resource_type}' in Base Point.")
+            continue
+
+        filtered = df.loc[mask, ts_cols]
+        numeric = filtered.apply(pd.to_numeric, errors="coerce")
+        if numeric.empty:
+            print(f"[INFO] {day}: filtered Base Point data empty for {resource_type}.")
+            continue
+
+        totals = numeric.sum(axis=0, skipna=True)
+        ts_index = pd.to_datetime(totals.index, errors="coerce")
+        valid_mask = ts_index.notna()
+        totals = totals[valid_mask]
+        ts_index = ts_index[valid_mask]
+        if totals.empty:
+            print(f"[INFO] {day}: no valid timestamps for Base Point monthlies ({resource_type}).")
+            continue
+
+        series = pd.Series(totals.values, index=ts_index).sort_index()
+        hourly = series.groupby(series.index.hour).mean()
+        hourly = hourly.reindex(hours, fill_value=np.nan)
+        hourly_data[resource_type] = hourly
+
+    if not hourly_data:
+        print(f"[INFO] {day}: no Base Point monthlies generated (no matching fuels).")
+        return
 
     fig, ax = plt.subplots(figsize=(10, 6))
     x = np.array(hours)
-    y = hourly.to_numpy(dtype=float)
-    ax.plot(x, y, marker="o", linewidth=2)
-    ax.set_title(f"{day} – Base Point (Fuel: {resource_type}) by Hour")
+    for fuel, ser in hourly_data.items():
+        ax.plot(x, ser.to_numpy(dtype=float), marker="o", linewidth=2, label=fuel)
+
+    ax.set_title(f"{day} – Base Point by Fuel and Hour")
     ax.set_xlabel("Hour of Day")
     ax.set_ylabel("Aggregate MW")
     if y_axis_min is not None or y_axis_max is not None:
@@ -427,16 +434,20 @@ def process_base_point_monthlies(
         ax.set_ylim(ylim)
     ax.set_xticks(hours)
     ax.grid(True, alpha=0.3)
+    ax.legend()
     fig.tight_layout()
-    out_png = day_out / f"{slug}_base_point_hourly.png"
+    out_png = day_out / "base_point_hourly.png"
     plt.savefig(out_png, dpi=150)
     plt.close(fig)
     print(f"[OK] Saved: {out_png}")
 
     if save_values_csv:
-        out_csv = day_out / f"{slug}_base_point_hourly.csv"
+        df_out = pd.DataFrame({"hour": hours})
+        for fuel, ser in hourly_data.items():
+            df_out[str(fuel)] = ser.to_numpy(dtype=float)
+        out_csv = day_out / "base_point_hourly.csv"
         try:
-            pd.DataFrame({"hour": hours, "mw": y}).to_csv(out_csv, index=False)
+            df_out.to_csv(out_csv, index=False)
             print(f"[OK] Saved: {out_csv}")
         except Exception as e:
             print(f"[WARN] {day}: failed to write Base Point monthlies CSV: {e}")

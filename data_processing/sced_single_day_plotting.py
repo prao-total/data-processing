@@ -498,6 +498,164 @@ def process_base_point_monthlies(
             print(f"[WARN] {day}: failed to write Base Point monthlies CSV: {e}")
 
 
+def process_base_point_monthlies_multiple(
+    day_dir: Path,
+    plots_root: Path,
+    resource_types: Iterable[str],
+    save_values_csv: bool,
+    y_axis_max: Optional[float] = None,
+    y_axis_min: Optional[float] = None,
+    price_locations: Optional[Iterable[str]] = None,
+) -> None:
+    """
+    Aggregate Base Point by fuel and hour; optional overlay of hourly price series.
+    """
+    day = day_dir.name
+    csv_path = day_dir / "aggregation_Base_Point.csv"
+    if not csv_path.exists():
+        matches = list(day_dir.glob("aggregation_Base_Point*.csv")) or list(day_dir.glob("*Base*Point*.csv"))
+        if not matches:
+            print(f"[INFO] {day}: no Base Point file; skipping monthlies.")
+            return
+        csv_path = matches[0]
+
+    try:
+        df = pd.read_csv(csv_path, dtype=str)
+    except Exception as e:
+        print(f"[ERROR] {day}: failed to read Base Point {csv_path.name}: {e}")
+        return
+
+    try:
+        name_col, type_col = normalize_key_columns(df)
+        ts_cols = detect_timestamp_columns(df, (name_col, type_col))
+    except Exception as e:
+        print(f"[ERROR] {day}: column detection failed for Base Point: {e}")
+        return
+
+    day_out = Path(plots_root) / day / "sced_base_point_monthlies_multiple"
+    day_out.mkdir(parents=True, exist_ok=True)
+
+    fuels_series = df[type_col].astype(str).fillna("Unknown").str.strip()
+    hours = list(range(24))
+    hourly_data: Dict[str, pd.Series] = {}
+
+    for resource_type in resource_types:
+        resource_norm = str(resource_type).strip().casefold()
+        mask = fuels_series.str.casefold() == resource_norm
+        if not mask.any():
+            print(f"[INFO] {day}: no rows with Resource Type '{resource_type}' in Base Point.")
+            continue
+
+        filtered = df.loc[mask, ts_cols]
+        numeric = filtered.apply(pd.to_numeric, errors="coerce")
+        if numeric.empty:
+            print(f"[INFO] {day}: filtered Base Point data empty for {resource_type}.")
+            continue
+
+        totals = numeric.sum(axis=0, skipna=True)
+        ts_index = pd.to_datetime(totals.index, errors="coerce")
+        valid_mask = ts_index.notna()
+        totals = totals[valid_mask]
+        ts_index = ts_index[valid_mask]
+        if totals.empty:
+            print(f"[INFO] {day}: no valid timestamps for Base Point monthlies ({resource_type}).")
+            continue
+
+        series = pd.Series(totals.values, index=ts_index).sort_index()
+        hourly = series.groupby(series.index.hour).mean().reindex(hours, fill_value=np.nan)
+        hourly_data[str(resource_type)] = hourly
+
+    if not hourly_data:
+        print(f"[INFO] {day}: no Base Point monthlies generated (no matching fuels).")
+        return
+
+    price_series_map: Dict[str, pd.Series] = {}
+    if price_locations:
+        for loc in price_locations:
+            loc_str = str(loc).strip()
+            price_files = list(Path(PRICE_DIR).glob(f"{loc_str}_rtlmp_bus*_hourly*.csv"))
+            if not price_files:
+                print(f"[INFO] {day}: no price file found for {loc_str}; skipping price overlay.")
+                continue
+            price_path = price_files[0]
+            try:
+                price_df = pd.read_csv(price_path, dtype=str)
+                price_df["DATETIME"] = pd.to_datetime(price_df["DATETIME"], errors="coerce")
+                price_df["AVGVALUE"] = pd.to_numeric(price_df["AVGVALUE"], errors="coerce")
+                day_dt = pd.to_datetime(day).date()
+                subset = price_df[price_df["DATETIME"].dt.date == day_dt]
+                if subset.empty:
+                    print(f"[INFO] {day}: no price rows for {loc_str}; skipping price overlay.")
+                    continue
+                price_series = (
+                    subset.groupby(subset["DATETIME"].dt.hour)["AVGVALUE"]
+                    .mean()
+                    .reindex(hours, fill_value=np.nan)
+                )
+                price_series_map[loc_str] = price_series
+            except Exception as e:
+                print(f"[WARN] {day}: failed to process price file {price_path.name}: {e}")
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    x = np.array(hours)
+    bottoms = np.zeros_like(x, dtype=float)
+    for fuel, ser in hourly_data.items():
+        y = ser.to_numpy(dtype=float)
+        ax.bar(x, y, bottom=bottoms, alpha=0.6, label=fuel)
+        bottoms = bottoms + np.nan_to_num(y, nan=0.0)
+
+    ax.set_title(f"{day} – Base Point by Fuel and Hour")
+    ax.set_xlabel("Hour of Day")
+    ax.set_ylabel("Aggregate MW")
+    if y_axis_min is not None or y_axis_max is not None:
+        ylim = [ax.get_ylim()[0], ax.get_ylim()[1]]
+        if y_axis_min is not None:
+            ylim[0] = float(y_axis_min)
+        if y_axis_max is not None:
+            ylim[1] = float(y_axis_max)
+        ax.set_ylim(ylim)
+    ax.set_xticks(hours)
+    ax.grid(True, alpha=0.3)
+
+    price_handles = []
+    if price_series_map:
+        ax2 = ax.twinx()
+        for loc, series in price_series_map.items():
+            if series.notna().any():
+                ax2.plot(x, series.to_numpy(dtype=float), linewidth=2, label=f"{loc} RTLMP")
+        ax2.set_ylabel("Price ($/MWh)")
+        price_handles = ax2.get_legend_handles_labels()
+
+    fuel_handles = ax.get_legend_handles_labels()
+    handles, labels = [], []
+    if fuel_handles:
+        handles, labels = fuel_handles
+    if price_handles:
+        handles += price_handles[0]
+        labels += price_handles[1]
+    if handles:
+        ax.legend(handles, labels, loc="upper left")
+
+    fig.tight_layout()
+    out_png = day_out / "base_point_hourly.png"
+    plt.savefig(out_png, dpi=150)
+    plt.close(fig)
+    print(f"[OK] Saved: {out_png}")
+
+    if save_values_csv:
+        df_out = pd.DataFrame({"hour": hours})
+        for fuel, ser in hourly_data.items():
+            df_out[str(fuel)] = ser.to_numpy(dtype=float)
+        for loc, series in price_series_map.items():
+            df_out[str(loc)] = series.to_numpy(dtype=float)
+        out_csv = day_out / "base_point_hourly.csv"
+        try:
+            df_out.to_csv(out_csv, index=False)
+            print(f"[OK] Saved: {out_csv}")
+        except Exception as e:
+            print(f"[WARN] {day}: failed to write Base Point monthlies CSV: {e}")
+
+
 def process_representative_quantity_curves(
     day_dir: Path,
     plots_root: Path,
@@ -2093,6 +2251,8 @@ def main():
         process_average_bid_quantity(day_dir, out)
         # 1d) Base Point monthlies
         process_base_point_monthlies(day_dir, out, ["CCGT90", "CCLE90", "SCLE90", "SCGT90"], save_values_csv=True, price_location="HB_HUBAVG") # y_axis_max=33000.0, y_axis_min=10000.0
+        # 1e) Base Point monthlies with multiple price and fuels
+        process_base_point_monthlies_multiple(day_dir, out, ["CCGT90", "CCLE90", "SCLE90", "SCGT90"], ["HB_HOUSTON", "HB_NORTH", "HB_SOUTH", "HB_WEST"], save_values_csv=True)
 
         rep_quantity_df = process_representative_quantity_curves(day_dir, out,resource_type="CCGT90",save_summary=True)
         rep_price_df = process_representative_price_curves(day_dir, out,resource_type="CCGT90",save_summary=True)

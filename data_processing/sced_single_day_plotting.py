@@ -351,6 +351,8 @@ def process_base_point_monthlies(
     save_values_csv: bool,
     y_axis_max: Optional[float] = None,
     y_axis_min: Optional[float] = None,
+    sec_axis_max: Optional[float] = None,
+    sec_axis_min: Optional[float] = None,
     price_location: Optional[str] = None,
 ) -> None:
     """
@@ -468,6 +470,13 @@ def process_base_point_monthlies(
             label=f"{price_location} RTLMP",
         )
         ax2.set_ylabel("Price ($/MWh)")
+        if sec_axis_min is not None or sec_axis_max is not None:
+            sec_ylim = [ax2.get_ylim()[0], ax2.get_ylim()[1]]
+            if sec_axis_min is not None:
+                sec_ylim[0] = float(sec_axis_min)
+            if sec_axis_max is not None:
+                sec_ylim[1] = float(sec_axis_max)
+            ax2.set_ylim(sec_ylim)
         price_handles = ax2.get_legend_handles_labels()
 
     fuel_handles = ax.get_legend_handles_labels()
@@ -505,6 +514,8 @@ def process_base_point_monthlies_multiple(
     save_values_csv: bool,
     y_axis_max: Optional[float] = None,
     y_axis_min: Optional[float] = None,
+    sec_axis_max: Optional[float] = None,
+    sec_axis_min: Optional[float] = None,
     price_locations: Optional[Iterable[str]] = None,
 ) -> None:
     """
@@ -624,6 +635,13 @@ def process_base_point_monthlies_multiple(
             if series.notna().any():
                 ax2.plot(x, series.to_numpy(dtype=float), linewidth=2, label=f"{loc} RTLMP")
         ax2.set_ylabel("Price ($/MWh)")
+        if sec_axis_min is not None or sec_axis_max is not None:
+            sec_ylim = [ax2.get_ylim()[0], ax2.get_ylim()[1]]
+            if sec_axis_min is not None:
+                sec_ylim[0] = float(sec_axis_min)
+            if sec_axis_max is not None:
+                sec_ylim[1] = float(sec_axis_max)
+            ax2.set_ylim(sec_ylim)
         price_handles = ax2.get_legend_handles_labels()
 
     fuel_handles = ax.get_legend_handles_labels()

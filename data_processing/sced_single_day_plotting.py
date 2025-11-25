@@ -992,6 +992,7 @@ def process_representative_bid_quantity_curves(
     rep_quantity_df: Optional[pd.DataFrame],
     rep_price_df: Optional[pd.DataFrame],
     price_location: Optional[str] = None,
+    fuel_label: Optional[str] = None,
 ) -> Optional[pd.DataFrame]:
     """
     Join representative MW and price curves; plot Bid Price vs MW for matching SCED steps.
@@ -1053,6 +1054,8 @@ def process_representative_bid_quantity_curves(
                 print(f"[WARN] Failed to process price overlay for {price_location}: {e}")
 
     day = day_dir.name
+    label = fuel_label or ""
+    slug = re.sub(r"[^0-9A-Za-z]+", "_", label).strip("_") if label else None
     out_dir = Path(plots_root) / day / "sced_representative_bid_curves"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1085,18 +1088,21 @@ def process_representative_bid_quantity_curves(
                 linewidth=0,
             )
 
-    ax.set_title(f"{day} – Representative Bid Quantity Curve")
+    title_suffix = f" (Fuel: {label})" if label else ""
+    ax.set_title(f"{day} – Representative Bid Quantity Curve{title_suffix}")
     ax.set_xlabel("Aggregate MW")
     ax.set_ylabel("Bid Price ($/MWh)")
     ax.grid(True, alpha=0.3)
     ax.legend()
     fig.tight_layout()
-    out_png = out_dir / "representative_bid_curve.png"
+    png_name = f"{slug}_representative_bid_curve.png" if slug else "representative_bid_curve.png"
+    out_png = out_dir / png_name
     plt.savefig(out_png, dpi=150)
     plt.close(fig)
     print(f"[OK] Saved: {out_png}")
 
-    out_csv = out_dir / "representative_bid_curve.csv"
+    csv_name = f"{slug}_representative_bid_curve.csv" if slug else "representative_bid_curve.csv"
+    out_csv = out_dir / csv_name
     try:
         merged.to_csv(out_csv, index=False)
         print(f"[OK] Saved: {out_csv}")

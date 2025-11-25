@@ -1115,13 +1115,15 @@ def process_representative_bid_quantity_curves(
     # Save bid price vs hub price summary (Bid Price = first rep MW below Base Point)
     bid_price = np.nan
     if np.isfinite(bp_level):
-        merged_sorted = merged.sort_values(by="SCED Step")
-        for _, row in merged_sorted.iterrows():
-            mw_val = pd.to_numeric(row["Representative MW"], errors="coerce")
-            pr_val = pd.to_numeric(row["Representative Price"], errors="coerce")
-            if np.isfinite(mw_val) and np.isfinite(pr_val) and mw_val < bp_level:
-                bid_price = float(pr_val)
-                break
+        candidates = merged.copy()
+        candidates["_mw"] = pd.to_numeric(candidates["Representative MW"], errors="coerce")
+        candidates["_pr"] = pd.to_numeric(candidates["Representative Price"], errors="coerce")
+        candidates["_step"] = pd.to_numeric(candidates["SCED Step"], errors="coerce")
+        candidates = candidates[np.isfinite(candidates["_mw"]) & np.isfinite(candidates["_pr"]) & (candidates["_mw"] < bp_level)]
+        if not candidates.empty:
+            # pick MW just below Base Point (max MW below BP; tie-break on smallest step)
+            chosen = candidates.sort_values(by=["_mw", "_step"], ascending=[False, True]).iloc[0]
+            bid_price = float(chosen["_pr"])
     if price_location:
         summary_csv = out_dir / (f"{slug}_bid_vs_hub_price.csv" if slug else "bid_vs_hub_price.csv")
         idx_label = label or "fuel"

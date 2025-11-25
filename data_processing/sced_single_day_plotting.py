@@ -1074,18 +1074,16 @@ def process_representative_bid_quantity_curves(
         if np.isfinite(price_std):
             low_band = price_avg - price_std
             high_band = price_avg + price_std
-            # use finite x-limits to avoid NaN fill issues
-            x_finite = x[np.isfinite(x)]
-            if x_finite.size > 0:
-                x_min, x_max = float(np.nanmin(x_finite)), float(np.nanmax(x_finite))
-                ax.fill_between(
-                    [x_min, x_max],
-                    low_band,
-                    high_band,
-                    color="gray",
-                    alpha=0.15,
-                    linewidth=0,
-                )
+            # use current axis limits to span the band (covers case where MW has NaNs)
+            x_min, x_max = ax.get_xlim()
+            ax.fill_between(
+                [x_min, x_max],
+                low_band,
+                high_band,
+                color="gray",
+                alpha=0.15,
+                linewidth=0,
+            )
 
     ax.set_title(f"{day} – Representative Bid Quantity Curve")
     ax.set_xlabel("Aggregate MW")

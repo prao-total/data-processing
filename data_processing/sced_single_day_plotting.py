@@ -1112,7 +1112,31 @@ def process_representative_bid_quantity_curves(
     except Exception as e:
         print(f"[WARN] {day}: failed to write representative bid curve CSV: {e}")
 
+    # Save bid price vs hub price summary (Bid Price = first rep MW below Base Point)
+    bid_price = np.nan
+    if np.isfinite(bp_level):
+        merged_sorted = merged.sort_values(by="SCED Step")
+        for _, row in merged_sorted.iterrows():
+            mw_val = pd.to_numeric(row["Representative MW"], errors="coerce")
+            pr_val = pd.to_numeric(row["Representative Price"], errors="coerce")
+            if np.isfinite(mw_val) and np.isfinite(pr_val) and mw_val < bp_level:
+                bid_price = float(pr_val)
+                break
+    if price_location:
+        summary_csv = out_dir / (f"{slug}_bid_vs_hub_price.csv" if slug else "bid_vs_hub_price.csv")
+        idx_label = label or "fuel"
+        df_summary = pd.DataFrame(
+            {"Bid Price": [bid_price], str(price_location): [price_avg]},
+            index=[idx_label],
+        )
+        try:
+            df_summary.to_csv(summary_csv)
+            print(f"[OK] Saved: {summary_csv}")
+        except Exception as e:
+            print(f"[WARN] {day}: failed to write bid vs hub price CSV: {e}")
+
     return merged
+
 
 
 def process_average_bid_quantity(day_dir: Path, plots_root: Path) -> None:

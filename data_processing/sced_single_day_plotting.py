@@ -517,6 +517,7 @@ def process_base_point_monthlies_multiple(
     sec_axis_max: Optional[float] = None,
     sec_axis_min: Optional[float] = None,
     price_locations: Optional[Iterable[str]] = None,
+    show_legend: bool = True,
 ) -> None:
     """
     Aggregate Base Point by fuel and hour; optional overlay of hourly price series.
@@ -651,7 +652,7 @@ def process_base_point_monthlies_multiple(
     if price_handles:
         handles += price_handles[0]
         labels += price_handles[1]
-    if handles:
+    if handles and show_legend:
         ax.legend(handles, labels, loc="upper left")
 
     fig.tight_layout()
@@ -993,6 +994,7 @@ def process_representative_bid_quantity_curves(
     rep_price_df: Optional[pd.DataFrame],
     price_location: Optional[str] = None,
     fuel_label: Optional[str] = None,
+    show_legend: bool = True,
 ) -> Optional[pd.DataFrame]:
     """
     Join representative MW and price curves; plot Bid Price vs MW for matching SCED steps.
@@ -1093,7 +1095,8 @@ def process_representative_bid_quantity_curves(
     ax.set_xlabel("Aggregate MW")
     ax.set_ylabel("Bid Price ($/MWh)")
     ax.grid(True, alpha=0.3)
-    ax.legend()
+    if show_legend:
+        ax.legend()
     fig.tight_layout()
     png_name = f"{slug}_representative_bid_curve.png" if slug else "representative_bid_curve.png"
     out_png = out_dir / png_name
@@ -2279,7 +2282,7 @@ def main():
         # 1d) Base Point monthlies
         process_base_point_monthlies(day_dir, out, ["CCGT90", "CCLE90", "SCLE90", "SCGT90"], save_values_csv=True, price_location="HB_HUBAVG") # y_axis_max=33000.0, y_axis_min=10000.0
         # 1e) Base Point monthlies with multiple price and fuels
-        process_base_point_monthlies_multiple(day_dir, out, ["CCGT90", "CCLE90", "SCLE90", "SCGT90"], ["HB_HOUSTON", "HB_NORTH", "HB_SOUTH", "HB_WEST"], save_values_csv=True)
+        process_base_point_monthlies_multiple(day_dir, out, ["CCGT90", "CCLE90", "SCLE90", "SCGT90"], price_locations=["HB_HOUSTON", "HB_NORTH", "HB_SOUTH", "HB_WEST"], save_values_csv=True)
 
         rep_quantity_df = process_representative_quantity_curves(day_dir, out,resource_type="CCGT90",save_summary=True)
         rep_price_df = process_representative_price_curves(day_dir, out,resource_type="CCGT90",save_summary=True)

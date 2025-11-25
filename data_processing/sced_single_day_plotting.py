@@ -1032,7 +1032,7 @@ def process_representative_bid_quantity_curves(
         if pd.notna(max_ts_price):
             max_ts = max_ts_price if (max_ts is None or max_ts_price < max_ts) else max_ts
 
-    price_avg = price_q1 = price_q3 = np.nan
+    price_avg = price_std = np.nan
     price_series = None
     if price_location and min_ts is not None and max_ts is not None:
         price_files = list(Path(PRICE_DIR).glob(f"{price_location}_rtlmp_bus*_hourly*.csv"))
@@ -1047,8 +1047,7 @@ def process_representative_bid_quantity_curves(
                 subset = subset[np.isfinite(subset)]
                 if not subset.empty:
                     price_avg = float(subset.mean())
-                    price_q1 = float(subset.quantile(0.25))
-                    price_q3 = float(subset.quantile(0.75))
+                    price_std = float(subset.std(ddof=0))
                     price_series = subset
             except Exception as e:
                 print(f"[WARN] Failed to process price overlay for {price_location}: {e}")
@@ -1072,11 +1071,13 @@ def process_representative_bid_quantity_curves(
         ax.axvline(hsl_level, linestyle="--", linewidth=1.5, color="#ff7f0e", label="HSL (MW)")
     if np.isfinite(price_avg):
         ax.axhline(price_avg, linestyle="--", linewidth=1.5, color="black", label="Avg Price")
-        if np.isfinite(price_q1) and np.isfinite(price_q3):
+        if np.isfinite(price_std):
+            low_band = price_avg - price_std
+            high_band = price_avg + price_std
             ax.fill_between(
                 [x.min(), x.max()],
-                price_q1,
-                price_q3,
+                low_band,
+                high_band,
                 color="gray",
                 alpha=0.15,
                 linewidth=0,

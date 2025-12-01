@@ -1058,7 +1058,7 @@ def process_representative_quantity_curves_v2(
             print(f"[WARN] {day}: failed to read {p.name}: {e}")
             continue
         filt, ts_cols_sorted = _prep_filtered_matrix(df)
-        if filt.empty():
+        if filt.empty:
             continue
         filtered_steps[step_key(p)] = filt
         ts_by_step[step_key(p)] = ts_cols_sorted
@@ -1221,7 +1221,7 @@ def process_representative_price_curves_v2(
             print(f"[WARN] {day}: failed to read {p.name}: {e}")
             continue
         filt, ts_cols_sorted = _prep_filtered_matrix(df)
-        if filt.empty():
+        if filt.empty:
             continue
         filtered_steps[step_key(p)] = filt
         ts_by_step[step_key(p)] = ts_cols_sorted
@@ -1377,7 +1377,7 @@ def process_representative_bid_quantity_curves(
     fig, ax = plt.subplots(figsize=(10, 6))
     x = pd.to_numeric(merged["Representative MW"], errors="coerce").to_numpy(dtype=float)
     y = pd.to_numeric(merged["Representative Price"], errors="coerce").to_numpy(dtype=float)
-    ax.plot(x, y, marker="o", linewidth=2)
+    ax.step(x, y, where="post", linewidth=2)
     for mw_val, price_val, step in zip(x, y, merged["SCED Step"].astype(int)):
         if np.isfinite(mw_val) and np.isfinite(price_val):
             ax.annotate(str(step), xy=(mw_val, price_val),

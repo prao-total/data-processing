@@ -55,6 +55,8 @@ BP_SAVE_HOURLY_CSV = True             # write hourly pivot per day
 SCED_SAVE_VALUES_CSV = False          # write per-step flattened price values
 VIOLIN_MIN_SAMPLES = 1                # min samples per fuel to draw a violin
 SAVE_NORMALIZED_SUMMARY_CSV = True    # write the per-day summary used for line plot
+GEN_LIST = ["GSSUP", "CCGT90", "CCLE90", "SCLE90", "SCGT90", "GSREH", "GSNONR"] # List of resource being analyzed for normalized bid curves
+HUB_LIST = ["HB_HOUSTON", "HB_NORTH", "HB_SOUTH", "HB_WEST", "HB_HUBAVG"]  # List of price locations for normalized bid curves
 # ======================================================
 
 PRICE_STEP_PATTERN = re.compile(r"aggregation_SCED1_Curve-Price(\d+)\.csv$", re.IGNORECASE)
@@ -1098,13 +1100,13 @@ def process_representative_bid_quantity_curves(
     if show_legend:
         ax.legend()
     fig.tight_layout()
-    png_name = f"{slug}_representative_bid_curve.png" if slug else "representative_bid_curve.png"
+    png_name = f"{slug}_{price_location}_representative_bid_curve.png" if slug else "representative_bid_curve.png"
     out_png = out_dir / png_name
     plt.savefig(out_png, dpi=150)
     plt.close(fig)
     print(f"[OK] Saved: {out_png}")
 
-    csv_name = f"{slug}_representative_bid_curve.csv" if slug else "representative_bid_curve.csv"
+    csv_name = f"{slug}_{price_location}_representative_bid_curve.csv" if slug else "representative_bid_curve.csv"
     out_csv = out_dir / csv_name
     try:
         merged.to_csv(out_csv, index=False)
@@ -1125,7 +1127,7 @@ def process_representative_bid_quantity_curves(
             chosen = candidates.sort_values(by=["_mw", "_step"], ascending=[False, True]).iloc[0]
             bid_price = float(chosen["_pr"])
     if price_location:
-        summary_csv = out_dir / (f"{slug}_bid_vs_hub_price.csv" if slug else "bid_vs_hub_price.csv")
+        summary_csv = out_dir / (f"{slug}_{price_location}_bid_vs_hub_price.csv" if slug else "bid_vs_hub_price.csv")
         idx_label = label or "fuel"
         df_summary = pd.DataFrame(
             {"Bid Price": [bid_price], str(price_location): [price_avg]},
@@ -2310,11 +2312,14 @@ def main():
         # 1e) Base Point monthlies with multiple price and fuels
         process_base_point_monthlies_multiple(day_dir, out, ["CCGT90", "CCLE90", "SCLE90", "SCGT90"], price_locations=["HB_HOUSTON", "HB_NORTH", "HB_SOUTH", "HB_WEST"], save_values_csv=True)
 
-        rep_quantity_df = process_representative_quantity_curves(day_dir, out,resource_type="CCGT90",save_summary=True)
-        rep_price_df = process_representative_price_curves(day_dir, out,resource_type="CCGT90",save_summary=True)
+        for gen in GEN_LIST:
+            for price_loc in HUB_LIST:
+                rep_quantity_df = process_representative_quantity_curves(day_dir, out,resource_type=gen,save_summary=True, price_location=price_loc)
+                rep_price_df = process_representative_price_curves(day_dir, out,resource_type=gen,save_summary=True)
 
-        # Plot the representative bid quantity pair
-        process_representative_bid_quantity_curves(day_dir, out, rep_quantity_df, rep_price_df)
+                # Plot the representative bid quantity pair
+                process_representative_bid_quantity_curves(day_dir, out, rep_quantity_df, rep_price_df, price_location=price_loc, fuel_label=gen)
+        
         # 2) SCED price violins
         process_sced_violins_day(day_dir, out, SCED_SAVE_VALUES_CSV)
 

@@ -989,6 +989,317 @@ def process_representative_price_curves(day_dir: Path, plots_root: Path, resourc
     return rep_df
 
 
+def process_representative_quantity_curves_v2(
+    day_dir: Path,
+    plots_root: Path,
+    resource_type: str,
+    save_summary: bool,
+    price_location: Optional[str] = None,
+) -> Optional[pd.DataFrame]:
+    day = day_dir.name
+
+    def _prep_filtered_matrix(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+        name_col, type_col = normalize_key_columns(df)
+        ts_cols = detect_timestamp_columns(df, (name_col, type_col))
+        mask = df[type_col].astype(str).fillna("Unknown").str.strip().str.casefold() == resource_type.casefold().strip()
+        filt = df.loc[mask].copy()
+        if filt.empty:
+            return pd.DataFrame(), []
+        filt["_key"] = filt[name_col].astype(str).str.strip().str.casefold()
+        filt = filt.drop_duplicates(subset=["_key"], keep="first").set_index("_key")
+        ts_cols_sorted = sorted(ts_cols, key=lambda c: pd.to_datetime(c))
+        return filt.reindex(columns=ts_cols_sorted), ts_cols_sorted
+
+    # BP/HSL
+    bp_path = day_dir / "aggregation_Base_Point.csv"
+    if not bp_path.exists():
+        matches = list(day_dir.glob("aggregation_Base_Point*.csv")) or list(day_dir.glob("*Base*Point*.csv"))
+        if not matches:
+            print(f"[INFO] {day}: no BP file; skipping quantity v2.")
+            return None
+        bp_path = matches[0]
+    hsl_path = day_dir / "aggregation_HSL.csv"
+    if not hsl_path.exists():
+        matches = list(day_dir.glob("*HSL*.csv"))
+        if not matches:
+            print(f"[INFO] {day}: no HSL file; skipping quantity v2.")
+            return None
+        hsl_path = matches[0]
+    try:
+        bp_df = pd.read_csv(bp_path, dtype=str)
+        hsl_df = pd.read_csv(hsl_path, dtype=str)
+    except Exception as e:
+        print(f"[ERROR] {day}: failed to read BP/HSL for quantity v2: {e}")
+        return None
+
+    bp_filtered, bp_ts = _prep_filtered_matrix(bp_df)
+    hsl_filtered, hsl_ts = _prep_filtered_matrix(hsl_df)
+    if bp_filtered.empty or hsl_filtered.empty:
+        print(f"[INFO] {day}: no BP/HSL rows for fuel {resource_type} (quantity v2).")
+        return None
+
+    # MW steps
+    mw_files = list(day_dir.glob("aggregation_SCED1_Curve-MW*.csv")) or list(day_dir.glob("*SCED*Curve*MW*.csv"))
+    if not mw_files:
+        print(f"[INFO] {day}: no SCED MW step files; skipping quantity v2.")
+        return None
+
+    def step_key(p: Path):
+        m = MW_STEP_PATTERN.search(p.name)
+        return int(m.group(1)) if m else 1_000_000
+    mw_files = sorted(mw_files, key=step_key)
+
+    filtered_steps: Dict[int, pd.DataFrame] = {}
+    ts_by_step: Dict[int, List[str]] = {}
+    for p in mw_files:
+        try:
+            df = pd.read_csv(p, dtype=str)
+        except Exception as e:
+            print(f"[WARN] {day}: failed to read {p.name}: {e}")
+            continue
+        filt, ts_cols_sorted = _prep_filtered_matrix(df)
+        if filt.empty():
+            continue
+        filtered_steps[step_key(p)] = filt
+        ts_by_step[step_key(p)] = ts_cols_sorted
+
+    if not filtered_steps:
+        print(f"[INFO] {day}: no SCED rows for fuel {resource_type} (quantity v2).")
+        return None
+
+    steps_sorted = sorted(filtered_steps.keys())
+    common_keys = sorted(set.intersection(*(set(df.index) for df in filtered_steps.values())) &
+                         set(bp_filtered.index) & set(hsl_filtered.index))
+    if not common_keys:
+        print(f"[INFO] {day}: no overlapping resources across SCED/BP/HSL for {resource_type} (quantity v2).")
+        return None
+    common_ts = sorted(
+        set.intersection(*( [set(ts_by_step[s]) for s in steps_sorted] + [set(bp_ts), set(hsl_ts)] )),
+        key=lambda c: pd.to_datetime(c)
+    )
+    if not common_ts:
+        print(f"[INFO] {day}: no common timestamps across SCED/BP/HSL for {resource_type} (quantity v2).")
+        return None
+
+    n_steps, n_keys, n_times = len(steps_sorted), len(common_keys), len(common_ts)
+    curves = np.full((n_steps, n_keys, n_times), np.nan, dtype=float)
+    bp_matrix = bp_filtered.reindex(index=common_keys, columns=common_ts).apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+    hsl_matrix = hsl_filtered.reindex(index=common_keys, columns=common_ts).apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+    for i, step in enumerate(steps_sorted):
+        df = filtered_steps[step].reindex(index=common_keys, columns=common_ts)
+        curves[i, :, :] = df.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+
+    zero_mask = (bp_matrix == 0.0) & np.isfinite(bp_matrix)
+    curves[:, zero_mask] = np.nan
+    bp_matrix = np.where(zero_mask, np.nan, bp_matrix)
+    hsl_matrix = np.where(zero_mask, np.nan, hsl_matrix)
+
+    with np.errstate(all="ignore"):
+        max_vals = np.nanmax(curves, axis=0)
+    max_vals[~np.isfinite(max_vals)] = np.nan
+    if np.isnan(max_vals).all():
+        print(f"[INFO] {day}: SCED curves all NaN for fuel {resource_type} (quantity v2).")
+        return None
+
+    with np.errstate(all="ignore"):
+        norm_curves = curves / max_vals[np.newaxis, :, :]
+        bp_norm = bp_matrix / max_vals
+        hsl_norm = hsl_matrix / max_vals
+
+    mean_norm = np.nanmean(norm_curves, axis=1).transpose(1, 0)
+    avg_max = np.nanmean(max_vals, axis=0)
+    scaled = mean_norm * avg_max[:, None]
+    bp_scaled = np.nanmean(bp_norm, axis=0) * avg_max
+    hsl_scaled = np.nanmean(hsl_norm, axis=0) * avg_max
+
+    ts_index = pd.to_datetime(common_ts)
+    step_index = pd.Index(steps_sorted, name="SCED Step")
+    curves_only = pd.DataFrame(scaled, index=ts_index, columns=step_index)
+    representative = curves_only.mean(axis=0, skipna=True)
+    bp_level = float(np.nanmean(bp_scaled)) if np.isfinite(bp_scaled).any() else np.nan
+    hsl_level = float(np.nanmean(hsl_scaled)) if np.isfinite(hsl_scaled).any() else np.nan
+
+    out_dir = Path(plots_root) / day / "sced_quantity_curve_representative"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    slug = re.sub(r"[^0-9A-Za-z]+", "_", resource_type).strip("_") or "fuel"
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(step_index.values, representative.to_numpy(dtype=float), marker="o", linewidth=2)
+    if np.isfinite(bp_level):
+        ax.axhline(bp_level, linestyle="--", linewidth=1.5, color="#1f77b4", label="Base Point")
+    if np.isfinite(hsl_level):
+        ax.axhline(hsl_level, linestyle="--", linewidth=1.5, color="#ff7f0e", label="HSL")
+    ax.set_title(f"{day} – Representative Quantity Curve v2 (Fuel: {resource_type})")
+    ax.set_xlabel("SCED Step")
+    ax.set_ylabel("MW")
+    ax.set_xticks(step_index.values)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    out_png = out_dir / f"{slug}_representative_curve_v2.png"
+    plt.savefig(out_png, dpi=150)
+    plt.close(fig)
+    print(f"[OK] Saved: {out_png}")
+
+    rep_df = pd.DataFrame({
+        "SCED Step": step_index.values,
+        "Representative MW": representative.values,
+        "Base Point MW": [bp_level] * len(representative),
+        "HSL MW": [hsl_level] * len(representative),
+        "Min Timestamp": [ts_index.min()] * len(representative),
+        "Max Timestamp": [ts_index.max()] * len(representative),
+    })
+
+    if save_summary:
+        rep_csv = out_dir / f"{slug}_representative_curve_v2.csv"
+        try:
+            rep_df.to_csv(rep_csv, index=False)
+            print(f"[OK] Saved: {rep_csv}")
+        except Exception as e:
+            print(f"[WARN] {day}: failed to write representative curve CSV: {e}")
+
+    rep_df.attrs["price_location"] = price_location
+    return rep_df
+
+
+def process_representative_price_curves_v2(
+    day_dir: Path,
+    plots_root: Path,
+    resource_type: str,
+    save_summary: bool,
+    fuel_label: Optional[str] = None,
+) -> Optional[pd.DataFrame]:
+    day = day_dir.name
+
+    def _prep_filtered_matrix(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+        name_col, type_col = normalize_key_columns(df)
+        ts_cols = detect_timestamp_columns(df, (name_col, type_col))
+        mask = df[type_col].astype(str).fillna("Unknown").str.strip().str.casefold() == resource_type.casefold().strip()
+        filt = df.loc[mask].copy()
+        if filt.empty:
+            return pd.DataFrame(), []
+        filt["_key"] = filt[name_col].astype(str).str.strip().str.casefold()
+        filt = filt.drop_duplicates(subset=["_key"], keep="first").set_index("_key")
+        ts_cols_sorted = sorted(ts_cols, key=lambda c: pd.to_datetime(c))
+        return filt.reindex(columns=ts_cols_sorted), ts_cols_sorted
+
+    # BP for masking
+    bp_path = day_dir / "aggregation_Base_Point.csv"
+    if not bp_path.exists():
+        matches = list(day_dir.glob("aggregation_Base_Point*.csv")) or list(day_dir.glob("*Base*Point*.csv"))
+        if not matches:
+            print(f"[INFO] {day}: no BP file; skipping price v2.")
+            return None
+        bp_path = matches[0]
+    try:
+        bp_df = pd.read_csv(bp_path, dtype=str)
+    except Exception as e:
+        print(f"[ERROR] {day}: failed to read BP for price v2: {e}")
+        return None
+
+    bp_filtered, bp_ts = _prep_filtered_matrix(bp_df)
+    if bp_filtered.empty:
+        print(f"[INFO] {day}: no BP rows for fuel {resource_type} (price v2).")
+        return None
+
+    # Price steps
+    step_files = list(day_dir.glob("aggregation_SCED1_Curve-Price*.csv")) or list(day_dir.glob("*SCED*Curve*Price*.csv"))
+    if not step_files:
+        print(f"[INFO] {day}: no SCED price files; skipping price v2.")
+        return None
+    def step_key(p: Path):
+        m = PRICE_STEP_PATTERN.search(p.name)
+        return int(m.group(1)) if m else 1_000_000
+    step_files = sorted(step_files, key=step_key)
+
+    filtered_steps: Dict[int, pd.DataFrame] = {}
+    ts_by_step: Dict[int, List[str]] = {}
+    for p in step_files:
+        try:
+            df = pd.read_csv(p, dtype=str)
+        except Exception as e:
+            print(f"[WARN] {day}: failed to read {p.name}: {e}")
+            continue
+        filt, ts_cols_sorted = _prep_filtered_matrix(df)
+        if filt.empty():
+            continue
+        filtered_steps[step_key(p)] = filt
+        ts_by_step[step_key(p)] = ts_cols_sorted
+
+    if not filtered_steps:
+        print(f"[INFO] {day}: no SCED price rows for fuel {resource_type} (price v2).")
+        return None
+
+    steps_sorted = sorted(filtered_steps.keys())
+    common_keys = sorted(set.intersection(*(set(df.index) for df in filtered_steps.values())) & set(bp_filtered.index))
+    if not common_keys:
+        print(f"[INFO] {day}: no overlapping resources across SCED price/BP for {resource_type} (price v2).")
+        return None
+    common_ts = sorted(
+        set.intersection(*( [set(ts_by_step[s]) for s in steps_sorted] + [set(bp_ts)] )),
+        key=lambda c: pd.to_datetime(c)
+    )
+    if not common_ts:
+        print(f"[INFO] {day}: no common timestamps across SCED price/BP for {resource_type} (price v2).")
+        return None
+
+    n_steps, n_keys, n_times = len(steps_sorted), len(common_keys), len(common_ts)
+    curves = np.full((n_steps, n_keys, n_times), np.nan, dtype=float)
+    bp_matrix = bp_filtered.reindex(index=common_keys, columns=common_ts).apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+    for i, step in enumerate(steps_sorted):
+        df = filtered_steps[step].reindex(index=common_keys, columns=common_ts)
+        curves[i, :, :] = df.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+
+    zero_mask = (bp_matrix == 0.0) & np.isfinite(bp_matrix)
+    curves[:, zero_mask] = np.nan
+
+    with np.errstate(all="ignore"):
+        mean_curves = np.nanmean(curves, axis=1).transpose(1, 0)
+    if np.isnan(mean_curves).all():
+        print(f"[INFO] {day}: SCED price curves all NaN after BP mask for {resource_type} (price v2).")
+        return None
+
+    ts_index = pd.to_datetime(common_ts)
+    step_index = pd.Index(steps_sorted, name="SCED Step")
+    curves_df = pd.DataFrame(mean_curves, index=ts_index, columns=step_index)
+    representative = curves_df.mean(axis=0, skipna=True)
+
+    out_dir = Path(plots_root) / day / "sced_price_curve_representative"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    label = fuel_label or resource_type
+    slug = re.sub(r"[^0-9A-Za-z]+", "_", label).strip("_") or "fuel"
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(step_index.values, representative.to_numpy(dtype=float), marker="o", linewidth=2)
+    ax.set_title(f"{day} – Representative Price Curve v2 (Fuel: {label})")
+    ax.set_xlabel("SCED Step")
+    ax.set_ylabel("Bid Price")
+    ax.set_xticks(step_index.values)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    out_png = out_dir / f"{slug}_representative_price_curve_v2.png"
+    plt.savefig(out_png, dpi=150)
+    plt.close(fig)
+    print(f"[OK] Saved: {out_png}")
+
+    rep_df = pd.DataFrame({
+        "SCED Step": step_index.values,
+        "Representative Price": representative.values,
+        "Min Timestamp": [ts_index.min()] * len(representative),
+        "Max Timestamp": [ts_index.max()] * len(representative),
+    })
+
+    if save_summary:
+        rep_csv = out_dir / f"{slug}_representative_price_curve_v2.csv"
+        try:
+            rep_df.to_csv(rep_csv, index=False)
+            print(f"[OK] Saved: {rep_csv}")
+        except Exception as e:
+            print(f"[WARN] {day}: failed to write representative price curve CSV: {e}")
+
+    return rep_df
+
+
 def process_representative_bid_quantity_curves(
     day_dir: Path,
     plots_root: Path,

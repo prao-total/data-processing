@@ -1299,6 +1299,411 @@ def process_representative_price_curves_v2(
 
     return rep_df
 
+def process_bid_quantity_curve_weighted(
+    day_dir: Path,
+    plots_root: Path,
+    resource_type: Optional[str] = None,
+    price_location: Optional[str] = None,
+    show_legend: bool = True,
+    save_summary: bool = False,
+) -> Optional[pd.DataFrame]:
+    """
+    Placeholder for weighted bid-quantity curves.
+    Loads BP, HSL, and SCED MW/Price step files; logic to be added incrementally.
+    Returns loaded-step metadata as a DataFrame if save_summary is True.
+    """
+    day = day_dir.name
+
+    # Load BP/HSL
+    bp_path = day_dir / "aggregation_Base_Point.csv"
+    hsl_path = day_dir / "aggregation_HSL.csv"
+    if not bp_path.exists() or not hsl_path.exists():
+        print(f"[INFO] {day}: missing BP or HSL; skipping weighted bid curve placeholder.")
+        return None
+    try:
+        bp_df = pd.read_csv(bp_path, dtype=str)
+        hsl_df = pd.read_csv(hsl_path, dtype=str)
+    except Exception as e:
+        print(f"[ERROR] {day}: failed to read BP/HSL for weighted bid curve: {e}")
+        return None
+
+    # SCED MW steps
+    mw_files = list(day_dir.glob("aggregation_SCED1_Curve-MW*.csv")) or list(day_dir.glob("*SCED*Curve*MW*.csv"))
+    if not mw_files:
+        print(f"[INFO] {day}: no SCED MW step files; skipping weighted bid curve.")
+        return None
+    mw_files = sorted(mw_files, key=lambda p: int(MW_STEP_PATTERN.search(p.name).group(1)) if MW_STEP_PATTERN.search(p.name) else 1_000_000)
+    mw_steps: Dict[int, pd.DataFrame] = {}
+    for p in mw_files:
+        try:
+            mw_steps[int(MW_STEP_PATTERN.search(p.name).group(1)) if MW_STEP_PATTERN.search(p.name) else 1_000_000] = pd.read_csv(p, dtype=str)
+        except Exception as e:
+            print(f"[WARN] {day}: failed to read MW step {p.name}: {e}")
+
+    if not mw_steps:
+        print(f"[INFO] {day}: no readable SCED MW steps; skipping weighted bid curve.")
+        return None
+
+    # SCED Price steps
+    price_files = list(day_dir.glob("aggregation_SCED1_Curve-Price*.csv")) or list(day_dir.glob("*SCED*Curve*Price*.csv"))
+    if not price_files:
+        print(f"[INFO] {day}: no SCED price step files; skipping weighted bid curve.")
+        return None
+    price_files = sorted(price_files, key=lambda p: int(PRICE_STEP_PATTERN.search(p.name).group(1)) if PRICE_STEP_PATTERN.search(p.name) else 1_000_000)
+    price_steps: Dict[int, pd.DataFrame] = {}
+    for p in price_files:
+        try:
+            price_steps[int(PRICE_STEP_PATTERN.search(p.name).group(1)) if PRICE_STEP_PATTERN.search(p.name) else 1_000_000] = pd.read_csv(p, dtype=str)
+        except Exception as e:
+            print(f"[WARN] {day}: failed to read price step {p.name}: {e}")
+
+    if not price_steps:
+        print(f"[INFO] {day}: no readable SCED price steps; skipping weighted bid curve.")
+        return None
+
+    print(f"[INFO] {day}: Loaded BP ({len(bp_df)} rows), HSL ({len(hsl_df)} rows), "
+          f"{len(mw_steps)} MW steps, {len(price_steps)} price steps for weighted bid curve (not yet implemented).")
+
+    if save_summary:
+        summary = pd.DataFrame({
+            "Type": ["BP", "HSL", "MW Steps", "Price Steps"],
+            "Count": [len(bp_df), len(hsl_df), len(mw_steps), len(price_steps)],
+            "Resource Type Filter": [resource_type] * 4,
+            "Price Location": [price_location] * 4,
+        })
+        out_dir = Path(plots_root) / day / "sced_weighted_bid_curves"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_csv = out_dir / "weighted_bid_curve_loaded_counts.csv"
+        try:
+            summary.to_csv(out_csv, index=False)
+            print(f"[OK] Saved: {out_csv}")
+        except Exception as e:
+            print(f"[WARN] {day}: failed to write weighted bid curve summary CSV: {e}")
+        return summary
+
+    return None
+
+
+def process_bid_quantity_curve_hourlies(
+    day_dir: Path,
+    plots_root: Path,
+    resource_type: Optional[str] = None,
+    price_location: Optional[str] = None,
+    show_legend: bool = True,
+    save_summary: bool = False,
+) -> Optional[pd.DataFrame]:
+    """
+    Skeleton for hourly bid-quantity curves.
+    Currently mirrors loading behavior of process_bid_quantity_curve_weighted.
+    """
+    day = day_dir.name
+
+    bp_path = day_dir / "aggregation_Base_Point.csv"
+    hsl_path = day_dir / "aggregation_HSL.csv"
+    if not bp_path.exists() or not hsl_path.exists():
+        print(f"[INFO] {day}: missing BP or HSL; skipping hourly bid curve placeholder.")
+        return None
+    try:
+        bp_df = pd.read_csv(bp_path, dtype=str)
+        hsl_df = pd.read_csv(hsl_path, dtype=str)
+    except Exception as e:
+        print(f"[ERROR] {day}: failed to read BP/HSL for hourly bid curve: {e}")
+        return None
+
+    mw_files = list(day_dir.glob("aggregation_SCED1_Curve-MW*.csv")) or list(day_dir.glob("*SCED*Curve*MW*.csv"))
+    if not mw_files:
+        print(f"[INFO] {day}: no SCED MW step files; skipping hourly bid curve.")
+        return None
+    mw_files = sorted(mw_files, key=lambda p: int(MW_STEP_PATTERN.search(p.name).group(1)) if MW_STEP_PATTERN.search(p.name) else 1_000_000)
+    mw_steps: Dict[int, pd.DataFrame] = {}
+    for p in mw_files:
+        try:
+            mw_steps[int(MW_STEP_PATTERN.search(p.name).group(1)) if MW_STEP_PATTERN.search(p.name) else 1_000_000] = pd.read_csv(p, dtype=str)
+        except Exception as e:
+            print(f"[WARN] {day}: failed to read MW step {p.name}: {e}")
+
+    if not mw_steps:
+        print(f"[INFO] {day}: no readable SCED MW steps; skipping hourly bid curve.")
+        return None
+
+    price_files = list(day_dir.glob("aggregation_SCED1_Curve-Price*.csv")) or list(day_dir.glob("*SCED*Curve*Price*.csv"))
+    if not price_files:
+        print(f"[INFO] {day}: no SCED price step files; skipping hourly bid curve.")
+        return None
+    price_files = sorted(price_files, key=lambda p: int(PRICE_STEP_PATTERN.search(p.name).group(1)) if PRICE_STEP_PATTERN.search(p.name) else 1_000_000)
+    price_steps: Dict[int, pd.DataFrame] = {}
+    for p in price_files:
+        try:
+            price_steps[int(PRICE_STEP_PATTERN.search(p.name).group(1)) if PRICE_STEP_PATTERN.search(p.name) else 1_000_000] = pd.read_csv(p, dtype=str)
+        except Exception as e:
+            print(f"[WARN] {day}: failed to read price step {p.name}: {e}")
+
+    if not price_steps:
+        print(f"[INFO] {day}: no readable SCED price steps; skipping hourly bid curve.")
+        return None
+
+    if save_summary:
+        summary = pd.DataFrame({
+            "Type": ["BP", "HSL", "MW Steps", "Price Steps"],
+            "Count": [len(bp_df), len(hsl_df), len(mw_steps), len(price_steps)],
+            "Resource Type Filter": [resource_type] * 4,
+            "Price Location": [price_location] * 4,
+        })
+        out_dir = Path(plots_root) / day / "sced_hourly_bid_curves"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_csv = out_dir / "hourly_bid_curve_loaded_counts.csv"
+        try:
+            summary.to_csv(out_csv, index=False)
+            print(f"[OK] Saved: {out_csv}")
+        except Exception as e:
+            print(f"[WARN] {day}: failed to write hourly bid curve summary CSV: {e}")
+        return summary
+
+    return None
+
+
+def process_marginal_bid_price(
+    day_dir: Path,
+    plots_root: Path,
+    resource_type: Optional[str] = None,
+) -> Optional[pd.DataFrame]:
+    """
+    Skeleton for marginal bid price curves.
+    Currently mirrors loading behavior of process_bid_quantity_curve_hourlies.
+    """
+    day = day_dir.name
+
+    bp_path = day_dir / "aggregation_Base_Point.csv"
+    if not bp_path.exists():
+        print(f"[INFO] {day}: missing BP; skipping marginal bid price placeholder.")
+        return None
+    try:
+        bp_df = pd.read_csv(bp_path, dtype=str)
+    except Exception as e:
+        print(f"[ERROR] {day}: failed to read BP for marginal bid price: {e}")
+        return None
+
+    mw_files = list(day_dir.glob("aggregation_SCED1_Curve-MW*.csv")) or list(day_dir.glob("*SCED*Curve*MW*.csv"))
+    if not mw_files:
+        print(f"[INFO] {day}: no SCED MW step files; skipping marginal bid price.")
+        return None
+    mw_files = sorted(mw_files, key=lambda p: int(MW_STEP_PATTERN.search(p.name).group(1)) if MW_STEP_PATTERN.search(p.name) else 1_000_000)
+    mw_steps: Dict[int, pd.DataFrame] = {}
+    for p in mw_files:
+        try:
+            mw_steps[int(MW_STEP_PATTERN.search(p.name).group(1)) if MW_STEP_PATTERN.search(p.name) else 1_000_000] = pd.read_csv(p, dtype=str)
+        except Exception as e:
+            print(f"[WARN] {day}: failed to read MW step {p.name}: {e}")
+
+    if not mw_steps:
+        print(f"[INFO] {day}: no readable SCED MW steps; skipping marginal bid price.")
+        return None
+
+    price_files = list(day_dir.glob("aggregation_SCED1_Curve-Price*.csv")) or list(day_dir.glob("*SCED*Curve*Price*.csv"))
+    if not price_files:
+        print(f"[INFO] {day}: no SCED price step files; skipping marginal bid price.")
+        return None
+    price_files = sorted(price_files, key=lambda p: int(PRICE_STEP_PATTERN.search(p.name).group(1)) if PRICE_STEP_PATTERN.search(p.name) else 1_000_000)
+    price_steps: Dict[int, pd.DataFrame] = {}
+    for p in price_files:
+        try:
+            price_steps[int(PRICE_STEP_PATTERN.search(p.name).group(1)) if PRICE_STEP_PATTERN.search(p.name) else 1_000_000] = pd.read_csv(p, dtype=str)
+        except Exception as e:
+            print(f"[WARN] {day}: failed to read price step {p.name}: {e}")
+
+    if not price_steps:
+        print(f"[INFO] {day}: no readable SCED price steps; skipping marginal bid price.")
+        return None
+
+    # ----- Base Point masking: zero BP -> mask matching MW/Price cells -----
+    try:
+        bp_name, bp_type = normalize_key_columns(bp_df)
+        bp_ts = detect_timestamp_columns(bp_df, (bp_name, bp_type))
+        bp_df["_key"] = bp_df[bp_name].astype(str).str.strip().str.casefold()
+        bp_df = bp_df.drop_duplicates(subset=["_key"], keep="first").set_index("_key")
+        bp_matrix = bp_df.reindex(columns=bp_ts).apply(pd.to_numeric, errors="coerce")
+    except Exception as e:
+        print(f"[WARN] {day}: BP masking skipped due to column detection error: {e}")
+        return None
+
+    zero_mask = (bp_matrix == 0.0)
+
+    target_fuel = resource_type.casefold().strip() if resource_type else None
+
+    def _filter_fuel(df: pd.DataFrame) -> pd.DataFrame:
+        name_col, type_col = normalize_key_columns(df)
+        if target_fuel is None:
+            return df
+        mask = df[type_col].astype(str).fillna("Unknown").str.strip().str.casefold() == target_fuel
+        return df.loc[mask]
+
+    bp_df = _filter_fuel(bp_df)
+    bp_matrix = bp_df.reindex(columns=bp_ts).apply(pd.to_numeric, errors="coerce")
+    base_point_marginal_cost = float(np.nansum(bp_matrix.to_numpy(dtype=float)))
+
+    def _mask_df(df: pd.DataFrame, ts_cols: List[str]) -> pd.DataFrame:
+        df = df.copy()
+        name_col, type_col = normalize_key_columns(df)
+        df["_key"] = df[name_col].astype(str).str.strip().str.casefold()
+        df = df.drop_duplicates(subset=["_key"], keep="first").set_index("_key")
+        ts_sorted = sorted(set(ts_cols).intersection(bp_ts), key=lambda c: pd.to_datetime(c))
+        if not ts_sorted:
+            return df
+        df_ts = df.reindex(columns=ts_sorted).apply(pd.to_numeric, errors="coerce")
+        aligned_bp = bp_matrix.reindex(index=df.index, columns=ts_sorted)
+        mask = (aligned_bp == 0.0)
+        df_ts = df_ts.mask(mask)
+        df.update(df_ts)
+        return df
+
+    target_fuel = resource_type.casefold().strip() if resource_type else None
+
+    def _filter_fuel(df: pd.DataFrame) -> pd.DataFrame:
+        name_col, type_col = normalize_key_columns(df)
+        if target_fuel is None:
+            return df
+        mask = df[type_col].astype(str).fillna("Unknown").str.strip().str.casefold() == target_fuel
+        return df.loc[mask]
+
+    # Apply mask and fuel filter to MW steps
+    for step, df in list(mw_steps.items()):
+        ts_cols = detect_timestamp_columns(df, normalize_key_columns(df))
+        masked = _mask_df(df, ts_cols)
+        mw_steps[step] = _filter_fuel(masked)
+
+    # Apply mask and fuel filter to Price steps
+    for step, df in list(price_steps.items()):
+        ts_cols = detect_timestamp_columns(df, normalize_key_columns(df))
+        masked = _mask_df(df, ts_cols)
+        price_steps[step] = _filter_fuel(masked)
+
+    print(f"[INFO] {day}: Applied BP==0 masking and fuel filter across MW and Price steps for marginal bid price placeholder.")
+
+    # ----- Identify first MW step where cumulative sum exceeds Base Point total -----
+    cumulative = 0.0
+    target_step = None
+    cumulative_before_exceed = None  # cumulative total before the step that crosses BP
+    step_sums: Dict[int, float] = {}
+    for step in sorted(mw_steps.keys()):
+        df = mw_steps[step]
+        if df.empty:
+            step_sums[step] = 0.0
+            continue
+        name_col, type_col = normalize_key_columns(df)
+        ts_cols = detect_timestamp_columns(df, (name_col, type_col))
+        vals = df[ts_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+        step_sum = float(np.nansum(vals))
+        step_sums[step] = step_sum
+        if target_step is None and cumulative + step_sum > base_point_marginal_cost:
+            cumulative_before_exceed = cumulative
+            target_step = step
+        cumulative += step_sum
+    if target_step is not None:
+        print(
+            f"[INFO] {day}: cumulative MW exceeds Base Point at SCED step {target_step} "
+            f"(BP sum={base_point_marginal_cost}, cum before exceed={cumulative_before_exceed}, cum MW={cumulative})."
+        )
+    else:
+        print(f"[INFO] {day}: cumulative MW never exceeds Base Point (BP sum={base_point_marginal_cost}, cum MW={cumulative}).")
+
+    # ----- Load only the target step MW/Price (post-mask/filter already in mw_steps/price_steps) -----
+        if target_step is not None:
+            target_mw_df = mw_steps.get(target_step)
+            target_price_df = price_steps.get(target_step)
+            if target_mw_df is None or target_price_df is None:
+                print(f"[INFO] {day}: target step {target_step} missing MW or Price after filtering.")
+                return None
+            print(f"[INFO] {day}: isolated target MW/Price step {target_step} with shapes {target_mw_df.shape} / {target_price_df.shape}.")
+
+            # ----- Sort by price ascending and apply order to MW -----
+            try:
+                name_col, type_col = normalize_key_columns(target_price_df)
+                ts_cols = detect_timestamp_columns(target_price_df, (name_col, type_col))
+
+                price_long = target_price_df[[name_col] + ts_cols].melt(
+                    id_vars=[name_col],
+                    value_vars=ts_cols,
+                    var_name="timestamp",
+                    value_name="price",
+                )
+                price_long["price"] = pd.to_numeric(price_long["price"], errors="coerce")
+                price_long["timestamp"] = pd.to_datetime(price_long["timestamp"], errors="coerce")
+                price_long = price_long.dropna(subset=["price", "timestamp", name_col])
+                price_long = price_long.sort_values(by="price", ascending=True).reset_index(drop=True)
+                price_long["order"] = price_long.index
+
+                mw_long = target_mw_df[[name_col] + ts_cols].melt(
+                    id_vars=[name_col],
+                    value_vars=ts_cols,
+                    var_name="timestamp",
+                    value_name="mw",
+                )
+                mw_long["mw"] = pd.to_numeric(mw_long["mw"], errors="coerce")
+                mw_long["timestamp"] = pd.to_datetime(mw_long["timestamp"], errors="coerce")
+
+                merged_long = price_long.merge(
+                    mw_long,
+                    on=[name_col, "timestamp"],
+                    how="left",
+                    suffixes=("", "_mw"),
+                )
+                merged_long = merged_long.sort_values(by="order")
+
+                print(f"[INFO] {day}: sorted price/MW pairs for step {target_step} (rows={len(merged_long)}).")
+
+                # ----- Find marginal price at first MW that pushes total above BP -----
+                running = cumulative_before_exceed or 0.0
+                marginal_row = None
+                for _, row in merged_long.iterrows():
+                    mw_val = row.get("mw")
+                    if pd.isna(mw_val):
+                        continue
+                    mw_val = float(mw_val)
+                    if (running + mw_val) > base_point_marginal_cost:
+                        marginal_row = row
+                        break
+                    running += mw_val
+
+                if marginal_row is None:
+                    print(f"[INFO] {day}: no marginal MW found after sorting; returning None.")
+                    return None
+
+                result = pd.DataFrame(
+                    {
+                        "Resource Name": [marginal_row[name_col]],
+                        "Timestamp": [marginal_row["timestamp"]],
+                        "Price": [float(marginal_row["price"]) if pd.notna(marginal_row["price"]) else np.nan],
+                        "MW": [float(marginal_row["mw"]) if pd.notna(marginal_row["mw"]) else np.nan],
+                        "Base Point Sum": [base_point_marginal_cost],
+                        "Cumulative Before Exceed": [running],
+                        "Target Step": [target_step],
+                    }
+                )
+
+                out_dir = Path(plots_root) / day / "sced_marginal_bid_price"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                fuel_slug = (
+                    re.sub(r"[^0-9A-Za-z]+", "_", resource_type).strip("_")
+                    if resource_type
+                    else "all_fuels"
+                )
+                out_path = out_dir / f"{day}_marginal_bid_price_{fuel_slug}.csv"
+                try:
+                    result.to_csv(out_path, index=False)
+                    print(f"[INFO] {day}: saved marginal bid price CSV to {out_path}.")
+                except Exception as e:
+                    print(f"[WARN] {day}: failed to save marginal bid price CSV: {e}")
+
+                return result
+            except Exception as e:
+                print(f"[WARN] {day}: failed to sort price/MW pairs for step {target_step}: {e}")
+        else:
+            target_mw_df = None
+            target_price_df = None
+
+    return None
+
+
 
 def process_representative_bid_quantity_curves(
     day_dir: Path,

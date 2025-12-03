@@ -1484,6 +1484,7 @@ def process_marginal_bid_price(
         return None
 
     mw_files = list(day_dir.glob("aggregation_SCED1_Curve-MW*.csv")) or list(day_dir.glob("*SCED*Curve*MW*.csv"))
+    mw_files = [p for p in mw_files if "_normalized" not in p.stem and "_normalized_normalized" not in p.stem]
     if not mw_files:
         print(f"[INFO] {day}: no SCED MW step files; skipping marginal bid price.")
         return None

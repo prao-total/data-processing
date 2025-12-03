@@ -3053,6 +3053,9 @@ def main():
 
                 # Plot the representative bid quantity pair
                 process_representative_bid_quantity_curves(day_dir, out, rep_quantity_df, rep_price_df, price_location=price_loc, fuel_label=gen)
+
+                # Save the marginal bid price pair
+                process_marginal_bid_price(day_dir, out, gen)
         
         # 2) SCED price violins
         process_sced_violins_day(day_dir, out, SCED_SAVE_VALUES_CSV)

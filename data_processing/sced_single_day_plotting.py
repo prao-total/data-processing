@@ -1652,6 +1652,23 @@ def process_marginal_bid_price(
 
             print(f"[INFO] {day}: sorted price/MW pairs for step {target_step} (rows={len(merged_long)}).")
 
+            # Save ordered/melted inspection CSVs for quick logic checks
+            out_dir = Path(plots_root) / day / "sced_marginal_bid_price"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            fuel_slug = (
+                re.sub(r"[^0-9A-Za-z]+", "_", resource_type).strip("_")
+                if resource_type
+                else "all_fuels"
+            )
+            price_order_path = out_dir / f"{day}_price_order_step{target_step}_{fuel_slug}.csv"
+            mw_order_path = out_dir / f"{day}_mw_order_step{target_step}_{fuel_slug}.csv"
+            try:
+                price_long.to_csv(price_order_path, index=False)
+                merged_long.to_csv(mw_order_path, index=False)
+                print(f"[INFO] {day}: saved ordered price/MW tables to {price_order_path.name} and {mw_order_path.name}.")
+            except Exception as e:
+                print(f"[WARN] {day}: failed to save ordered price/MW inspection CSVs: {e}")
+
             # ----- Find marginal price at first MW that pushes total above BP -----
             running = cumulative_before_exceed or 0.0
             marginal_row = None

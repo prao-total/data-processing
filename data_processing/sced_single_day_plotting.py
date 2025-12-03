@@ -1607,99 +1607,99 @@ def process_marginal_bid_price(
         print(f"[INFO] {day}: cumulative MW never exceeds Base Point (BP sum={base_point_marginal_cost}, cum MW={cumulative}).")
 
     # ----- Load only the target step MW/Price (post-mask/filter already in mw_steps/price_steps) -----
-        if target_step is not None:
-            target_mw_df = mw_steps.get(target_step)
-            target_price_df = price_steps.get(target_step)
-            if target_mw_df is None or target_price_df is None:
-                print(f"[INFO] {day}: target step {target_step} missing MW or Price after filtering.")
+    if target_step is not None:
+        target_mw_df = mw_steps.get(target_step)
+        target_price_df = price_steps.get(target_step)
+        if target_mw_df is None or target_price_df is None:
+            print(f"[INFO] {day}: target step {target_step} missing MW or Price after filtering.")
+            return None
+        print(f"[INFO] {day}: isolated target MW/Price step {target_step} with shapes {target_mw_df.shape} / {target_price_df.shape}.")
+
+        # ----- Sort by price ascending and apply order to MW -----
+        try:
+            name_col, type_col = normalize_key_columns(target_price_df)
+            ts_cols = detect_timestamp_columns(target_price_df, (name_col, type_col))
+
+            price_long = target_price_df[[name_col] + ts_cols].melt(
+                id_vars=[name_col],
+                value_vars=ts_cols,
+                var_name="timestamp",
+                value_name="price",
+            )
+            price_long["price"] = pd.to_numeric(price_long["price"], errors="coerce")
+            price_long["timestamp"] = pd.to_datetime(price_long["timestamp"], errors="coerce")
+            price_long = price_long.dropna(subset=["price", "timestamp", name_col])
+            price_long = price_long.sort_values(by="price", ascending=True).reset_index(drop=True)
+            price_long["order"] = price_long.index
+
+            mw_long = target_mw_df[[name_col] + ts_cols].melt(
+                id_vars=[name_col],
+                value_vars=ts_cols,
+                var_name="timestamp",
+                value_name="mw",
+            )
+            mw_long["mw"] = pd.to_numeric(mw_long["mw"], errors="coerce")
+            mw_long["timestamp"] = pd.to_datetime(mw_long["timestamp"], errors="coerce")
+
+            merged_long = price_long.merge(
+                mw_long,
+                on=[name_col, "timestamp"],
+                how="left",
+                suffixes=("", "_mw"),
+            )
+            merged_long = merged_long.sort_values(by="order")
+
+            print(f"[INFO] {day}: sorted price/MW pairs for step {target_step} (rows={len(merged_long)}).")
+
+            # ----- Find marginal price at first MW that pushes total above BP -----
+            running = cumulative_before_exceed or 0.0
+            marginal_row = None
+            for _, row in merged_long.iterrows():
+                mw_val = row.get("mw")
+                if pd.isna(mw_val):
+                    continue
+                mw_val = float(mw_val)
+                if (running + mw_val) > base_point_marginal_cost:
+                    marginal_row = row
+                    break
+                running += mw_val
+
+            if marginal_row is None:
+                print(f"[INFO] {day}: no marginal MW found after sorting; returning None.")
                 return None
-            print(f"[INFO] {day}: isolated target MW/Price step {target_step} with shapes {target_mw_df.shape} / {target_price_df.shape}.")
 
-            # ----- Sort by price ascending and apply order to MW -----
+            result = pd.DataFrame(
+                {
+                    "Resource Name": [marginal_row[name_col]],
+                    "Timestamp": [marginal_row["timestamp"]],
+                    "Price": [float(marginal_row["price"]) if pd.notna(marginal_row["price"]) else np.nan],
+                    "MW": [float(marginal_row["mw"]) if pd.notna(marginal_row["mw"]) else np.nan],
+                    "Base Point Sum": [base_point_marginal_cost],
+                    "Cumulative Before Exceed": [running],
+                    "Target Step": [target_step],
+                }
+            )
+
+            out_dir = Path(plots_root) / day / "sced_marginal_bid_price"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            fuel_slug = (
+                re.sub(r"[^0-9A-Za-z]+", "_", resource_type).strip("_")
+                if resource_type
+                else "all_fuels"
+            )
+            out_path = out_dir / f"{day}_marginal_bid_price_{fuel_slug}.csv"
             try:
-                name_col, type_col = normalize_key_columns(target_price_df)
-                ts_cols = detect_timestamp_columns(target_price_df, (name_col, type_col))
-
-                price_long = target_price_df[[name_col] + ts_cols].melt(
-                    id_vars=[name_col],
-                    value_vars=ts_cols,
-                    var_name="timestamp",
-                    value_name="price",
-                )
-                price_long["price"] = pd.to_numeric(price_long["price"], errors="coerce")
-                price_long["timestamp"] = pd.to_datetime(price_long["timestamp"], errors="coerce")
-                price_long = price_long.dropna(subset=["price", "timestamp", name_col])
-                price_long = price_long.sort_values(by="price", ascending=True).reset_index(drop=True)
-                price_long["order"] = price_long.index
-
-                mw_long = target_mw_df[[name_col] + ts_cols].melt(
-                    id_vars=[name_col],
-                    value_vars=ts_cols,
-                    var_name="timestamp",
-                    value_name="mw",
-                )
-                mw_long["mw"] = pd.to_numeric(mw_long["mw"], errors="coerce")
-                mw_long["timestamp"] = pd.to_datetime(mw_long["timestamp"], errors="coerce")
-
-                merged_long = price_long.merge(
-                    mw_long,
-                    on=[name_col, "timestamp"],
-                    how="left",
-                    suffixes=("", "_mw"),
-                )
-                merged_long = merged_long.sort_values(by="order")
-
-                print(f"[INFO] {day}: sorted price/MW pairs for step {target_step} (rows={len(merged_long)}).")
-
-                # ----- Find marginal price at first MW that pushes total above BP -----
-                running = cumulative_before_exceed or 0.0
-                marginal_row = None
-                for _, row in merged_long.iterrows():
-                    mw_val = row.get("mw")
-                    if pd.isna(mw_val):
-                        continue
-                    mw_val = float(mw_val)
-                    if (running + mw_val) > base_point_marginal_cost:
-                        marginal_row = row
-                        break
-                    running += mw_val
-
-                if marginal_row is None:
-                    print(f"[INFO] {day}: no marginal MW found after sorting; returning None.")
-                    return None
-
-                result = pd.DataFrame(
-                    {
-                        "Resource Name": [marginal_row[name_col]],
-                        "Timestamp": [marginal_row["timestamp"]],
-                        "Price": [float(marginal_row["price"]) if pd.notna(marginal_row["price"]) else np.nan],
-                        "MW": [float(marginal_row["mw"]) if pd.notna(marginal_row["mw"]) else np.nan],
-                        "Base Point Sum": [base_point_marginal_cost],
-                        "Cumulative Before Exceed": [running],
-                        "Target Step": [target_step],
-                    }
-                )
-
-                out_dir = Path(plots_root) / day / "sced_marginal_bid_price"
-                out_dir.mkdir(parents=True, exist_ok=True)
-                fuel_slug = (
-                    re.sub(r"[^0-9A-Za-z]+", "_", resource_type).strip("_")
-                    if resource_type
-                    else "all_fuels"
-                )
-                out_path = out_dir / f"{day}_marginal_bid_price_{fuel_slug}.csv"
-                try:
-                    result.to_csv(out_path, index=False)
-                    print(f"[INFO] {day}: saved marginal bid price CSV to {out_path}.")
-                except Exception as e:
-                    print(f"[WARN] {day}: failed to save marginal bid price CSV: {e}")
-
-                return result
+                result.to_csv(out_path, index=False)
+                print(f"[INFO] {day}: saved marginal bid price CSV to {out_path}.")
             except Exception as e:
-                print(f"[WARN] {day}: failed to sort price/MW pairs for step {target_step}: {e}")
-        else:
-            target_mw_df = None
-            target_price_df = None
+                print(f"[WARN] {day}: failed to save marginal bid price CSV: {e}")
+
+            return result
+        except Exception as e:
+            print(f"[WARN] {day}: failed to sort price/MW pairs for step {target_step}: {e}")
+    else:
+        target_mw_df = None
+        target_price_df = None
 
     return None
 

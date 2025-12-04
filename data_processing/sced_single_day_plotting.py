@@ -1541,6 +1541,7 @@ def process_marginal_bid_price(
         bp_filtered["_key"] = bp_filtered[bp_name].astype(str).str.strip().str.casefold()
         bp_filtered = bp_filtered.drop_duplicates(subset=["_key"], keep="first").set_index("_key")
         bp_matrix = bp_filtered.reindex(columns=bp_ts).apply(pd.to_numeric, errors="coerce")
+        zero_rows_all_zero = set(bp_matrix.index[(bp_matrix == 0.0).all(axis=1)])
         zero_cols_by_name: Dict[str, set] = {
             idx: set(bp_matrix.columns[mask_row].tolist())
             for idx, mask_row in (bp_matrix == 0.0).iterrows()
@@ -1560,6 +1561,9 @@ def process_marginal_bid_price(
             ts_cols = detect_timestamp_columns(df, (name_col, type_col))
             df["_key"] = df[name_col].astype(str).str.strip().str.casefold()
             df = df.drop_duplicates(subset=["_key"], keep="first").set_index("_key")
+            # Drop rows whose BP is entirely zero
+            if zero_rows_all_zero:
+                df = df.loc[~df.index.isin(zero_rows_all_zero)]
             ts_sorted = sorted(set(ts_cols).intersection(bp_ts), key=lambda c: pd.to_datetime(c))
             if ts_sorted:
                 df_ts = df.reindex(columns=ts_sorted).apply(pd.to_numeric, errors="coerce")
@@ -1623,25 +1627,8 @@ def process_marginal_bid_price(
 
     # ----- Load only the target step MW/Price (post-mask/filter already in mw_steps/price_steps) -----
     if target_step is not None:
-        # Re-apply masking/filtering to ensure the ordered melt uses BP-masked data
         target_mw_df = mw_steps.get(target_step)
         target_price_df = price_steps.get(target_step)
-        if target_mw_df is not None:
-            name_col, type_col = normalize_key_columns(target_mw_df)
-            ts_cols = detect_timestamp_columns(target_mw_df, (name_col, type_col))
-            target_mw_df = _mask_df(target_mw_df, ts_cols)
-            target_mw_df = _filter_fuel(target_mw_df)
-            ts_cols = detect_timestamp_columns(target_mw_df, normalize_key_columns(target_mw_df))
-            if ts_cols:
-                target_mw_df = target_mw_df.dropna(subset=ts_cols, how="all")
-        if target_price_df is not None:
-            name_col, type_col = normalize_key_columns(target_price_df)
-            ts_cols = detect_timestamp_columns(target_price_df, (name_col, type_col))
-            target_price_df = _mask_df(target_price_df, ts_cols)
-            target_price_df = _filter_fuel(target_price_df)
-            ts_cols = detect_timestamp_columns(target_price_df, normalize_key_columns(target_price_df))
-            if ts_cols:
-                target_price_df = target_price_df.dropna(subset=ts_cols, how="all")
         if target_mw_df is None or target_price_df is None:
             print(f"[INFO] {day}: target step {target_step} missing MW or Price after filtering.")
             return None

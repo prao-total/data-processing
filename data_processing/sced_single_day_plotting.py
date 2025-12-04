@@ -1548,9 +1548,9 @@ def process_marginal_bid_price(
             if mask_row.any()
         }
 
-        def mask_step(df: pd.DataFrame, step_label: str) -> pd.DataFrame:
-            pre_path = debug_dir / f"{day}_{step_label}_pre_mask.csv"
-            post_path = debug_dir / f"{day}_{step_label}_post_mask.csv"
+        def mask_step(df: pd.DataFrame, step_label: str, resource:str) -> pd.DataFrame:
+            pre_path = debug_dir / f"{day}_{resource}_{step_label}_pre_mask.csv"
+            post_path = debug_dir / f"{day}_{resource}_{step_label}_post_mask.csv"
             try:
                 df.to_csv(pre_path, index=False)
             except Exception:
@@ -1583,11 +1583,11 @@ def process_marginal_bid_price(
 
         masked_mw: Dict[int, pd.DataFrame] = {}
         for step, df in mw_steps_in.items():
-            masked_mw[step] = mask_step(df, f"mw_step{step}")
+            masked_mw[step] = mask_step(df, f"mw_step{step}", resource_type)
 
         masked_price: Dict[int, pd.DataFrame] = {}
         for step, df in price_steps_in.items():
-            masked_price[step] = mask_step(df, f"price_step{step}")
+            masked_price[step] = mask_step(df, f"price_step{step}", resource_type)
 
         return bp_filtered.reset_index(drop=False), masked_mw, masked_price
 

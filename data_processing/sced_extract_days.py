@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Extract selected days and/or months from wide 5-minute timeseries CSVs.
+Extract selected days, months, or hours from wide 5-minute timeseries CSVs.
 
 INPUT FILES:
 - Named like either:
@@ -34,7 +34,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Tuple
 
 import pandas as pd
 
@@ -70,15 +70,15 @@ def normalize_key_columns(df: pd.DataFrame) -> Tuple[str, str]:
     return name_col, type_col
 
 
-def detect_timestamp_columns(df: pd.DataFrame, key_cols: Tuple[str, str]) -> Dict[pd.Timestamp, str]:
+def detect_timestamp_columns(df: pd.DataFrame, key_cols: Tuple[str, str]) -> List[Tuple[pd.Timestamp, str]]:
     """
     Attempt to parse remaining column headers as datetimes.
-    Returns a mapping {parsed_timestamp: original_column_name}
-    Only includes columns that successfully parse to a Timestamp.
-    Drops timezone info (localized to naive) for date/month filtering.
+    Returns a list of (parsed_timestamp, original_column_name) pairs, preserving all duplicates.
+    Only includes columns that successfully parse to a Timestamp. Drops timezone info (localized to naive)
+    for date/month filtering.
     """
     name_col, type_col = key_cols
-    ts_map: Dict[pd.Timestamp, str] = {}
+    ts_entries: List[Tuple[pd.Timestamp, str]] = []
 
     for col in df.columns:
         if col in (name_col, type_col):
@@ -88,24 +88,26 @@ def detect_timestamp_columns(df: pd.DataFrame, key_cols: Tuple[str, str]) -> Dic
             continue
         if getattr(ts, "tzinfo", None) is not None:
             ts = ts.tz_localize(None)
-        ts_map[pd.Timestamp(ts)] = col
+        ts_entries.append((pd.Timestamp(ts), col))
 
-    return ts_map
+    return ts_entries
 
 
-def subset_for_day(df: pd.DataFrame, key_cols: Tuple[str, str], ts_map: Dict[pd.Timestamp, str], day_str: str) -> pd.DataFrame:
+def subset_for_day(df: pd.DataFrame, key_cols: Tuple[str, str], ts_entries: List[Tuple[pd.Timestamp, str]], day_str: str) -> pd.DataFrame:
     """
     Select only the timestamp columns that fall on a specific day (YYYY-MM-DD).
     Returns a new DataFrame with key columns + sorted timestamp columns.
     """
     target_date = pd.to_datetime(day_str).date()
     cols = [key_cols[0], key_cols[1]]
-    day_ts = sorted([ts for ts in ts_map.keys() if ts.date() == target_date])
-    cols += [ts_map[ts] for ts in day_ts if ts_map[ts] in df.columns]
+    day_cols = [
+        col for ts, col in sorted(ts_entries, key=lambda t: t[0]) if ts.date() == target_date and col in df.columns
+    ]
+    cols += day_cols
     return df.loc[:, cols]
 
 
-def subset_for_month(df: pd.DataFrame, key_cols: Tuple[str, str], ts_map: Dict[pd.Timestamp, str], month_str: str) -> pd.DataFrame:
+def subset_for_month(df: pd.DataFrame, key_cols: Tuple[str, str], ts_entries: List[Tuple[pd.Timestamp, str]], month_str: str) -> pd.DataFrame:
     """
     Select only the timestamp columns that fall in a specific month (YYYY-MM).
     Returns a new DataFrame with key columns + sorted timestamp columns.
@@ -115,15 +117,19 @@ def subset_for_month(df: pd.DataFrame, key_cols: Tuple[str, str], ts_map: Dict[p
     year, month = target.year, target.month
 
     cols = [key_cols[0], key_cols[1]]
-    month_ts = sorted([ts for ts in ts_map.keys() if ts.year == year and ts.month == month])
-    cols += [ts_map[ts] for ts in month_ts if ts_map[ts] in df.columns]
+    month_cols = [
+        col
+        for ts, col in sorted(ts_entries, key=lambda t: t[0])
+        if ts.year == year and ts.month == month and col in df.columns
+    ]
+    cols += month_cols
     return df.loc[:, cols]
 
 
 def subset_for_hour(
     df: pd.DataFrame,
     key_cols: Tuple[str, str],
-    ts_map: Dict[pd.Timestamp, str],
+    ts_entries: List[Tuple[pd.Timestamp, str]],
     hour_start: pd.Timestamp,
 ) -> pd.DataFrame:
     """
@@ -131,8 +137,12 @@ def subset_for_hour(
     """
     hour_end = hour_start + pd.Timedelta(hours=1)
     cols = [key_cols[0], key_cols[1]]
-    hour_ts = sorted([ts for ts in ts_map.keys() if hour_start <= ts < hour_end])
-    cols += [ts_map[ts] for ts in hour_ts if ts_map[ts] in df.columns]
+    hour_cols = [
+        col
+        for ts, col in sorted(ts_entries, key=lambda t: t[0])
+        if hour_start <= ts < hour_end and col in df.columns
+    ]
+    cols += hour_cols
     return df.loc[:, cols]
 
 
@@ -211,26 +221,26 @@ def process_directory(
             print(f"[ERROR] {csv_path.name}: {e}", file=sys.stderr)
             continue
 
-        ts_map = detect_timestamp_columns(df, key_cols)
-        if not ts_map:
+        ts_entries = detect_timestamp_columns(df, key_cols)
+        if not ts_entries:
             print(f"[WARN] {csv_path.name}: No timestamp columns detected; skipping.", file=sys.stderr)
             continue
 
         # Per-day outputs
         for day in days_norm:
-            day_df = subset_for_day(df, key_cols, ts_map, day)
+            day_df = subset_for_day(df, key_cols, ts_entries, day)
             day_folder = output_dir / day
             write_subset(day_folder, csv_path.name, day_df, period_label=f"day {day}")
 
         # Per-month outputs
         for month in months_norm:
-            month_df = subset_for_month(df, key_cols, ts_map, month)
+            month_df = subset_for_month(df, key_cols, ts_entries, month)
             month_folder = output_dir / month
             write_subset(month_folder, csv_path.name, month_df, period_label=f"month {month}")
 
         # Per-hour outputs
         for hour_start in hours_norm:
-            hour_df = subset_for_hour(df, key_cols, ts_map, hour_start)
+            hour_df = subset_for_hour(df, key_cols, ts_entries, hour_start)
             hour_label = hour_start.strftime("%Y-%m-%d_%H%M")
             hour_folder = output_dir / hour_label
             pretty_label = hour_start.strftime("%Y-%m-%d %I:%M %p")

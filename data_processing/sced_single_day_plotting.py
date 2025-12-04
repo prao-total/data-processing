@@ -1546,6 +1546,9 @@ def process_marginal_bid_price(
     bp_matrix = bp_df.reindex(columns=bp_ts).apply(pd.to_numeric, errors="coerce")
     base_point_marginal_cost = float(np.nansum(bp_matrix.to_numpy(dtype=float)))
 
+    debug_dir = Path(plots_root) / day / "sced_marginal_bid_price" / "debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
     def _mask_df(df: pd.DataFrame, ts_cols: List[str]) -> pd.DataFrame:
         df = df.copy()
         name_col, type_col = normalize_key_columns(df)
@@ -1576,14 +1579,36 @@ def process_marginal_bid_price(
     # Apply mask and fuel filter to MW steps
     for step, df in list(mw_steps.items()):
         ts_cols = detect_timestamp_columns(df, normalize_key_columns(df))
+        pre_path = debug_dir / f"{day}_mw_step{step}_pre_mask.csv"
+        post_path = debug_dir / f"{day}_mw_step{step}_post_mask.csv"
+        try:
+            df.to_csv(pre_path, index=False)
+        except Exception:
+            pass
         masked = _mask_df(df, ts_cols)
-        mw_steps[step] = _filter_fuel(masked)
+        masked = _filter_fuel(masked)
+        mw_steps[step] = masked
+        try:
+            masked.to_csv(post_path, index=False)
+        except Exception:
+            pass
 
     # Apply mask and fuel filter to Price steps
     for step, df in list(price_steps.items()):
         ts_cols = detect_timestamp_columns(df, normalize_key_columns(df))
+        pre_path = debug_dir / f"{day}_price_step{step}_pre_mask.csv"
+        post_path = debug_dir / f"{day}_price_step{step}_post_mask.csv"
+        try:
+            df.to_csv(pre_path, index=False)
+        except Exception:
+            pass
         masked = _mask_df(df, ts_cols)
-        price_steps[step] = _filter_fuel(masked)
+        masked = _filter_fuel(masked)
+        price_steps[step] = masked
+        try:
+            masked.to_csv(post_path, index=False)
+        except Exception:
+            pass
 
     print(f"[INFO] {day}: Applied BP==0 masking and fuel filter across MW and Price steps for marginal bid price placeholder.")
 
@@ -1603,6 +1628,17 @@ def process_marginal_bid_price(
             ts_cols_tmp = detect_timestamp_columns(df, normalize_key_columns(df))
             if ts_cols_tmp:
                 df = df.dropna(subset=ts_cols_tmp, how="all")
+            # Save per-step pre/post during cumulative for debugging
+            cum_pre = debug_dir / f"{day}_cum_mw_step{step}_pre_mask.csv"
+            cum_post = debug_dir / f"{day}_cum_mw_step{step}_post_mask.csv"
+            try:
+                mw_steps[step].to_csv(cum_pre, index=False)
+            except Exception:
+                pass
+            try:
+                df.to_csv(cum_post, index=False)
+            except Exception:
+                pass
         except Exception:
             pass
         mw_steps[step] = df  # keep masked version for downstream

@@ -1547,8 +1547,21 @@ def process_marginal_bid_price(
             for idx, mask_row in (bp_matrix == 0.0).iterrows()
             if mask_row.any()
         }
+        try:
+            zero_map_df = pd.DataFrame(
+                {"Resource Name": list(zero_cols_by_name.keys()), "Zero Timestamps": [list(v) for v in zero_cols_by_name.values()]}
+            )
+            zero_map_df.to_csv(debug_dir / f"{day}_{resource_type}_bp_zero_pairs.csv", index=False)
+        except Exception:
+            pass
 
-        def mask_step(df: pd.DataFrame, step_label: str, resource:str) -> pd.DataFrame:
+        def mask_step(
+            df: pd.DataFrame,
+            step_label: str,
+            resource: str,
+            zero_map: Dict[str, set] = zero_cols_by_name,
+            zero_all_zero: set = zero_rows_all_zero,
+        ) -> pd.DataFrame:
             pre_path = debug_dir / f"{day}_{resource}_{step_label}_pre_mask.csv"
             post_path = debug_dir / f"{day}_{resource}_{step_label}_post_mask.csv"
             try:
@@ -1562,17 +1575,15 @@ def process_marginal_bid_price(
             df["_key"] = df[name_col].astype(str).str.strip().str.casefold()
             df = df.drop_duplicates(subset=["_key"], keep="first").set_index("_key")
             # Drop rows whose BP is entirely zero
-            if zero_rows_all_zero:
-                df = df.loc[~df.index.isin(zero_rows_all_zero)]
+            if zero_all_zero:
+                df = df.loc[~df.index.isin(zero_all_zero)]
             ts_sorted = sorted(set(ts_cols).intersection(bp_ts), key=lambda c: pd.to_datetime(c))
             if ts_sorted:
-                df_ts = df.reindex(columns=ts_sorted).apply(pd.to_numeric, errors="coerce")
-                for res_name in df_ts.index:
-                    zero_cols = zero_cols_by_name.get(res_name, set())
+                for res_name in df.index:
+                    zero_cols = zero_map.get(res_name, set())
                     cols_to_mask = [c for c in ts_sorted if c in zero_cols]
                     if cols_to_mask:
-                        df_ts.loc[res_name, cols_to_mask] = np.nan
-                df.update(df_ts)
+                        df.loc[res_name, cols_to_mask] = np.nan
                 df = df.dropna(subset=ts_sorted, how="all")
 
             try:
@@ -1583,11 +1594,11 @@ def process_marginal_bid_price(
 
         masked_mw: Dict[int, pd.DataFrame] = {}
         for step, df in mw_steps_in.items():
-            masked_mw[step] = mask_step(df, f"mw_step{step}", resource_type)
+            masked_mw[step] = mask_step(df, f"mw_step{step}", resource_type, zero_cols_by_name, zero_rows_all_zero)
 
         masked_price: Dict[int, pd.DataFrame] = {}
         for step, df in price_steps_in.items():
-            masked_price[step] = mask_step(df, f"price_step{step}", resource_type)
+            masked_price[step] = mask_step(df, f"price_step{step}", resource_type, zero_cols_by_name, zero_rows_all_zero)
 
         return bp_filtered.reset_index(drop=False), masked_mw, masked_price
 

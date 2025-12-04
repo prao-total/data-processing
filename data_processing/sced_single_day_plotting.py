@@ -1523,11 +1523,15 @@ def process_marginal_bid_price(
         bp_df["_key"] = bp_df[bp_name].astype(str).str.strip().str.casefold()
         bp_df = bp_df.drop_duplicates(subset=["_key"], keep="first").set_index("_key")
         bp_matrix = bp_df.reindex(columns=bp_ts).apply(pd.to_numeric, errors="coerce")
+        zero_mask = bp_matrix == 0.0
+        zero_cols_by_name: Dict[str, set] = {
+            idx: set(bp_matrix.columns[mask_row].tolist())
+            for idx, mask_row in zero_mask.iterrows()
+            if mask_row.any()
+        }
     except Exception as e:
         print(f"[WARN] {day}: BP masking skipped due to column detection error: {e}")
         return None
-
-    zero_mask = (bp_matrix == 0.0)
 
     target_fuel = resource_type.casefold().strip() if resource_type else None
 
@@ -1551,9 +1555,12 @@ def process_marginal_bid_price(
         if not ts_sorted:
             return df
         df_ts = df.reindex(columns=ts_sorted).apply(pd.to_numeric, errors="coerce")
-        aligned_bp = bp_matrix.reindex(index=df.index, columns=ts_sorted)
-        mask = (aligned_bp == 0.0)
-        df_ts = df_ts.mask(mask)
+        # Explicitly apply BP zero mask by name/timestamp pairs
+        for res_name in df_ts.index:
+            zero_cols = zero_cols_by_name.get(res_name, set())
+            cols_to_mask = [c for c in ts_sorted if c in zero_cols]
+            if cols_to_mask:
+                df_ts.loc[res_name, cols_to_mask] = np.nan
         df.update(df_ts)
         return df
 

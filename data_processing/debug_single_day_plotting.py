@@ -1579,13 +1579,11 @@ def process_marginal_bid_price(
                 df = df.loc[~df.index.isin(zero_all_zero)]
             ts_sorted = sorted(set(ts_cols).intersection(bp_ts), key=lambda c: pd.to_datetime(c))
             if ts_sorted:
-                df_ts = df.reindex(columns=ts_sorted).apply(pd.to_numeric, errors="coerce")
-                for res_name in df_ts.index:
+                for res_name in df.index:
                     zero_cols = zero_map.get(res_name, set())
                     cols_to_mask = [c for c in ts_sorted if c in zero_cols]
                     if cols_to_mask:
-                        df_ts.loc[res_name, cols_to_mask] = np.nan
-                df.update(df_ts)
+                        df.loc[res_name, cols_to_mask] = np.nan
                 df = df.dropna(subset=ts_sorted, how="all")
 
             try:

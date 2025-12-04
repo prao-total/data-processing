@@ -1614,6 +1614,26 @@ def process_marginal_bid_price(
         if target_mw_df is None or target_price_df is None:
             print(f"[INFO] {day}: target step {target_step} missing MW or Price after filtering.")
             return None
+        # Save per-step sums for debugging
+        try:
+            step_sum_df = pd.DataFrame(
+                {
+                    "SCED Step": list(step_sums.keys()),
+                    "Step Sum MW": list(step_sums.values()),
+                }
+            ).sort_values(by="SCED Step")
+            debug_out_dir = Path(plots_root) / day / "sced_marginal_bid_price"
+            debug_out_dir.mkdir(parents=True, exist_ok=True)
+            fuel_slug = (
+                re.sub(r"[^0-9A-Za-z]+", "_", resource_type).strip("_")
+                if resource_type
+                else "all_fuels"
+            )
+            step_sum_path = debug_out_dir / f"{day}_step_sums_{fuel_slug}.csv"
+            step_sum_df.to_csv(step_sum_path, index=False)
+            print(f"[INFO] {day}: saved step sum debug CSV to {step_sum_path}.")
+        except Exception as e:
+            print(f"[WARN] {day}: failed to save step sum debug CSV: {e}")
         print(f"[INFO] {day}: isolated target MW/Price step {target_step} with shapes {target_mw_df.shape} / {target_price_df.shape}.")
 
         # ----- Sort by price ascending and apply order to MW -----

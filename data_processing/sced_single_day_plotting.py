@@ -1516,101 +1516,83 @@ def process_marginal_bid_price(
         print(f"[INFO] {day}: no readable SCED price steps; skipping marginal bid price.")
         return None
 
-    # ----- Base Point masking: zero BP -> mask matching MW/Price cells -----
-    try:
-        bp_name, bp_type = normalize_key_columns(bp_df)
-        bp_ts = detect_timestamp_columns(bp_df, (bp_name, bp_type))
-        bp_df["_key"] = bp_df[bp_name].astype(str).str.strip().str.casefold()
-        bp_df = bp_df.drop_duplicates(subset=["_key"], keep="first").set_index("_key")
-        bp_matrix = bp_df.reindex(columns=bp_ts).apply(pd.to_numeric, errors="coerce")
-        zero_mask = bp_matrix == 0.0
-        zero_cols_by_name: Dict[str, set] = {
-            idx: set(bp_matrix.columns[mask_row].tolist())
-            for idx, mask_row in zero_mask.iterrows()
-            if mask_row.any()
-        }
-    except Exception as e:
-        print(f"[WARN] {day}: BP masking skipped due to column detection error: {e}")
-        return None
-
-    target_fuel = resource_type.casefold().strip() if resource_type else None
-
-    def _filter_fuel(df: pd.DataFrame) -> pd.DataFrame:
-        name_col, type_col = normalize_key_columns(df)
-        if target_fuel is None:
-            return df
-        mask = df[type_col].astype(str).fillna("Unknown").str.strip().str.casefold() == target_fuel
-        return df.loc[mask]
-
-    bp_df = _filter_fuel(bp_df)
-    bp_matrix = bp_df.reindex(columns=bp_ts).apply(pd.to_numeric, errors="coerce")
-    base_point_marginal_cost = float(np.nansum(bp_matrix.to_numpy(dtype=float)))
-
     debug_dir = Path(plots_root) / day / "sced_marginal_bid_price" / "debug"
     debug_dir.mkdir(parents=True, exist_ok=True)
 
-    def _mask_df(df: pd.DataFrame, ts_cols: List[str]) -> pd.DataFrame:
-        df = df.copy()
-        name_col, type_col = normalize_key_columns(df)
-        df["_key"] = df[name_col].astype(str).str.strip().str.casefold()
-        df = df.drop_duplicates(subset=["_key"], keep="first").set_index("_key")
-        ts_sorted = sorted(set(ts_cols).intersection(bp_ts), key=lambda c: pd.to_datetime(c))
-        if not ts_sorted:
-            return df
-        df_ts = df.reindex(columns=ts_sorted).apply(pd.to_numeric, errors="coerce")
-        # Explicitly apply BP zero mask by name/timestamp pairs
-        for res_name in df_ts.index:
-            zero_cols = zero_cols_by_name.get(res_name, set())
-            cols_to_mask = [c for c in ts_sorted if c in zero_cols]
-            if cols_to_mask:
-                df_ts.loc[res_name, cols_to_mask] = np.nan
-        df.update(df_ts)
-        return df
+    def apply_fuel_and_bp_mask(
+        bp_df_in: pd.DataFrame,
+        mw_steps_in: Dict[int, pd.DataFrame],
+        price_steps_in: Dict[int, pd.DataFrame],
+        fuel: Optional[str],
+    ) -> Tuple[pd.DataFrame, Dict[int, pd.DataFrame], Dict[int, pd.DataFrame]]:
+        """Filter by fuel then mask MW/Price by BP==0 name/timestamp pairs."""
+        fuel_key = fuel.casefold().strip() if fuel else None
 
-    target_fuel = resource_type.casefold().strip() if resource_type else None
+        def filter_fuel(df: pd.DataFrame) -> pd.DataFrame:
+            name_col, type_col = normalize_key_columns(df)
+            if fuel_key is None:
+                return df
+            mask = df[type_col].astype(str).fillna("Unknown").str.strip().str.casefold() == fuel_key
+            return df.loc[mask]
 
-    def _filter_fuel(df: pd.DataFrame) -> pd.DataFrame:
-        name_col, type_col = normalize_key_columns(df)
-        if target_fuel is None:
-            return df
-        mask = df[type_col].astype(str).fillna("Unknown").str.strip().str.casefold() == target_fuel
-        return df.loc[mask]
+        bp_filtered = filter_fuel(bp_df_in.copy())
+        bp_name, bp_type = normalize_key_columns(bp_filtered)
+        bp_ts = detect_timestamp_columns(bp_filtered, (bp_name, bp_type))
+        bp_filtered["_key"] = bp_filtered[bp_name].astype(str).str.strip().str.casefold()
+        bp_filtered = bp_filtered.drop_duplicates(subset=["_key"], keep="first").set_index("_key")
+        bp_matrix = bp_filtered.reindex(columns=bp_ts).apply(pd.to_numeric, errors="coerce")
+        zero_cols_by_name: Dict[str, set] = {
+            idx: set(bp_matrix.columns[mask_row].tolist())
+            for idx, mask_row in (bp_matrix == 0.0).iterrows()
+            if mask_row.any()
+        }
 
-    # Apply mask and fuel filter to MW steps
-    for step, df in list(mw_steps.items()):
-        ts_cols = detect_timestamp_columns(df, normalize_key_columns(df))
-        pre_path = debug_dir / f"{day}_mw_step{step}_pre_mask.csv"
-        post_path = debug_dir / f"{day}_mw_step{step}_post_mask.csv"
-        try:
-            df.to_csv(pre_path, index=False)
-        except Exception:
-            pass
-        masked = _mask_df(df, ts_cols)
-        masked = _filter_fuel(masked)
-        mw_steps[step] = masked
-        try:
-            masked.to_csv(post_path, index=False)
-        except Exception:
-            pass
+        def mask_step(df: pd.DataFrame, step_label: str) -> pd.DataFrame:
+            pre_path = debug_dir / f"{day}_{step_label}_pre_mask.csv"
+            post_path = debug_dir / f"{day}_{step_label}_post_mask.csv"
+            try:
+                df.to_csv(pre_path, index=False)
+            except Exception:
+                pass
 
-    # Apply mask and fuel filter to Price steps
-    for step, df in list(price_steps.items()):
-        ts_cols = detect_timestamp_columns(df, normalize_key_columns(df))
-        pre_path = debug_dir / f"{day}_price_step{step}_pre_mask.csv"
-        post_path = debug_dir / f"{day}_price_step{step}_post_mask.csv"
-        try:
-            df.to_csv(pre_path, index=False)
-        except Exception:
-            pass
-        masked = _mask_df(df, ts_cols)
-        masked = _filter_fuel(masked)
-        price_steps[step] = masked
-        try:
-            masked.to_csv(post_path, index=False)
-        except Exception:
-            pass
+            df = filter_fuel(df.copy())
+            name_col, type_col = normalize_key_columns(df)
+            ts_cols = detect_timestamp_columns(df, (name_col, type_col))
+            df["_key"] = df[name_col].astype(str).str.strip().str.casefold()
+            df = df.drop_duplicates(subset=["_key"], keep="first").set_index("_key")
+            ts_sorted = sorted(set(ts_cols).intersection(bp_ts), key=lambda c: pd.to_datetime(c))
+            if ts_sorted:
+                df_ts = df.reindex(columns=ts_sorted).apply(pd.to_numeric, errors="coerce")
+                for res_name in df_ts.index:
+                    zero_cols = zero_cols_by_name.get(res_name, set())
+                    cols_to_mask = [c for c in ts_sorted if c in zero_cols]
+                    if cols_to_mask:
+                        df_ts.loc[res_name, cols_to_mask] = np.nan
+                df.update(df_ts)
+                df = df.dropna(subset=ts_sorted, how="all")
 
-    print(f"[INFO] {day}: Applied BP==0 masking and fuel filter across MW and Price steps for marginal bid price placeholder.")
+            try:
+                df.to_csv(post_path, index=False)
+            except Exception:
+                pass
+            return df.reset_index(drop=False)
+
+        masked_mw: Dict[int, pd.DataFrame] = {}
+        for step, df in mw_steps_in.items():
+            masked_mw[step] = mask_step(df, f"mw_step{step}")
+
+        masked_price: Dict[int, pd.DataFrame] = {}
+        for step, df in price_steps_in.items():
+            masked_price[step] = mask_step(df, f"price_step{step}")
+
+        return bp_filtered.reset_index(drop=False), masked_mw, masked_price
+
+    bp_df, mw_steps, price_steps = apply_fuel_and_bp_mask(bp_df, mw_steps, price_steps, resource_type)
+    bp_name, bp_type = normalize_key_columns(bp_df)
+    bp_ts = detect_timestamp_columns(bp_df, (bp_name, bp_type))
+    bp_matrix = bp_df.reindex(columns=bp_ts).apply(pd.to_numeric, errors="coerce")
+    base_point_marginal_cost = float(np.nansum(bp_matrix.to_numpy(dtype=float)))
+    print(f"[INFO] {day}: Applied fuel filter and BP==0 masking across MW/Price steps for marginal bid price.")
 
     # ----- Identify first MW step where cumulative sum exceeds Base Point total -----
     cumulative = 0.0
@@ -1618,30 +1600,7 @@ def process_marginal_bid_price(
     cumulative_before_exceed = None  # cumulative total before the step that crosses BP
     step_sums: Dict[int, float] = {}
     for step in sorted(mw_steps.keys()):
-        # Re-mask and filter defensively to ensure zero-BP cells are excluded
         df = mw_steps[step]
-        try:
-            name_col_tmp, type_col_tmp = normalize_key_columns(df)
-            ts_cols_tmp = detect_timestamp_columns(df, (name_col_tmp, type_col_tmp))
-            df = _mask_df(df, ts_cols_tmp)
-            df = _filter_fuel(df)
-            ts_cols_tmp = detect_timestamp_columns(df, normalize_key_columns(df))
-            if ts_cols_tmp:
-                df = df.dropna(subset=ts_cols_tmp, how="all")
-            # Save per-step pre/post during cumulative for debugging
-            cum_pre = debug_dir / f"{day}_cum_mw_step{step}_pre_mask.csv"
-            cum_post = debug_dir / f"{day}_cum_mw_step{step}_post_mask.csv"
-            try:
-                mw_steps[step].to_csv(cum_pre, index=False)
-            except Exception:
-                pass
-            try:
-                df.to_csv(cum_post, index=False)
-            except Exception:
-                pass
-        except Exception:
-            pass
-        mw_steps[step] = df  # keep masked version for downstream
         if df.empty:
             step_sums[step] = 0.0
             continue

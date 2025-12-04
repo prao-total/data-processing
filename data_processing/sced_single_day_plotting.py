@@ -1593,7 +1593,19 @@ def process_marginal_bid_price(
     cumulative_before_exceed = None  # cumulative total before the step that crosses BP
     step_sums: Dict[int, float] = {}
     for step in sorted(mw_steps.keys()):
+        # Re-mask and filter defensively to ensure zero-BP cells are excluded
         df = mw_steps[step]
+        try:
+            name_col_tmp, type_col_tmp = normalize_key_columns(df)
+            ts_cols_tmp = detect_timestamp_columns(df, (name_col_tmp, type_col_tmp))
+            df = _mask_df(df, ts_cols_tmp)
+            df = _filter_fuel(df)
+            ts_cols_tmp = detect_timestamp_columns(df, normalize_key_columns(df))
+            if ts_cols_tmp:
+                df = df.dropna(subset=ts_cols_tmp, how="all")
+        except Exception:
+            pass
+        mw_steps[step] = df  # keep masked version for downstream
         if df.empty:
             step_sums[step] = 0.0
             continue

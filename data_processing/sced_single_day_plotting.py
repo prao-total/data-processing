@@ -1440,9 +1440,6 @@ def process_bid_quantity_curve_hourlies(
         print(f"[INFO] {day}: no readable SCED price steps; skipping hourly bid curve.")
         return None
 
-    debug_dir = Path(plots_root) / day / "sced_hourly_bid_curves" / "debug"
-    debug_dir.mkdir(parents=True, exist_ok=True)
-
     def apply_fuel_and_bp_mask_hourly(
         bp_df_in: pd.DataFrame,
         mw_steps_in: Dict[int, pd.DataFrame],
@@ -1471,14 +1468,6 @@ def process_bid_quantity_curve_hourlies(
             for idx, mask_row in (bp_matrix == 0.0).iterrows()
             if mask_row.any()
         }
-        try:
-            zero_map_df = pd.DataFrame(
-                {"Resource Name": list(zero_cols_by_name.keys()), "Zero Timestamps": [list(v) for v in zero_cols_by_name.values()]}
-            )
-            zero_map_df.to_csv(debug_dir / f"{day}_bp_zero_pairs.csv", index=False)
-        except Exception:
-            pass
-
         def mask_step(
             df: pd.DataFrame,
             step_label: str,
@@ -1486,13 +1475,6 @@ def process_bid_quantity_curve_hourlies(
             zero_map: Dict[str, set] = zero_cols_by_name,
             zero_all_zero: set = zero_rows_all_zero,
         ) -> pd.DataFrame:
-            pre_path = debug_dir / f"{day}_{resource}_{step_label}_pre_mask.csv"
-            post_path = debug_dir / f"{day}_{resource}_{step_label}_post_mask.csv"
-            try:
-                df.to_csv(pre_path, index=False)
-            except Exception:
-                pass
-
             df = filter_fuel(df.copy())
             name_col, type_col = normalize_key_columns(df)
             ts_cols = detect_timestamp_columns(df, (name_col, type_col))
@@ -1508,11 +1490,6 @@ def process_bid_quantity_curve_hourlies(
                     if cols_to_mask:
                         df.loc[res_name, cols_to_mask] = np.nan
                 df = df.dropna(subset=ts_sorted, how="all")
-
-            try:
-                df.to_csv(post_path, index=False)
-            except Exception:
-                pass
             return df.reset_index(drop=False)
 
         masked_mw: Dict[int, pd.DataFrame] = {}
@@ -1646,8 +1623,8 @@ def process_bid_quantity_curve_hourlies(
     hourly_curves = aggregate_curves_hourly(curves_nested)
 
     def plot_hourly_curves(curves_hourly: Dict[str, Dict[int, List[Dict[str, float]]]]) -> None:
-        """Plot hourly step curves per fuel; peak hours (7-17) vs off-peak colored differently."""
-        out_root = Path(day_dir) / "sced_bid_quantity_hourlies" / day
+        """Plot hourly step curves per fuel on a single plot; peak hours (7-17) vs off-peak colored differently."""
+        out_root = Path(plots_root) / day / "sced_bid_quantity_hourlies"
         out_root.mkdir(parents=True, exist_ok=True)
         peak_color = "#1f77b4"
         off_color = "#888888"
@@ -1655,7 +1632,9 @@ def process_bid_quantity_curve_hourlies(
         for fuel, hour_map in curves_hourly.items():
             fuel_label = str(fuel) if fuel is not None else "Unknown"
             fuel_slug = re.sub(r"[^0-9A-Za-z]+", "_", fuel_label).strip("_") or "fuel"
-            for hour, pts in hour_map.items():
+            fig, ax = plt.subplots(figsize=(10, 6))
+
+            for hour, pts in sorted(hour_map.items()):
                 if not pts:
                     continue
                 pts_sorted = sorted(pts, key=lambda x: x.get("SCED Step", 0))
@@ -1663,21 +1642,20 @@ def process_bid_quantity_curve_hourlies(
                 y = [p.get("price", np.nan) for p in pts_sorted]
                 color = peak_color if 7 <= hour <= 17 else off_color
                 label = f"Hour {hour:02d} ({'Peak' if 7 <= hour <= 17 else 'Off-peak'})"
+                ax.step(x, y, where="post", color=color, label=label, alpha=0.8)
 
-                fig, ax = plt.subplots(figsize=(8, 5))
-                ax.step(x, y, where="post", color=color, label=label)
-                ax.set_xlabel("MW")
-                ax.set_ylabel("Price")
-                ax.set_title(f"{day} – {fuel_label} Hour {hour:02d} Bid Curve")
-                ax.grid(True, alpha=0.3)
-                ax.legend()
-                fname = out_root / f"{day}_{fuel_slug}_hour{hour:02d}.png"
-                try:
-                    fig.savefig(fname, bbox_inches="tight")
-                    print(f"[INFO] Saved hourly bid curve plot: {fname}")
-                except Exception as e:
-                    print(f"[WARN] {day}: failed to save hourly plot for {fuel_label} hour {hour}: {e}")
-                plt.close(fig)
+            ax.set_xlabel("MW")
+            ax.set_ylabel("Price")
+            ax.set_title(f"{day} – {fuel_label} Bid Curves (All Hours)")
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+            fname = out_root / f"{day}_{fuel_slug}_hours_all.png"
+            try:
+                fig.savefig(fname, bbox_inches="tight")
+                print(f"[INFO] Saved hourly bid curve plot: {fname}")
+            except Exception as e:
+                print(f"[WARN] {day}: failed to save hourly plot for {fuel_label}: {e}")
+            plt.close(fig)
 
     plot_hourly_curves(hourly_curves)
 

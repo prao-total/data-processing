@@ -1634,6 +1634,8 @@ def process_bid_quantity_curve_hourlies(
             fuel_slug = re.sub(r"[^0-9A-Za-z]+", "_", fuel_label).strip("_") or "fuel"
             fig, ax = plt.subplots(figsize=(10, 6))
 
+            peak_label_used = False
+            off_label_used = False
             for hour, pts in sorted(hour_map.items()):
                 if not pts:
                     continue
@@ -1641,7 +1643,12 @@ def process_bid_quantity_curve_hourlies(
                 x = [p.get("mw", np.nan) for p in pts_sorted]
                 y = [p.get("price", np.nan) for p in pts_sorted]
                 color = peak_color if 7 <= hour <= 17 else off_color
-                label = f"Hour {hour:02d} ({'Peak' if 7 <= hour <= 17 else 'Off-peak'})"
+                if 7 <= hour <= 17:
+                    label = "Peak Hours" if not peak_label_used else None
+                    peak_label_used = True
+                else:
+                    label = "Off-Peak Hours" if not off_label_used else None
+                    off_label_used = True
                 ax.step(x, y, where="post", color=color, label=label, alpha=0.8)
 
             ax.set_xlabel("MW")

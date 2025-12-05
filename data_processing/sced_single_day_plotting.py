@@ -1442,24 +1442,248 @@ def process_bid_quantity_curve_hourlies(
         print(f"[INFO] {day}: no readable SCED price steps; skipping hourly bid curve.")
         return None
 
-    if save_summary:
-        summary = pd.DataFrame({
-            "Type": ["BP", "HSL", "MW Steps", "Price Steps"],
-            "Count": [len(bp_df), len(hsl_df), len(mw_steps), len(price_steps)],
-            "Resource Type Filter": [resource_type] * 4,
-            "Price Location": [price_location] * 4,
-        })
-        out_dir = Path(plots_root) / day / "sced_hourly_bid_curves"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_csv = out_dir / "hourly_bid_curve_loaded_counts.csv"
-        try:
-            summary.to_csv(out_csv, index=False)
-            print(f"[OK] Saved: {out_csv}")
-        except Exception as e:
-            print(f"[WARN] {day}: failed to write hourly bid curve summary CSV: {e}")
-        return summary
+    debug_dir = Path(plots_root) / day / "sced_hourly_bid_curves" / "debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
 
-    return None
+    def apply_fuel_and_bp_mask_hourly(
+        bp_df_in: pd.DataFrame,
+        mw_steps_in: Dict[int, pd.DataFrame],
+        price_steps_in: Dict[int, pd.DataFrame],
+        fuel: Optional[str],
+    ) -> Tuple[pd.DataFrame, Dict[int, pd.DataFrame], Dict[int, pd.DataFrame]]:
+        """Filter by fuel then mask MW/Price by BP==0 name/timestamp pairs (hourly variant)."""
+        fuel_key = fuel.casefold().strip() if fuel else None
+
+        def filter_fuel(df: pd.DataFrame) -> pd.DataFrame:
+            name_col, type_col = normalize_key_columns(df)
+            if fuel_key is None:
+                return df
+            mask = df[type_col].astype(str).fillna("Unknown").str.strip().str.casefold() == fuel_key
+            return df.loc[mask]
+
+        bp_filtered = filter_fuel(bp_df_in.copy())
+        bp_name, bp_type = normalize_key_columns(bp_filtered)
+        bp_ts = detect_timestamp_columns(bp_filtered, (bp_name, bp_type))
+        bp_filtered["_key"] = bp_filtered[bp_name].astype(str).str.strip().str.casefold()
+        bp_filtered = bp_filtered.drop_duplicates(subset=["_key"], keep="first").set_index("_key")
+        bp_matrix = bp_filtered.reindex(columns=bp_ts).apply(pd.to_numeric, errors="coerce")
+        zero_rows_all_zero = set(bp_matrix.index[(bp_matrix == 0.0).all(axis=1)])
+        zero_cols_by_name: Dict[str, set] = {
+            idx: set(bp_matrix.columns[mask_row].tolist())
+            for idx, mask_row in (bp_matrix == 0.0).iterrows()
+            if mask_row.any()
+        }
+        try:
+            zero_map_df = pd.DataFrame(
+                {"Resource Name": list(zero_cols_by_name.keys()), "Zero Timestamps": [list(v) for v in zero_cols_by_name.values()]}
+            )
+            zero_map_df.to_csv(debug_dir / f"{day}_bp_zero_pairs.csv", index=False)
+        except Exception:
+            pass
+
+        def mask_step(
+            df: pd.DataFrame,
+            step_label: str,
+            resource: str,
+            zero_map: Dict[str, set] = zero_cols_by_name,
+            zero_all_zero: set = zero_rows_all_zero,
+        ) -> pd.DataFrame:
+            pre_path = debug_dir / f"{day}_{resource}_{step_label}_pre_mask.csv"
+            post_path = debug_dir / f"{day}_{resource}_{step_label}_post_mask.csv"
+            try:
+                df.to_csv(pre_path, index=False)
+            except Exception:
+                pass
+
+            df = filter_fuel(df.copy())
+            name_col, type_col = normalize_key_columns(df)
+            ts_cols = detect_timestamp_columns(df, (name_col, type_col))
+            df["_key"] = df[name_col].astype(str).str.strip().str.casefold()
+            df = df.drop_duplicates(subset=["_key"], keep="first").set_index("_key")
+            if zero_all_zero:
+                df = df.loc[~df.index.isin(zero_all_zero)]
+            ts_sorted = sorted(set(ts_cols).intersection(bp_ts), key=lambda c: pd.to_datetime(c))
+            if ts_sorted:
+                for res_name in df.index:
+                    zero_cols = zero_map.get(res_name, set())
+                    cols_to_mask = [c for c in ts_sorted if c in zero_cols]
+                    if cols_to_mask:
+                        df.loc[res_name, cols_to_mask] = np.nan
+                df = df.dropna(subset=ts_sorted, how="all")
+
+            try:
+                df.to_csv(post_path, index=False)
+            except Exception:
+                pass
+            return df.reset_index(drop=False)
+
+        masked_mw: Dict[int, pd.DataFrame] = {}
+        for step, df in mw_steps_in.items():
+            masked_mw[step] = mask_step(df, f"mw_step{step}", resource_type, zero_cols_by_name, zero_rows_all_zero)
+
+        masked_price: Dict[int, pd.DataFrame] = {}
+        for step, df in price_steps_in.items():
+            masked_price[step] = mask_step(df, f"price_step{step}", resource_type, zero_cols_by_name, zero_rows_all_zero)
+
+        return bp_filtered.reset_index(drop=False), masked_mw, masked_price
+
+    bp_df, mw_steps, price_steps = apply_fuel_and_bp_mask_hourly(bp_df, mw_steps, price_steps, resource_type)
+    print(f"[INFO] {day}: Applied fuel filter and BP==0 masking across MW/Price steps for hourly bid curve.")
+
+    def build_price_mw_curves_nested(
+        mw_steps_in: Dict[int, pd.DataFrame],
+        price_steps_in: Dict[int, pd.DataFrame],
+    ) -> Dict[str, Dict[Tuple[str, pd.Timestamp], List[Dict[str, Any]]]]:
+        """
+        Build nested curves: {fuel: { (resource, timestamp): [ {SCED Step, mw, price}, ... ] } }.
+        """
+        curves: Dict[str, Dict[Tuple[str, pd.Timestamp], List[Dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
+        for step in sorted(mw_steps_in.keys()):
+            mw_df = mw_steps_in.get(step)
+            price_df = price_steps_in.get(step)
+            if mw_df is None or price_df is None or mw_df.empty or price_df.empty:
+                continue
+            try:
+                mw_name, mw_type = normalize_key_columns(mw_df)
+                price_name, price_type = normalize_key_columns(price_df)
+                mw_ts = detect_timestamp_columns(mw_df, (mw_name, mw_type))
+                price_ts = detect_timestamp_columns(price_df, (price_name, price_type))
+                ts_cols = sorted(set(mw_ts).intersection(price_ts), key=lambda c: pd.to_datetime(c))
+                if not ts_cols:
+                    continue
+                mw_long = mw_df[[mw_name, mw_type] + ts_cols].melt(
+                    id_vars=[mw_name, mw_type],
+                    value_vars=ts_cols,
+                    var_name="timestamp",
+                    value_name="mw",
+                )
+                price_long = price_df[[price_name, price_type] + ts_cols].melt(
+                    id_vars=[price_name, price_type],
+                    value_vars=ts_cols,
+                    var_name="timestamp",
+                    value_name="price",
+                )
+                mw_long["timestamp"] = pd.to_datetime(mw_long["timestamp"], errors="coerce")
+                price_long["timestamp"] = pd.to_datetime(price_long["timestamp"], errors="coerce")
+                merged = mw_long.merge(
+                    price_long,
+                    left_on=[mw_name, "timestamp"],
+                    right_on=[price_name, "timestamp"],
+                    how="inner",
+                    suffixes=("", "_y"),
+                )
+                merged = merged.rename(columns={mw_name: "Resource Name", mw_type: "Resource Type"})
+                merged = merged[["Resource Name", "Resource Type", "timestamp", "mw", "price"]]
+                for _, row in merged.iterrows():
+                    res = row["Resource Name"]
+                    fuel = row["Resource Type"]
+                    ts = row["timestamp"]
+                    mw_val = pd.to_numeric(row["mw"], errors="coerce")
+                    price_val = pd.to_numeric(row["price"], errors="coerce")
+                    if pd.isna(ts) or pd.isna(mw_val) or pd.isna(price_val):
+                        continue
+                    key = (str(res), ts)
+                    curves[str(fuel)][key].append(
+                        {"SCED Step": step, "mw": float(mw_val), "price": float(price_val)}
+                    )
+            except Exception as e:
+                print(f"[WARN] {day}: failed to build price/MW curve for step {step}: {e}")
+                continue
+        # Convert each curve to cumulative MW by SCED Step
+        for fuel, res_map in curves.items():
+            for key, pts in res_map.items():
+                pts_sorted = sorted(pts, key=lambda x: x["SCED Step"])
+                cumulative = 0.0
+                for pt in pts_sorted:
+                    cumulative += pt.get("mw", 0.0)
+                    pt["mw"] = cumulative
+                res_map[key] = pts_sorted
+        return curves
+
+    curves_nested = build_price_mw_curves_nested(mw_steps, price_steps)
+
+    def aggregate_curves_hourly(
+        curves: Dict[str, Dict[Tuple[str, pd.Timestamp], List[Dict[str, Any]]]]
+    ) -> Dict[str, Dict[int, List[Dict[str, float]]]]:
+        """
+        Aggregate curves into hourly buckets:
+        {fuel: {hour (1-24): [ {SCED Step, mw, price}, ... ]}}
+        MW is summed per step; price is MW-weighted per step.
+        """
+        hourly: Dict[str, Dict[int, List[Dict[str, float]]]] = defaultdict(dict)
+
+        for fuel, res_map in curves.items():
+            # bucket curves by hour (1-24)
+            buckets: Dict[int, List[List[Dict[str, float]]]] = defaultdict(list)
+            for (res_name, ts), points in res_map.items():
+                if pd.isna(ts):
+                    continue
+                hour_bucket = int(ts.hour) + 1  # 1-24
+                buckets[hour_bucket].append(points)
+
+            # aggregate each hour bucket
+            for hour, curves_list in buckets.items():
+                step_mw: Dict[int, float] = defaultdict(float)
+                step_price_weight: Dict[int, float] = defaultdict(float)
+                for curve in curves_list:
+                    for pt in curve:
+                        step = int(pt.get("SCED Step", 0))
+                        mw_val = float(pt.get("mw", 0.0)) if pd.notna(pt.get("mw")) else 0.0
+                        price_val = float(pt.get("price", 0.0)) if pd.notna(pt.get("price")) else 0.0
+                        step_mw[step] += mw_val
+                        step_price_weight[step] += price_val * mw_val
+                aggregated = []
+                for step in sorted(step_mw.keys()):
+                    mw_total = step_mw[step]
+                    if mw_total > 0:
+                        price_avg = step_price_weight[step] / mw_total
+                    else:
+                        price_avg = np.nan
+                    aggregated.append({"SCED Step": step, "mw": mw_total, "price": price_avg})
+                hourly[fuel][hour] = aggregated
+
+        return hourly
+
+    # Aggregate curves into hourly buckets (MW summed, price MW-weighted)
+    hourly_curves = aggregate_curves_hourly(curves_nested)
+
+    def plot_hourly_curves(curves_hourly: Dict[str, Dict[int, List[Dict[str, float]]]]) -> None:
+        """Plot hourly step curves per fuel; peak hours (7-17) vs off-peak colored differently."""
+        out_root = Path(day_dir) / "sced_bid_quantity_hourlies" / day
+        out_root.mkdir(parents=True, exist_ok=True)
+        peak_color = "#1f77b4"
+        off_color = "#888888"
+
+        for fuel, hour_map in curves_hourly.items():
+            fuel_label = str(fuel) if fuel is not None else "Unknown"
+            fuel_slug = re.sub(r"[^0-9A-Za-z]+", "_", fuel_label).strip("_") or "fuel"
+            for hour, pts in hour_map.items():
+                if not pts:
+                    continue
+                pts_sorted = sorted(pts, key=lambda x: x.get("SCED Step", 0))
+                x = [p.get("mw", np.nan) for p in pts_sorted]
+                y = [p.get("price", np.nan) for p in pts_sorted]
+                color = peak_color if 7 <= hour <= 17 else off_color
+                label = f"Hour {hour:02d} ({'Peak' if 7 <= hour <= 17 else 'Off-peak'})"
+
+                fig, ax = plt.subplots(figsize=(8, 5))
+                ax.step(x, y, where="post", color=color, label=label)
+                ax.set_xlabel("MW")
+                ax.set_ylabel("Price")
+                ax.set_title(f"{day} – {fuel_label} Hour {hour:02d} Bid Curve")
+                ax.grid(True, alpha=0.3)
+                ax.legend()
+                fname = out_root / f"{day}_{fuel_slug}_hour{hour:02d}.png"
+                try:
+                    fig.savefig(fname, bbox_inches="tight")
+                    print(f"[INFO] Saved hourly bid curve plot: {fname}")
+                except Exception as e:
+                    print(f"[WARN] {day}: failed to save hourly plot for {fuel_label} hour {hour}: {e}")
+                plt.close(fig)
+
+    plot_hourly_curves(hourly_curves)
+
+    return hourly_curves
 
 
 def process_marginal_bid_price(

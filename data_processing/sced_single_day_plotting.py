@@ -1389,9 +1389,6 @@ def process_bid_quantity_curve_hourlies(
     day_dir: Path,
     plots_root: Path,
     resource_type: Optional[str] = None,
-    price_location: Optional[str] = None,
-    show_legend: bool = True,
-    save_summary: bool = False,
 ) -> Optional[pd.DataFrame]:
     """
     Skeleton for hourly bid-quantity curves.
@@ -3330,6 +3327,8 @@ def main():
 
                 # Save the marginal bid price pair
                 process_marginal_bid_price(day_dir, out, gen)
+
+                process_bid_quantity_curve_hourlies(day_dir, out, resource_type=gen)
         
         # 2) SCED price violins
         process_sced_violins_day(day_dir, out, SCED_SAVE_VALUES_CSV)

@@ -119,18 +119,91 @@ def preprocess_categories(df: pd.DataFrame) -> pd.DataFrame:
     return processed
 
 
+def plot_value_scatter(
+    x_df: pd.DataFrame,
+    y_df: pd.DataFrame,
+    output_dir: Path,
+) -> Path | None:
+    """Scatter plot of values from two dataframes (x and y)."""
+    x_property = str(x_df["Property"].iloc[0]).strip()
+    x_units = str(x_df["Units"].iloc[0]).strip()
+    y_property = str(y_df["Property"].iloc[0]).strip()
+    y_units = str(y_df["Units"].iloc[0]).strip()
+
+    x_label = f"{x_property} {x_units}".strip()
+    y_label = f"{y_property} {y_units}".strip()
+
+    merged = (
+        x_df[["Child Object", "Value", "Category"]]
+        .merge(
+            y_df[["Child Object", "Value"]],
+            on="Child Object",
+            how="inner",
+            suffixes=("_x", "_y"),
+        )
+        .dropna()
+    )
+
+    if merged.empty:
+        return None
+
+    property_dir = output_dir / f"{x_property}_vs_{y_property}"
+    property_dir.mkdir(parents=True, exist_ok=True)
+    output_path = property_dir / f"scatter_{x_property}_vs_{y_property}.png"
+
+    categories = merged["Category"].astype(str)
+    unique_categories = sorted(categories.unique())
+    cmap = plt.get_cmap("tab20")
+    color_map = {
+        category: cmap(idx % cmap.N) for idx, category in enumerate(unique_categories)
+    }
+
+    plt.figure(figsize=(10, 6))
+    for category in unique_categories:
+        mask = categories == category
+        plt.scatter(
+            merged.loc[mask, "Value_x"],
+            merged.loc[mask, "Value_y"],
+            label=category,
+            color=color_map[category],
+            alpha=0.8,
+            edgecolors="none",
+        )
+
+    plt.xlabel(x_label)
+    plt.ylabel(y_label)
+    plt.title(f"{y_property} vs {x_property}")
+    plt.legend(title="Category", loc="best")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+
+    return output_path
+
+
 def main() -> None:
     base_dir = Path(__file__).resolve().parent
     input_paths = default_input_paths(base_dir)
     dataframes = load_pcm_inputs(input_paths)
+    processed = {name: preprocess_categories(df) for name, df in dataframes.items()}
 
     output_dir = base_dir / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    for df in dataframes.values():
-        df = preprocess_categories(df)
+    for df in processed.values():
         plot_value_distribution(df, output_dir)
         plot_value_boxplot_by_category(df, output_dir)
+
+    capacity_df = processed["capacity"]
+    heatrate_df = processed["heatrate"]
+    vom_df = processed["vom"]
+    fom_df = processed["fom"]
+
+    plot_value_scatter(capacity_df, heatrate_df, output_dir)
+    plot_value_scatter(capacity_df, vom_df, output_dir)
+    plot_value_scatter(capacity_df, fom_df, output_dir)
+    plot_value_scatter(heatrate_df, vom_df, output_dir)
+    plot_value_scatter(heatrate_df, fom_df, output_dir)
 
 
 if __name__ == "__main__":

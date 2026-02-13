@@ -17,7 +17,7 @@ class PcmInputPaths:
 
 
 def default_input_paths(base_dir: Path) -> PcmInputPaths:
-    inputs_dir = base_dir / "inputs"
+    inputs_dir = base_dir / "inputs" / "pcm_inputs"
     return PcmInputPaths(
         heatrate=inputs_dir / "heatrate.csv",
         vom=inputs_dir / "vom.csv",

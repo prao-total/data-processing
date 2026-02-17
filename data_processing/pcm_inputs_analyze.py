@@ -14,6 +14,7 @@ class PcmInputPaths:
     vom: Path
     fom: Path
     capacity: Path
+    startcosts: Path
 
 
 def default_input_paths(base_dir: Path) -> PcmInputPaths:
@@ -23,6 +24,7 @@ def default_input_paths(base_dir: Path) -> PcmInputPaths:
         vom="C:/Users/L1165683/GitHub_Repos/data-processing/inputs/pcm_inputs/vom.csv",
         fom="C:/Users/L1165683/GitHub_Repos/data-processing/inputs/pcm_inputs/fom.csv",
         capacity="C:/Users/L1165683/GitHub_Repos/data-processing/inputs/pcm_inputs/capacity.csv",
+        startcosts="C:/Users/L1165683/GitHub_Repos/data-processing/inputs/pcm_inputs/startcosts.csv",
     )
 
 
@@ -32,6 +34,7 @@ def load_pcm_inputs(paths: PcmInputPaths) -> Dict[str, pd.DataFrame]:
         "vom": pd.read_csv(paths.vom),
         "fom": pd.read_csv(paths.fom),
         "capacity": pd.read_csv(paths.capacity),
+        "startcosts": pd.read_csv(paths.startcosts),
     }
 
 
@@ -200,10 +203,12 @@ def main() -> None:
     heatrate_df = processed["heatrate"]
     vom_df = processed["vom"]
     fom_df = processed["fom"]
+    startcosts_df = processed["startcosts"]
 
     plot_value_scatter(capacity_df, heatrate_df, output_dir)
     plot_value_scatter(capacity_df, vom_df, output_dir)
     plot_value_scatter(capacity_df, fom_df, output_dir)
+    plot_value_scatter(capacity_df, startcosts_df, output_dir)
     plot_value_scatter(heatrate_df, vom_df, output_dir)
     plot_value_scatter(heatrate_df, fom_df, output_dir)
 

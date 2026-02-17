@@ -19,10 +19,10 @@ class PcmInputPaths:
 def default_input_paths(base_dir: Path) -> PcmInputPaths:
     inputs_dir = base_dir / "inputs" / "pcm_inputs"
     return PcmInputPaths(
-        heatrate=inputs_dir / "heatrate.csv",
-        vom=inputs_dir / "vom.csv",
-        fom=inputs_dir / "fom.csv",
-        capacity=inputs_dir / "capacity.csv",
+        heatrate="C:/Users/L1165683/GitHub_Repos/data-processing/inputs/pcm_inputs/heatrate.csv",
+        vom="C:/Users/L1165683/GitHub_Repos/data-processing/inputs/pcm_inputs/vom.csv",
+        fom="C:/Users/L1165683/GitHub_Repos/data-processing/inputs/pcm_inputs/fom.csv",
+        capacity="C:/Users/L1165683/GitHub_Repos/data-processing/inputs/pcm_inputs/capacity.csv",
     )
 
 
@@ -110,6 +110,8 @@ def preprocess_categories(df: pd.DataFrame) -> pd.DataFrame:
         (r"\bccct\b", "CCCT_NG"),
         (r"\bcgt\b|\bgt\b", "CCGT_NG"),
         (r"\bcoal\b", "ST_COAL"),
+        (r"\bhydro\b", "HY_WAT"),
+        (r"\bgas\b", "OtherTech_NG"),
     ]
 
     for pattern, replacement in mapping:

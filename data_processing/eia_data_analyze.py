@@ -269,6 +269,8 @@ def plot_avg_monthly_heat_rate_by_fuel_time_series(
     if not processed_by_year:
         return
 
+    allowed_fuels = {"BFG", "SUN", "WND", "WAT", "NG", "NUC", "LIG", "RC", "DFO", "PC"}
+
     month_map = {
         "January": 1,
         "February": 2,
@@ -290,6 +292,12 @@ def plot_avg_monthly_heat_rate_by_fuel_time_series(
         if not heat_rate_cols:
             continue
         subset = df[["Reported Fuel Type Code", *heat_rate_cols]].copy()
+        subset["Reported Fuel Type Code"] = (
+            subset["Reported Fuel Type Code"].astype(str).str.strip().str.upper()
+        )
+        subset = subset[subset["Reported Fuel Type Code"].isin(allowed_fuels)]
+        if subset.empty:
+            continue
         melted = subset.melt(
             id_vars=["Reported Fuel Type Code"],
             value_vars=heat_rate_cols,

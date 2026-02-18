@@ -17,16 +17,8 @@ class EiaInputPaths:
 def default_input_paths() -> EiaInputPaths:
     # Hardcode your input directory here.
     return EiaInputPaths(
-        input_dir=Path("C:/path/to/your/eia_inputs")
+        input_dir=Path("C:/Users/L1165683/GitHub_Repos/data-processing/inputs/eia_data")
     )
-
-
-def load_csvs_from_paths(paths: Iterable[Path]) -> Dict[str, pd.DataFrame]:
-    data: Dict[str, pd.DataFrame] = {}
-    for path in paths:
-        year = _year_from_filename(path)
-        data[year] = pd.read_csv(path)
-    return data
 
 
 def load_csvs_from_dir(directory: Path) -> Dict[str, pd.DataFrame]:

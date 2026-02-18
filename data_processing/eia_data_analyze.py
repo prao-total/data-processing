@@ -323,6 +323,7 @@ def plot_avg_monthly_heat_rate_by_fuel_time_series(
         .mean()
         .reset_index()
     )
+    grouped["Heat Rate"] = grouped["Heat Rate"] * 1_000_000.0
 
     years = sorted(int(y) for y in processed_by_year.keys())
     min_year, max_year = years[0], years[-1]
@@ -344,9 +345,71 @@ def plot_avg_monthly_heat_rate_by_fuel_time_series(
         plt.plot(full_index, series.values, label=str(fuel_type))
 
     plt.xlabel("Month")
-    plt.ylabel("MMBtu/kWh")
+    plt.ylabel("Btu/kWh")
     plt.title(f"Average Monthly Heat Rate by Fuel ({min_year}\u2013{max_year})")
     plt.legend(title="Fuel Type", loc="best")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+
+
+def plot_heat_rate_boxplot_by_fuel_btu(
+    processed_by_year: Dict[str, pd.DataFrame],
+    output_dir: Path,
+) -> None:
+    if not processed_by_year:
+        return
+
+    years = sorted(int(y) for y in processed_by_year.keys())
+    min_year, max_year = years[0], years[-1]
+
+    combined = pd.concat(processed_by_year.values(), ignore_index=True)
+    heat_rate_cols = [col for col in combined.columns if col.startswith("Heat Rate ")]
+    if not heat_rate_cols:
+        return
+
+    fuel_types = (
+        combined["Reported Fuel Type Code"]
+        .astype(str)
+        .str.strip()
+        .replace({"nan": None})
+        .dropna()
+        .unique()
+    )
+
+    box_data = []
+    labels = []
+    for fuel_type in fuel_types:
+        fuel_df = combined[
+            combined["Reported Fuel Type Code"].astype(str).str.strip() == fuel_type
+        ]
+        if fuel_df.empty:
+            continue
+
+        values = fuel_df[heat_rate_cols].stack().dropna() * 1_000_000.0
+        if values.empty:
+            continue
+
+        box_data.append(values)
+        labels.append(fuel_type)
+
+    if not box_data:
+        return
+
+    output_path = (
+        output_dir
+        / "eia_data"
+        / "boxplot_all_years_by_fuel"
+        / "heat_rate_boxplot_by_fuel_btu.png"
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    plt.figure(figsize=(12, 6))
+    plt.boxplot(box_data, labels=labels, showfliers=True)
+    plt.xlabel("Fuel Type")
+    plt.ylabel("Btu/kWh")
+    plt.title(f"Heat Rate by Fuel ({min_year}\u2013{max_year})")
+    plt.xticks(rotation=45, ha="right")
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
     plt.close()
@@ -364,6 +427,7 @@ def main() -> None:
     plot_heat_rate_boxplot_all_years(processed, output_dir)
     plot_heat_rate_distribution_all_years_by_fuel(processed, output_dir)
     plot_avg_monthly_heat_rate_by_fuel_time_series(processed, output_dir)
+    plot_heat_rate_boxplot_by_fuel_btu(processed, output_dir)
 
 
 if __name__ == "__main__":

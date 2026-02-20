@@ -8,6 +8,53 @@ import re
 import pandas as pd
 import matplotlib.pyplot as plt
 
+EIA860_TECH_TO_EIA923_FUELS = {
+    # Natural gas family
+    "Natural Gas Fired Combined Cycle": ["NG", "DFO", "JF", "KER"],
+    "Natural Gas Fired Combustion Turbine": ["NG", "DFO", "JF", "KER"],
+    "Natural Gas Steam Turbine": ["NG", "DFO"],
+    "Natural Gas Internal Combustion Engine": ["NG", "PG"],
+    "Other Natural Gas": ["NG", "BFG", "OG", "SC", "SGC", "SGP"],
+    "Other Gases": ["BFG", "OG", "SC", "SGC", "SGP"],
+
+    # Coal family
+    "Conventional Steam Coal": ["BIT", "SUB", "LIG", "ANT", "RC", "WC", "DFO"],
+    "Coal Integrated Gasification Combined Cycle": ["SGC", "SGP", "DFO"],
+
+    # Petroleum family
+    "Petroleum Coke": ["PC", "DFO"],
+    "Petroleum Liquids": ["RFO", "DFO", "KER", "JF", "WO"],
+
+    # Nuclear
+    "Nuclear": ["NUC"],
+
+    # Hydro & storage
+    "Conventional Hydroelectric": ["WAT"],
+    "Hydroelectric Pumped Storage": ["MWH"],
+    "Batteries": ["MWH"],
+    "Flywheels": ["MWH"],
+    "Natural Gas with Compressed Air Storage": ["MWH", "NG"],
+
+    # Wind & solar
+    "Onshore Wind Turbine": ["WND"],
+    "Offshore Wind Turbine": ["WND"],
+    "Solar Photovoltaic": ["SUN"],
+    "Solar Thermal without Energy Storage": ["SUN"],
+    "Solar Thermal with Energy Storage": ["SUN"],  # in most reporting; storage may appear as MWH in some contexts
+
+    # Geothermal & heat
+    "Geothermal": ["GEO"],
+
+    # Biomass & waste
+    "Wood/Wood Waste Biomass": ["WDS", "WDL", "BLQ"],
+    "Other Waste Biomass": ["AB", "OBS", "OBL", "OBG", "SLW"],
+    "Municipal Solid Waste": ["MSB", "MSN"],
+    "Landfill Gas": ["LFG"],
+
+    # Catch-all
+    "All Other": ["OTH"]
+}
+
 
 @dataclass(frozen=True)
 class EiaInputPaths:

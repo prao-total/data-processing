@@ -33,6 +33,19 @@ def load_csvs_from_dir(directory: Path) -> Dict[str, pd.DataFrame]:
     return data
 
 
+def load_generation_data(directory: Path) -> pd.DataFrame | None:
+    gen_path = directory / "eiagendata.csv"
+    if not gen_path.exists():
+        return None
+    return pd.read_csv(gen_path)
+
+
+def process_generation_data(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    if df is None:
+        return None
+    return df[df["State"] == "TX"].copy()
+
+
 def process_yearly_dataframes(
     raw_by_year: Dict[str, pd.DataFrame],
 ) -> Dict[str, pd.DataFrame]:
@@ -419,6 +432,8 @@ def main() -> None:
     inputs = default_input_paths()
     dataframes = load_csvs_from_dir(inputs.input_dir)
     processed = process_yearly_dataframes(dataframes)
+    generation_df = load_generation_data(inputs.input_dir)
+    generation_processed = process_generation_data(generation_df)
 
     # TODO: Add plotting functions and call them here.
     output_dir = Path(__file__).resolve().parent / "output"
@@ -428,6 +443,7 @@ def main() -> None:
     plot_heat_rate_distribution_all_years_by_fuel(processed, output_dir)
     plot_avg_monthly_heat_rate_by_fuel_time_series(processed, output_dir)
     plot_heat_rate_boxplot_by_fuel_btu(processed, output_dir)
+    _ = generation_processed
 
 
 if __name__ == "__main__":

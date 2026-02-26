@@ -186,6 +186,21 @@ def plot_value_scatter(
     return output_path
 
 
+def summarize_capacity_by_category(df: pd.DataFrame, output_dir: Path) -> Path:
+    summary_dir = output_dir / "summary_stats"
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    output_path = summary_dir / "capacity_summary_by_category.csv"
+
+    data = df[["Category", "Value"]].dropna()
+    summary = (
+        data.groupby("Category")["Value"]
+        .agg(count="count", mean="mean", min="min", max="max")
+        .reset_index()
+    )
+    summary.to_csv(output_path, index=False)
+    return output_path
+
+
 def main() -> None:
     base_dir = Path(__file__).resolve().parent
     input_paths = default_input_paths(base_dir)
@@ -211,6 +226,8 @@ def main() -> None:
     plot_value_scatter(capacity_df, startcosts_df, output_dir)
     plot_value_scatter(heatrate_df, vom_df, output_dir)
     plot_value_scatter(heatrate_df, fom_df, output_dir)
+
+    summarize_capacity_by_category(capacity_df, output_dir)
 
 
 if __name__ == "__main__":

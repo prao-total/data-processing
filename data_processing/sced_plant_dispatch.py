@@ -77,6 +77,7 @@ def plot_dispatch(df):
             subset["Dispatch (GWh)"],
             label=None,
             marker="o",
+            color="black",
         )
 
     ax1.set_xlabel("fuel")

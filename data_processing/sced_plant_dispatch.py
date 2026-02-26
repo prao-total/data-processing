@@ -69,13 +69,13 @@ def plot_dispatch(df):
             x + offset,
             subset["Number of Plants"],
             width=width,
-            label=f"# Plants {year}",
+            label=str(year),
             alpha=0.8,
         )
         ax2.scatter(
             x + offset,
             subset["Dispatch (GWh)"],
-            label=f"Dispatch (GWh) {year}",
+            label=None,
             marker="o",
         )
 
@@ -87,10 +87,16 @@ def plot_dispatch(df):
     ax1.set_xticklabels(resources, rotation=45, ha="right")
 
     handles1, labels1 = ax1.get_legend_handles_labels()
-    handles2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(handles1 + handles2, labels1 + labels2, loc="upper left", ncol=2)
+    ax1.legend(
+        handles1,
+        labels1,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.15),
+        ncol=len(years),
+    )
 
     fig.tight_layout()
+    fig.subplots_adjust(bottom=0.2)
     return fig, ax1, ax2
 
 

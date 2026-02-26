@@ -16,8 +16,8 @@ class CcgtMatchConfig:
 def default_config() -> CcgtMatchConfig:
     # Hardcode your input CSV path here.
     return CcgtMatchConfig(
-        input_csv=Path("C:/Users/L1165683/GitHub_Repos/data-processing/inputs/sced_ccgt_matching.csv"),
-        output_dir=None,
+        input_csv=Path("C:/Users/L1165683/OneDrive - TotalEnergies/Documents/db/plots/plants_by_fuel.csv"),
+        output_dir=Path("C:/Users/L1165683/GitHub_Repos/data-processing/data_processing/output/buckets"),
     )
 
 

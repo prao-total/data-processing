@@ -67,22 +67,22 @@ def plot_dispatch(df):
 
         ax1.bar(
             x + offset,
-            subset["Number of Plants"],
+            subset["Dispatch (GWh)"],
             width=width,
             label=str(year),
             alpha=0.8,
         )
         ax2.scatter(
             x + offset,
-            subset["Dispatch (GWh)"],
+            subset["Number of Plants"],
             label=None,
             marker="o",
             color="black",
         )
 
     ax1.set_xlabel("fuel")
-    ax1.set_ylabel("# Plants")
-    ax2.set_ylabel("Dispatch (GWh)")
+    ax1.set_ylabel("Dispatch (GWh)")
+    ax2.set_ylabel("# Plants")
 
     ax1.set_xticks(x)
     ax1.set_xticklabels(resources, rotation=45, ha="right")

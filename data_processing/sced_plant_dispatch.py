@@ -5,8 +5,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-CSV_PATH = "/Users/pradyrao/Downloads/two_axis_plot.csv"
-OUTPUT_DIR = "/Users/pradyrao/VSCode/data-processing/outputs"
+CSV_PATH = "C:/Users/L1165683/Downloads/two_axis_plot.csv"
+OUTPUT_DIR = "C:/Users/L1165683/GitHub_Repos/data-processing/data_processing/output/dispatch_count_plot"
 
 
 def _extract_year(col_name):

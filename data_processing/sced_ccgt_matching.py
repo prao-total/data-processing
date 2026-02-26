@@ -117,7 +117,8 @@ def main() -> None:
     print(f"Identified {len(buckets)} buckets (placeholder logic)")
 
     print("\nUnits per fuel:")
-    print(summarize_units_per_fuel(bucketed).to_string())
+    units_per_fuel = summarize_units_per_fuel(bucketed)
+    print(units_per_fuel.to_string())
 
     targets = ["CCGT90", "SCLE90"]
     print("\nUnits per fuel in buckets containing target fuels:")
@@ -128,13 +129,26 @@ def main() -> None:
         print(target_counts.to_string(index=False))
 
     print("\nBucket types (unique fuel combinations) with count:")
-    print(summarize_bucket_types(bucketed).to_string(index=False))
+    bucket_types = summarize_bucket_types(bucketed)
+    print(bucket_types.to_string(index=False))
 
     if config.output_dir is not None:
         config.output_dir.mkdir(parents=True, exist_ok=True)
         output_path = config.output_dir / "sced_ccgt_buckets.csv"
         bucketed.to_csv(output_path, index=False)
         print(f"Wrote bucketed output to {output_path}")
+
+        units_path = config.output_dir / "sced_ccgt_units_per_fuel.csv"
+        units_per_fuel.reset_index(name="unit_count").to_csv(units_path, index=False)
+        print(f"Wrote units-per-fuel summary to {units_path}")
+
+        targets_path = config.output_dir / "sced_ccgt_units_with_target_fuels.csv"
+        target_counts.to_csv(targets_path, index=False)
+        print(f"Wrote target-fuel bucket summary to {targets_path}")
+
+        bucket_types_path = config.output_dir / "sced_ccgt_bucket_types.csv"
+        bucket_types.to_csv(bucket_types_path, index=False)
+        print(f"Wrote bucket-type summary to {bucket_types_path}")
 
 
 if __name__ == "__main__":

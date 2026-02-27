@@ -95,7 +95,7 @@ def save_load_duration_curve(off_peak_df, output_dir):
 
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.plot(df["Hours"], df["Base Point"], linewidth=1.5)
-    ax.set_xlabel("Hours")
+    ax.set_xlabel("# of 5-minute intervals")
     ax.set_ylabel("MW")
     ax.set_title("Load Duration Curve (Off-Peak)")
     ax.grid(True, linestyle="--", alpha=0.4)

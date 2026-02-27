@@ -94,11 +94,15 @@ def make_plots(df, output_path):
 def save_load_duration_curve(off_peak_df, output_dir):
     df = off_peak_df.copy()
     df["Base Point"] = pd.to_numeric(df["Base Point"], errors="coerce")
-    series = df["Base Point"].dropna().sort_values(ascending=False).reset_index(drop=True)
+    df = df.dropna(subset=["Base Point"]).sort_values("Base Point", ascending=False).reset_index(drop=True)
+    df["Hours"] = df.index + 1
 
     output_path = ensure_output_dir(output_dir, "load_duration_curve")
+    data_path = output_path / "load_duration_curve_data.csv"
+    df.to_csv(data_path, index=False)
+
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(series.index + 1, series.values, linewidth=1.5)
+    ax.plot(df["Hours"], df["Base Point"], linewidth=1.5)
     ax.set_xlabel("Hours")
     ax.set_ylabel("MW")
     ax.set_title("Load Duration Curve (Off-Peak)")
@@ -106,7 +110,7 @@ def save_load_duration_curve(off_peak_df, output_dir):
     plot_path = output_path / "load_duration_curve.png"
     fig.savefig(plot_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
-    return plot_path
+    return plot_path, data_path
 
 
 def main():
@@ -114,11 +118,12 @@ def main():
     output_path = ensure_output_dir()
     off_peak_df, summary_path = run_analysis(df, output_path)
     agg_path = save_resource_hour_counts(off_peak_df, OUTPUT_DIR)
-    ldc_path = save_load_duration_curve(off_peak_df, OUTPUT_DIR)
+    ldc_path, ldc_data_path = save_load_duration_curve(off_peak_df, OUTPUT_DIR)
     plot_path = make_plots(off_peak_df, output_path)
     print(f"Saved summary to {summary_path}")
     print(f"Saved resource hours/base point to {agg_path}")
     print(f"Saved load duration curve to {ldc_path}")
+    print(f"Saved load duration curve data to {ldc_data_path}")
     print(f"Saved plot to {plot_path}")
 
 

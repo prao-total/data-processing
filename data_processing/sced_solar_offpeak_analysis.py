@@ -68,7 +68,7 @@ def save_resource_hour_counts(off_peak_df, output_dir):
     df = off_peak_df.copy()
     df["Base Point"] = pd.to_numeric(df["Base Point"], errors="coerce")
     agg = (
-        df.groupby("resource_type", dropna=False)
+        df.groupby("resource_name", dropna=False)
         .agg(
             hours_count=("ts", "count"),
             base_point_sum=("Base Point", "sum"),

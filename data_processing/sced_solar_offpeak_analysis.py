@@ -4,10 +4,10 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 # TODO: Replace with real input file path.
-CSV_PATH = "C:/path/to/your/input.csv"
+CSV_PATH = "C:/Users/L1165683/OneDrive - TotalEnergies/Documents/db/plots/Base Point_mean_hourly_202301010000_202312312359/aggregated.csv"
 
 # TODO: Replace with real output directory.
-OUTPUT_DIR = "C:/path/to/your/output"
+OUTPUT_DIR = "C:/Users/L1165683/GitHub_Repos/data-processing/data_processing/output/solar_offpeak_analysis"
 
 
 OFF_PEAK_END_HOUR = 6  # inclusive

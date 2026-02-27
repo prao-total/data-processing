@@ -81,14 +81,6 @@ def save_resource_hour_counts(off_peak_df, output_dir):
     return out_path
 
 
-def make_plots(df, output_path):
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.axis("off")
-    ax.text(0.5, 0.5, "Plots pending", ha="center", va="center")
-    plot_path = output_path / "placeholder_plot.png"
-    fig.savefig(plot_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    return plot_path
 
 
 def save_load_duration_curve(off_peak_df, output_dir):
@@ -119,12 +111,10 @@ def main():
     off_peak_df, summary_path = run_analysis(df, output_path)
     agg_path = save_resource_hour_counts(off_peak_df, OUTPUT_DIR)
     ldc_path, ldc_data_path = save_load_duration_curve(off_peak_df, OUTPUT_DIR)
-    plot_path = make_plots(off_peak_df, output_path)
     print(f"Saved summary to {summary_path}")
     print(f"Saved resource hours/base point to {agg_path}")
     print(f"Saved load duration curve to {ldc_path}")
     print(f"Saved load duration curve data to {ldc_data_path}")
-    print(f"Saved plot to {plot_path}")
 
 
 if __name__ == "__main__":

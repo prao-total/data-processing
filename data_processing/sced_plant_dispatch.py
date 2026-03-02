@@ -4,6 +4,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.lines import Line2D
 
 CSV_PATH = "C:/Users/L1165683/Downloads/two_axis_plot.csv"
 OUTPUT_DIR = "C:/Users/L1165683/GitHub_Repos/data-processing/data_processing/output/dispatch_count_plot"
@@ -80,7 +81,7 @@ def plot_dispatch(df):
             color="black",
         )
 
-    ax1.set_xlabel("fuel")
+    ax1.set_xlabel("Fuel Type")
     ax1.set_ylabel("Dispatch (GWh)")
     ax2.set_ylabel("# Plants")
 
@@ -88,16 +89,19 @@ def plot_dispatch(df):
     ax1.set_xticklabels(resources, rotation=45, ha="right")
 
     handles1, labels1 = ax1.get_legend_handles_labels()
+    dot_proxy = Line2D([0], [0], marker="o", color="black", linestyle="None")
+    legend_handles = handles1 + [dot_proxy]
+    legend_labels = labels1 + ["Plant Count"]
     ax1.legend(
-        handles1,
-        labels1,
+        legend_handles,
+        legend_labels,
         loc="upper center",
-        bbox_to_anchor=(0.5, -0.15),
-        ncol=len(years),
+        bbox_to_anchor=(0.5, -0.2),
+        ncol=min(len(legend_labels), 4),
     )
 
     fig.tight_layout()
-    fig.subplots_adjust(bottom=0.2)
+    fig.subplots_adjust(bottom=0.25)
     return fig, ax1, ax2
 
 

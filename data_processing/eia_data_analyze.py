@@ -136,8 +136,10 @@ def plot_eiahr_yearly_boxplot(input_dir: Path, output_dir: Path) -> None:
     box = plt.boxplot(box_data, labels=plot_cols, patch_artist=True, showfliers=True)
     for patch, color in zip(box["boxes"], box_colors):
         patch.set_facecolor(color)
-    plt.xlabel("Fuel Type")
-    plt.ylabel("Value")
+    plt.xlabel("Category")
+    plt.ylabel("Heat Rate [Btu/kWh]")
+    max_val = max((series.max() for series in box_data if not series.empty), default=0)
+    plt.ylim(0, max_val if max_val > 0 else 1)
     plt.title("EIA Heat Rate Yearly Boxplot")
     plt.xticks(rotation=45, ha="right")
     plt.tight_layout()

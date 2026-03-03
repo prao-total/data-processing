@@ -68,6 +68,7 @@ def plot_value_boxplot_by_category(df: pd.DataFrame, output_dir: Path) -> Path |
     ylabel = f"{property_label} {units_label}".strip()
 
     data = pd.DataFrame({"Category": categories, "Value": values}).dropna()
+    data = data[~data["Category"].isin(["Intertie Proxy Gen", "Spark Spread Proxies"])]
     if data.empty:
         return
 

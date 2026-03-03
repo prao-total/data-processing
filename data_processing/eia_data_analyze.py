@@ -93,6 +93,58 @@ def process_generation_data(df: pd.DataFrame | None) -> pd.DataFrame | None:
     return df[df["State"] == "TX"].copy()
 
 
+def plot_eiahr_yearly_boxplot(input_dir: Path, output_dir: Path) -> None:
+    hr_path = input_dir / "eiahryearly.csv"
+    if not hr_path.exists():
+        return
+
+    df = pd.read_csv(hr_path)
+    if "Year" in df.columns:
+        df = df.drop(columns=["Year"])
+
+    if df.empty:
+        return
+
+    fuel_order = [
+        col
+        for col in ["Coal", "Nuclear", "Natural Gas", "Petroleum"]
+        if col in df.columns
+    ]
+    other_cols = [col for col in df.columns if col not in fuel_order]
+    plot_cols = fuel_order + other_cols
+
+    box_data = []
+    for col in plot_cols:
+        values = pd.to_numeric(df[col], errors="coerce").dropna()
+        box_data.append(values)
+
+    if all(series.empty for series in box_data):
+        return
+
+    colors = {
+        "Nuclear": "grey",
+        "Coal": "pink",
+        "Natural Gas": "blue",
+        "Petroleum": "purple",
+    }
+    box_colors = [colors.get(col, "lightgray") for col in plot_cols]
+
+    output_path = output_dir / "eia_data" / "eiahryearly_boxplot.png"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    plt.figure(figsize=(10, 6))
+    box = plt.boxplot(box_data, labels=plot_cols, patch_artist=True, showfliers=True)
+    for patch, color in zip(box["boxes"], box_colors):
+        patch.set_facecolor(color)
+    plt.xlabel("Fuel Type")
+    plt.ylabel("Value")
+    plt.title("EIA Heat Rate Yearly Boxplot")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+
+
 def process_yearly_dataframes(
     raw_by_year: Dict[str, pd.DataFrame],
 ) -> Dict[str, pd.DataFrame]:
@@ -156,6 +208,7 @@ def plot_heat_rate_boxplots_by_fuel(
         year_dir = output_dir / "eia_data" / "boxplot_yearlies" / year
         year_dir.mkdir(parents=True, exist_ok=True)
 
+        excluded_fuels = {"Intertie Proxy Gen", "Spark Spread"}
         fuel_types = (
             df["Reported Fuel Type Code"]
             .astype(str)
@@ -164,6 +217,7 @@ def plot_heat_rate_boxplots_by_fuel(
             .dropna()
             .unique()
         )
+        fuel_types = [ft for ft in fuel_types if ft not in excluded_fuels]
 
         heat_rate_cols = [col for col in df.columns if col.startswith("Heat Rate ")]
         months_in_data = [col.replace("Heat Rate ", "") for col in heat_rate_cols]
@@ -428,6 +482,7 @@ def plot_heat_rate_boxplot_by_fuel_btu(
     if not heat_rate_cols:
         return
 
+    excluded_fuels = {"Intertie Proxy Gen", "Spark Spread"}
     fuel_types = (
         combined["Reported Fuel Type Code"]
         .astype(str)
@@ -436,6 +491,7 @@ def plot_heat_rate_boxplot_by_fuel_btu(
         .dropna()
         .unique()
     )
+    fuel_types = [ft for ft in fuel_types if ft not in excluded_fuels]
 
     box_data = []
     labels = []
@@ -490,6 +546,7 @@ def main() -> None:
     plot_heat_rate_distribution_all_years_by_fuel(processed, output_dir)
     plot_avg_monthly_heat_rate_by_fuel_time_series(processed, output_dir)
     plot_heat_rate_boxplot_by_fuel_btu(processed, output_dir)
+    plot_eiahr_yearly_boxplot(inputs.input_dir, output_dir)
     _ = generation_processed
 
 

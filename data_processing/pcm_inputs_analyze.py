@@ -149,6 +149,9 @@ def plot_value_scatter(
         )
         .dropna()
     )
+    merged = merged[
+        ~merged["Category"].isin(["Intertie Proxy Gen", "Spark Spread Proxies"])
+    ]
 
     if merged.empty:
         return None

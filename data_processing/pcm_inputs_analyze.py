@@ -8,6 +8,17 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 
+EXCLUDED_CATEGORIES = {"Intertie Proxy Gen", "Spark Spread Proxies"}
+
+
+def build_category_color_map(categories: pd.Series) -> Dict[str, tuple]:
+    unique_categories = sorted(categories.dropna().astype(str).unique())
+    cmap = plt.get_cmap("tab20")
+    return {
+        category: cmap(idx % cmap.N) for idx, category in enumerate(unique_categories)
+    }
+
+
 @dataclass(frozen=True)
 class PcmInputPaths:
     heatrate: Path
@@ -60,7 +71,11 @@ def plot_value_distribution(df: pd.DataFrame, output_dir: Path) -> Path:
     return output_path
 
 
-def plot_value_boxplot_by_category(df: pd.DataFrame, output_dir: Path) -> Path | None:
+def plot_value_boxplot_by_category(
+    df: pd.DataFrame,
+    output_dir: Path,
+    color_map: Dict[str, tuple],
+) -> Path | None:
     values = df["Value"]
     categories = df["Category"]
     property_label = str(df["Property"].iloc[0]).strip()
@@ -68,7 +83,7 @@ def plot_value_boxplot_by_category(df: pd.DataFrame, output_dir: Path) -> Path |
     ylabel = f"{property_label} {units_label}".strip()
 
     data = pd.DataFrame({"Category": categories, "Value": values}).dropna()
-    data = data[~data["Category"].isin(["Intertie Proxy Gen", "Spark Spread Proxies"])]
+    data = data[~data["Category"].isin(EXCLUDED_CATEGORIES)]
     if data.empty:
         return
 
@@ -79,9 +94,18 @@ def plot_value_boxplot_by_category(df: pd.DataFrame, output_dir: Path) -> Path |
     grouped = data.groupby("Category")["Value"].apply(list)
     labels = grouped.index.tolist()
     box_data = grouped.tolist()
+    box_colors = [color_map.get(label) for label in labels]
 
     plt.figure(figsize=(12, 6))
-    plt.boxplot(box_data, labels=labels, showfliers=True)
+    boxplot = plt.boxplot(
+        box_data,
+        labels=labels,
+        showfliers=True,
+        patch_artist=True,
+    )
+    for patch, color in zip(boxplot["boxes"], box_colors):
+        if color is not None:
+            patch.set_facecolor(color)
     plt.xlabel("Category")
     plt.ylabel(ylabel)
     plt.title(f"{property_label} by Fuel")
@@ -129,6 +153,7 @@ def plot_value_scatter(
     x_df: pd.DataFrame,
     y_df: pd.DataFrame,
     output_dir: Path,
+    color_map: Dict[str, tuple],
 ) -> Path | None:
     """Scatter plot of values from two dataframes (x and y)."""
     x_property = str(x_df["Property"].iloc[0]).strip()
@@ -149,9 +174,7 @@ def plot_value_scatter(
         )
         .dropna()
     )
-    merged = merged[
-        ~merged["Category"].isin(["Intertie Proxy Gen", "Spark Spread Proxies"])
-    ]
+    merged = merged[~merged["Category"].isin(EXCLUDED_CATEGORIES)]
 
     if merged.empty:
         return None
@@ -162,11 +185,6 @@ def plot_value_scatter(
 
     categories = merged["Category"].astype(str)
     unique_categories = sorted(categories.unique())
-    cmap = plt.get_cmap("tab20")
-    color_map = {
-        category: cmap(idx % cmap.N) for idx, category in enumerate(unique_categories)
-    }
-
     plt.figure(figsize=(10, 6))
     for category in unique_categories:
         mask = categories == category
@@ -214,9 +232,15 @@ def main() -> None:
     output_dir = base_dir / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    all_categories = pd.concat(
+        [df["Category"] for df in processed.values()], ignore_index=True
+    )
+    all_categories = all_categories[~all_categories.isin(EXCLUDED_CATEGORIES)]
+    global_color_map = build_category_color_map(all_categories)
+
     for df in processed.values():
         plot_value_distribution(df, output_dir)
-        plot_value_boxplot_by_category(df, output_dir)
+        plot_value_boxplot_by_category(df, output_dir, global_color_map)
 
     capacity_df = processed["capacity"]
     heatrate_df = processed["heatrate"]
@@ -224,12 +248,12 @@ def main() -> None:
     fom_df = processed["fom"]
     startcosts_df = processed["startcosts"]
 
-    plot_value_scatter(capacity_df, heatrate_df, output_dir)
-    plot_value_scatter(capacity_df, vom_df, output_dir)
-    plot_value_scatter(capacity_df, fom_df, output_dir)
-    plot_value_scatter(capacity_df, startcosts_df, output_dir)
-    plot_value_scatter(heatrate_df, vom_df, output_dir)
-    plot_value_scatter(heatrate_df, fom_df, output_dir)
+    plot_value_scatter(capacity_df, heatrate_df, output_dir, global_color_map)
+    plot_value_scatter(capacity_df, vom_df, output_dir, global_color_map)
+    plot_value_scatter(capacity_df, fom_df, output_dir, global_color_map)
+    plot_value_scatter(capacity_df, startcosts_df, output_dir, global_color_map)
+    plot_value_scatter(heatrate_df, vom_df, output_dir, global_color_map)
+    plot_value_scatter(heatrate_df, fom_df, output_dir, global_color_map)
 
     summarize_capacity_by_category(capacity_df, output_dir)
 

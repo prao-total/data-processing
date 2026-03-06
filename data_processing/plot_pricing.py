@@ -10,9 +10,9 @@ import matplotlib.pyplot as plt
 
 # Hardcoded CSV paths by year.
 CSV_BY_YEAR = {
-    2023: Path("data/price_2023.csv"),
-    2024: Path("data/price_2024.csv"),
-    2025: Path("data/price_2025.csv"),
+    2023: Path("C:/Users/L1165683/GitHub_Repos/yes-energy-extract/tests/outputs/HB_HUBAVG_rtlmp_2023-01-01_to_2023-12-31_hourly.csv"),
+    2024: Path("C:/Users/L1165683/GitHub_Repos/yes-energy-extract/tests/outputs/HB_HUBAVG_rtlmp_2024-01-01_to_2024-12-31_hourly.csv"),
+    2025: Path("C:/Users/L1165683/GitHub_Repos/yes-energy-extract/tests/outputs/HB_HUBAVG_rtlmp_2025-01-01_to_2025-12-31_hourly.csv"),
 }
 
 

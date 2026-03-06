@@ -115,10 +115,10 @@ if __name__ == "__main__":
     # Example usage
     data = read_yearly_csvs()
     plot_days(
-        ["2024-01-01 00:00:00", "2024-01-15 00:00:00", "2024-02-01 00:00:00"],
+        ["2023-01-31 00:00:00", "2024-01-16 00:00:00", "2025-02-20 00:00:00"],
         data,
-        title="Selected Days Pricing",
-        x_label="Date",
-        y_label="Average Value",
-        output_dir="output",
+        title="Winter Peak Day Pricing",
+        x_label="Time",
+        y_label="Price (USD/MWh)",
+        output_dir="C:/Users/L1165683/GitHub_Repos/data-processing/data_processing/output",
     )

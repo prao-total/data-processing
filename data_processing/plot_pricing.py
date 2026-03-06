@@ -63,7 +63,7 @@ def plot_days(
         days: Iterable of day values (string or datetime). Time will be truncated to date.
         data_by_year: Output of `read_yearly_csvs`.
         title: Plot title.
-        x_label: X-axis title.
+        x_label: X-axis title (hour of day).
         y_label: Y-axis title.
     """
     if days is None:
@@ -93,11 +93,17 @@ def plot_days(
 
         for day_start, day_end, label in day_windows:
             mask = (df[date_col] >= day_start) & (df[date_col] < day_end)
-            x_values = df.loc[mask, date_col]
-            y_values = df.loc[mask, value_col]
-
-            if len(x_values) == 0:
+            day_df = df.loc[mask, [date_col, value_col]]
+            if day_df.empty:
                 continue
+
+            day_df = day_df.copy()
+            day_df["hour"] = day_df[date_col].dt.hour
+            hourly = day_df.groupby("hour", as_index=True)[value_col].mean()
+            hourly = hourly.reindex(range(24))
+
+            x_values = hourly.index
+            y_values = hourly.values
 
             plt.plot(
                 x_values,
@@ -109,7 +115,7 @@ def plot_days(
     plt.title(title)
     plt.xlabel(x_label)
     plt.ylabel(y_label)
-    plt.legend()
+    plt.legend(loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=3)
     plt.tight_layout()
 
     output_base = Path(output_dir)

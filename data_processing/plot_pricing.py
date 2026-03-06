@@ -54,6 +54,7 @@ def plot_days(
     title: str,
     x_label: str,
     y_label: str,
+    output_dir: Path | str = "output",
     date_col: str = "DATETIME",
     value_col: str = "AVGVALUE",
     figsize: tuple[int, int] = (10, 6),
@@ -98,6 +99,15 @@ def plot_days(
     plt.ylabel(y_label)
     plt.legend()
     plt.tight_layout()
+
+    output_base = Path(output_dir)
+    plots_dir = output_base / "pricing_plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"pricing_plot_{timestamp}.png"
+    output_path = plots_dir / filename
+    plt.savefig(output_path, dpi=150)
     plt.show()
 
 
@@ -110,4 +120,5 @@ if __name__ == "__main__":
         title="Selected Days Pricing",
         x_label="Date",
         y_label="Average Value",
+        output_dir="output",
     )

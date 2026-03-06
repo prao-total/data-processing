@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable
-
 import pandas as pd
 import matplotlib.pyplot as plt
 
@@ -48,7 +46,7 @@ def read_yearly_csvs(
 
 
 def plot_days(
-    days: Iterable,
+    days,
     data_by_year: dict[int, pd.DataFrame],
     *,
     title: str,
@@ -59,40 +57,54 @@ def plot_days(
     value_col: str = "AVGVALUE",
     figsize: tuple[int, int] = (10, 6),
 ) -> None:
-    """Plot selected days as a line plot for each year.
+    """Plot multiple days as separate line plots for each year.
 
     Args:
-        days: Iterable of day values (dates or numbers) to plot.
+        days: Iterable of day values (string or datetime). Time will be truncated to date.
         data_by_year: Output of `read_yearly_csvs`.
         title: Plot title.
         x_label: X-axis title.
         y_label: Y-axis title.
     """
+    if days is None:
+        raise ValueError("days must be provided")
     days_list = list(days)
     if not days_list:
         raise ValueError("days must contain at least one day")
 
     plt.figure(figsize=figsize)
 
+    day_windows: list[tuple[pd.Timestamp, pd.Timestamp, str]] = []
+    for day in days_list:
+        day_ts = pd.to_datetime(day, errors="raise")
+        day_date = day_ts.date()
+        day_start = pd.Timestamp(day_date)
+        day_end = day_start + pd.Timedelta(days=1)
+        label = day_start.strftime("%Y-%m-%d")
+        day_windows.append((day_start, day_end, label))
+
     for year, df in data_by_year.items():
         if date_col not in df.columns:
             raise ValueError(f"Missing required column '{date_col}' for year {year}")
 
-        # If date_col is datetime-like, coerce days to datetime for matching.
-        if pd.api.types.is_datetime64_any_dtype(df[date_col]):
-            days_coerced = pd.to_datetime(days_list, errors="coerce")
-            mask = df[date_col].isin(days_coerced)
+        if not pd.api.types.is_datetime64_any_dtype(df[date_col]):
+            df = df.copy()
+            df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+
+        for day_start, day_end, label in day_windows:
+            mask = (df[date_col] >= day_start) & (df[date_col] < day_end)
             x_values = df.loc[mask, date_col]
-        else:
-            mask = df[date_col].isin(days_list)
-            x_values = df.loc[mask, date_col]
+            y_values = df.loc[mask, value_col]
 
-        y_values = df.loc[mask, value_col]
+            if len(x_values) == 0:
+                continue
 
-        if len(x_values) == 0:
-            continue
-
-        plt.plot(x_values, y_values, marker="o", label=str(year))
+            plt.plot(
+                x_values,
+                y_values,
+                marker="o",
+                label=f"{year} {label}",
+            )
 
     plt.title(title)
     plt.xlabel(x_label)

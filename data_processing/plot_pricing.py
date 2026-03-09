@@ -116,7 +116,7 @@ def plot_days(
     plt.xlabel(x_label, fontsize=14)
     plt.ylabel(y_label, fontsize=14)
     plt.tick_params(axis="both", which="major", labelsize=12)
-    plt.legend(loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=3)
+    plt.legend(loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=3, fontsize=12)
     plt.tight_layout()
 
     output_base = Path(output_dir)

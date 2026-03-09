@@ -163,6 +163,8 @@ def plot_value_scatter(
 
     x_label = f"{x_property} {x_units}".strip()
     y_label = f"{y_property} {y_units}".strip()
+    x_property_lower = x_property.lower()
+    y_property_lower = y_property.lower()
 
     merged = (
         x_df[["Child Object", "Value", "Category"]]
@@ -199,6 +201,8 @@ def plot_value_scatter(
 
     plt.xlabel(x_label)
     plt.ylabel(y_label)
+    if "capacity" in x_property_lower and "heat rate" in y_property_lower:
+        plt.ylim(-25, 13000)
     plt.title(f"{y_property} vs {x_property}")
     plt.legend(title="Category", loc="best")
     plt.tight_layout()

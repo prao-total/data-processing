@@ -109,12 +109,12 @@ def plot_days(
                 x_values,
                 y_values,
                 marker="o",
-                label=f"{year} {label}",
+                label=str(year),
             )
 
-    plt.title(title)
-    plt.xlabel(x_label)
-    plt.ylabel(y_label)
+    # plt.title(title)
+    plt.xlabel(x_label, fontsize=14)
+    plt.ylabel(y_label, fontsize=14)
     plt.legend(loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=3)
     plt.tight_layout()
 

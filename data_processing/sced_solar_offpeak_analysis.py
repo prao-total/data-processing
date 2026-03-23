@@ -21,6 +21,7 @@ MONTH_START_HOUR = {
     4: 20,  # Apr
 }
 DEFAULT_START_HOUR = 21  # Mar, May-Aug
+NEIGHBOR_OFFSET = pd.Timedelta(hours=1)
 
 
 def load_data(csv_path=CSV_PATH):
@@ -40,23 +41,45 @@ def _off_peak_start_hour(month):
     return MONTH_START_HOUR.get(month, DEFAULT_START_HOUR)
 
 
+def exclude_plus_minus_one_hour_noise(df, group_col="resource_name"):
+    df = df.copy()
+    df = df.dropna(subset=["ts"]).sort_values([group_col, "ts"]).reset_index(drop=True)
+
+    prior_lookup = df[[group_col, "ts"]].copy()
+    prior_lookup["ts"] = prior_lookup["ts"] + NEIGHBOR_OFFSET
+    prior_lookup["has_prior_hour"] = True
+
+    next_lookup = df[[group_col, "ts"]].copy()
+    next_lookup["ts"] = next_lookup["ts"] - NEIGHBOR_OFFSET
+    next_lookup["has_next_hour"] = True
+
+    df = df.merge(prior_lookup, on=[group_col, "ts"], how="left")
+    df = df.merge(next_lookup, on=[group_col, "ts"], how="left")
+
+    is_kept = df["has_prior_hour"].fillna(False) & df["has_next_hour"].fillna(False)
+    return df.loc[is_kept].drop(columns=["has_prior_hour", "has_next_hour"]).copy()
+
+
 def filter_off_peak(df):
     ts = df["ts"]
     month = ts.dt.month
     hour = ts.dt.hour
     start_hour = month.map(_off_peak_start_hour)
     is_off_peak = (hour >= start_hour) | (hour <= OFF_PEAK_END_HOUR)
-    return df[is_off_peak].copy()
+    off_peak_df = df[is_off_peak].copy()
+    return exclude_plus_minus_one_hour_noise(off_peak_df)
 
 
 def run_analysis(df, output_path):
     off_peak_df = filter_off_peak(df)
+    raw_off_peak_df = df[((df["ts"].dt.hour >= df["ts"].dt.month.map(_off_peak_start_hour)) | (df["ts"].dt.hour <= OFF_PEAK_END_HOUR))].copy()
 
     summary_path = output_path / "summary.csv"
     summary = pd.DataFrame(
         {
             "rows_total": [len(df)],
-            "rows_off_peak": [len(off_peak_df)],
+            "rows_off_peak_raw": [len(raw_off_peak_df)],
+            "rows_off_peak_reduced_noise": [len(off_peak_df)],
             "columns": [len(df.columns)],
         }
     )

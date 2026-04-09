@@ -8,8 +8,8 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 
-INPUT_DIR = "/Users/pradyrao/Downloads/ercot_price_csvs"
-OUTPUT_DIR = "/Users/pradyrao/VSCode/data-processing/data_processing/output/ercot_load_hub_price_analysis"
+INPUT_DIR = "C:/Users/L1165683/GitHub_Repos/data-processing/inputs/price_inputs"
+OUTPUT_DIR = "C:/Users/L1165683/GitHub_Repos/data-processing/output/ercot_load_hub_price_analysis"
 PRICE_PROFILES_DIR = "price_profiles"
 HEATMAPS_DIR = "mean_month_hour_heatmaps"
 YEARLY_LINE_PLOTS_DIR = "yearly_line_plots"

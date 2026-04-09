@@ -18,6 +18,8 @@ YEARLY_LINE_PLOTS_DIR = "yearly_line_plots"
 PAIRED_YEARLY_LINE_PLOTS_DIR = "paired_yearly_line_plots"
 SPREAD_YEARLY_LINE_PLOTS_DIR = "spread_yearly_line_plots"
 SPREAD_ALL_YEARS_LINE_PLOTS_DIR = "spread_all_years_line_plots"
+MONTHLY_ERROR_DIR = "monthly_error_metrics"
+MONTHLY_ERROR_SUMMARY_FILE_NAME = "monthly_error_summary.csv"
 LINE_PLOT_NODE_PAIRS = [
     ("HB_HOUSTON", "LZ_HOUSTON"),
     ("HB_WEST", "LZ_WEST"),
@@ -413,6 +415,91 @@ def build_spread_profile(first_profile: pd.DataFrame, second_profile: pd.DataFra
     return spread_profile.sort_values("timestamp", kind="stable").reset_index(drop=True)
 
 
+def build_monthly_average_profile(profile: pd.DataFrame, price_column_name: str) -> pd.DataFrame:
+    monthly_profile = (
+        profile.assign(
+            year=profile["Delivery Date"].dt.year,
+            month=profile["Delivery Date"].dt.month,
+        )
+        .groupby(["year", "month"], as_index=False)["Settlement Point Price"]
+        .mean()
+        .rename(columns={"Settlement Point Price": price_column_name})
+        .sort_values(["year", "month"], kind="stable")
+        .reset_index(drop=True)
+    )
+    monthly_profile["month_start"] = pd.to_datetime(
+        dict(year=monthly_profile["year"], month=monthly_profile["month"], day=1)
+    )
+    return monthly_profile
+
+
+def build_monthly_error_profile(first_profile: pd.DataFrame, second_profile: pd.DataFrame) -> pd.DataFrame:
+    first_monthly = build_monthly_average_profile(first_profile, "first_monthly_avg_price")
+    second_monthly = build_monthly_average_profile(second_profile, "second_monthly_avg_price")
+
+    monthly_error = first_monthly.merge(second_monthly, on=["year", "month"], how="inner")
+    monthly_error["absolute_error"] = (
+        monthly_error["first_monthly_avg_price"] - monthly_error["second_monthly_avg_price"]
+    ).abs()
+
+    denominator = monthly_error["second_monthly_avg_price"].abs()
+    monthly_error["absolute_percentage_error"] = (
+        monthly_error["absolute_error"].div(denominator).where(denominator != 0)
+    ) * 100.0
+
+    monthly_error = monthly_error.sort_values(["year", "month"], kind="stable").reset_index(drop=True)
+    return monthly_error
+
+
+def save_monthly_error_metrics(
+    profiles: dict[str, pd.DataFrame],
+    node_pairs: list[tuple[str, str]] = LINE_PLOT_NODE_PAIRS,
+    output_dir: str | Path = OUTPUT_DIR,
+) -> tuple[Path, Path]:
+    monthly_error_output_dir = ensure_output_dir(output_dir) / MONTHLY_ERROR_DIR
+    monthly_error_output_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_rows: list[dict[str, object]] = []
+
+    for first_node, second_node in node_pairs:
+        if first_node not in profiles or second_node not in profiles:
+            missing_nodes = [
+                node_name for node_name in (first_node, second_node) if node_name not in profiles
+            ]
+            raise ValueError(f"Missing price profiles for monthly error metrics: {missing_nodes}")
+
+        pair_name = f"{safe_file_stem(first_node)}__vs__{safe_file_stem(second_node)}"
+        monthly_error = build_monthly_error_profile(profiles[first_node], profiles[second_node]).rename(
+            columns={
+                "first_monthly_avg_price": f"{first_node}_monthly_avg_price",
+                "second_monthly_avg_price": f"{second_node}_monthly_avg_price",
+                "absolute_error": "monthly_mae",
+                "absolute_percentage_error": "monthly_mape",
+            }
+        )
+        monthly_error.insert(0, "pair_name", f"{first_node} vs {second_node}")
+
+        output_path = monthly_error_output_dir / f"{pair_name}.csv"
+        monthly_error.to_csv(output_path, index=False)
+
+        summary_rows.append(
+            {
+                "pair_name": f"{first_node} vs {second_node}",
+                "first_node": first_node,
+                "second_node": second_node,
+                "monthly_mae_mean": monthly_error["monthly_mae"].mean(),
+                "monthly_mape_mean": monthly_error["monthly_mape"].mean(),
+                "months_compared": len(monthly_error),
+            }
+        )
+
+    summary_df = pd.DataFrame(summary_rows).sort_values("pair_name", kind="stable").reset_index(drop=True)
+    summary_output_path = monthly_error_output_dir / MONTHLY_ERROR_SUMMARY_FILE_NAME
+    summary_df.to_csv(summary_output_path, index=False)
+
+    return monthly_error_output_dir, summary_output_path
+
+
 def save_spread_yearly_line_plots(
     profiles: dict[str, pd.DataFrame],
     node_pairs: list[tuple[str, str]] = LINE_PLOT_NODE_PAIRS,
@@ -495,6 +582,7 @@ def main() -> None:
     paired_yearly_line_plots_output_dir = save_paired_yearly_line_plots(profiles)
     spread_yearly_line_plots_output_dir = save_spread_yearly_line_plots(profiles)
     spread_all_years_line_plots_output_dir = save_spread_all_years_line_plots(profiles)
+    monthly_error_output_dir, monthly_error_summary_output_path = save_monthly_error_metrics(profiles)
     print(f"Loaded {len(profiles)} settlement point profiles from {INPUT_DIR}")
     print(f"Saved price profiles to {profiles_output_dir}")
     print(f"Saved heatmaps to {heatmaps_output_dir}")
@@ -504,6 +592,8 @@ def main() -> None:
     print(f"Saved paired yearly line plots to {paired_yearly_line_plots_output_dir}")
     print(f"Saved spread yearly line plots to {spread_yearly_line_plots_output_dir}")
     print(f"Saved all-years spread line plots to {spread_all_years_line_plots_output_dir}")
+    print(f"Saved monthly error metrics to {monthly_error_output_dir}")
+    print(f"Saved monthly error summary to {monthly_error_summary_output_path}")
 
 
 if __name__ == "__main__":

@@ -14,6 +14,13 @@ PRICE_PROFILES_DIR = "price_profiles"
 HEATMAPS_DIR = "mean_month_hour_heatmaps"
 YEARLY_HEATMAPS_GLOBAL_SCALE_DIR = "yearly_month_hour_heatmaps_global_scale"
 YEARLY_LINE_PLOTS_DIR = "yearly_line_plots"
+PAIRED_YEARLY_LINE_PLOTS_DIR = "paired_yearly_line_plots"
+LINE_PLOT_NODE_PAIRS = [
+    ("HB_HOUSTON", "LZ_HOUSTON"),
+    ("HB_WEST", "LZ_WEST"),
+    ("HB_NORTH", "LZ_NORTH"),
+    ("HB_SOUTH", "LZ_SOUTH"),
+]
 
 REQUIRED_COLUMNS = [
     "Delivery Date",
@@ -285,17 +292,80 @@ def save_yearly_line_plots(
     return yearly_output_dir
 
 
+def save_paired_yearly_line_plots(
+    profiles: dict[str, pd.DataFrame],
+    node_pairs: list[tuple[str, str]] = LINE_PLOT_NODE_PAIRS,
+    output_dir: str | Path = OUTPUT_DIR,
+) -> Path:
+    paired_output_dir = ensure_output_dir(output_dir) / PAIRED_YEARLY_LINE_PLOTS_DIR
+    paired_output_dir.mkdir(parents=True, exist_ok=True)
+
+    for first_node, second_node in node_pairs:
+        if first_node not in profiles or second_node not in profiles:
+            missing_nodes = [
+                node_name for node_name in (first_node, second_node) if node_name not in profiles
+            ]
+            raise ValueError(f"Missing price profiles for paired plot: {missing_nodes}")
+
+        pair_name = f"{safe_file_stem(first_node)}__vs__{safe_file_stem(second_node)}"
+        pair_output_dir = paired_output_dir / pair_name
+        pair_output_dir.mkdir(parents=True, exist_ok=True)
+
+        first_profile = profiles[first_node].copy()
+        second_profile = profiles[second_node].copy()
+        first_profile["year"] = first_profile["Delivery Date"].dt.year
+        second_profile["year"] = second_profile["Delivery Date"].dt.year
+
+        pair_years = sorted(set(first_profile["year"].dropna()) & set(second_profile["year"].dropna()))
+
+        for year in pair_years:
+            first_year_df = first_profile.loc[first_profile["year"] == year].sort_values(
+                "timestamp", kind="stable"
+            )
+            second_year_df = second_profile.loc[second_profile["year"] == year].sort_values(
+                "timestamp", kind="stable"
+            )
+
+            fig, ax = plt.subplots(figsize=(16, 6))
+            ax.plot(
+                first_year_df["timestamp"],
+                first_year_df["Settlement Point Price"],
+                linewidth=0.8,
+                label=first_node,
+            )
+            ax.plot(
+                second_year_df["timestamp"],
+                second_year_df["Settlement Point Price"],
+                linewidth=0.8,
+                label=second_node,
+            )
+            ax.set_title(f"Settlement Point Price: {first_node} vs {second_node} ({year})")
+            ax.set_xlabel("Timestamp")
+            ax.set_ylabel("Settlement Point Price")
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+
+            fig.tight_layout()
+            output_path = pair_output_dir / f"{year}.png"
+            fig.savefig(output_path, dpi=200)
+            plt.close(fig)
+
+    return paired_output_dir
+
+
 def main() -> None:
     profiles = load_price_profiles(INPUT_DIR)
     profiles_output_dir = save_price_profiles(profiles)
     heatmaps_output_dir = save_month_hour_heatmaps(profiles)
     yearly_heatmaps_output_dir = save_yearly_month_hour_heatmaps_global_scale(profiles)
     yearly_line_plots_output_dir = save_yearly_line_plots(profiles)
+    paired_yearly_line_plots_output_dir = save_paired_yearly_line_plots(profiles)
     print(f"Loaded {len(profiles)} settlement point profiles from {INPUT_DIR}")
     print(f"Saved price profiles to {profiles_output_dir}")
     print(f"Saved heatmaps to {heatmaps_output_dir}")
     print(f"Saved yearly global-scale heatmaps to {yearly_heatmaps_output_dir}")
     print(f"Saved yearly line plots to {yearly_line_plots_output_dir}")
+    print(f"Saved paired yearly line plots to {paired_yearly_line_plots_output_dir}")
 
 
 if __name__ == "__main__":

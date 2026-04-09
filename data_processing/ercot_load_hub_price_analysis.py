@@ -330,14 +330,20 @@ def save_paired_yearly_line_plots(
             ax.plot(
                 first_year_df["timestamp"],
                 first_year_df["Settlement Point Price"],
-                linewidth=0.8,
+                color="#1f77b4",
+                linewidth=0.9,
+                alpha=0.9,
                 label=first_node,
+                zorder=3,
             )
             ax.plot(
                 second_year_df["timestamp"],
                 second_year_df["Settlement Point Price"],
-                linewidth=0.8,
+                color="#d62728",
+                linewidth=0.7,
+                alpha=0.55,
                 label=second_node,
+                zorder=2,
             )
             ax.set_title(f"Settlement Point Price: {first_node} vs {second_node} ({year})")
             ax.set_xlabel("Timestamp")

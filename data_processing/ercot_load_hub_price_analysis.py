@@ -13,6 +13,7 @@ OUTPUT_DIR = "C:/Users/L1165683/GitHub_Repos/data-processing/output/ercot_load_h
 PRICE_PROFILES_DIR = "price_profiles"
 HEATMAPS_DIR = "mean_month_hour_heatmaps"
 YEARLY_HEATMAPS_GLOBAL_SCALE_DIR = "yearly_month_hour_heatmaps_global_scale"
+YEARLY_HEATMAPS_AUTO_SCALE_DIR = "yearly_month_hour_heatmaps_auto_scale"
 YEARLY_LINE_PLOTS_DIR = "yearly_line_plots"
 PAIRED_YEARLY_LINE_PLOTS_DIR = "paired_yearly_line_plots"
 SPREAD_YEARLY_LINE_PLOTS_DIR = "spread_yearly_line_plots"
@@ -262,6 +263,31 @@ def save_yearly_month_hour_heatmaps_global_scale(
     return yearly_heatmaps_output_dir
 
 
+def save_yearly_month_hour_heatmaps_auto_scale(
+    profiles: dict[str, pd.DataFrame], output_dir: str | Path = OUTPUT_DIR
+) -> Path:
+    yearly_heatmaps_output_dir = ensure_output_dir(output_dir) / YEARLY_HEATMAPS_AUTO_SCALE_DIR
+    yearly_heatmaps_output_dir.mkdir(parents=True, exist_ok=True)
+
+    for settlement_point_name, profile in profiles.items():
+        node_output_dir = yearly_heatmaps_output_dir / safe_file_stem(settlement_point_name)
+        node_output_dir.mkdir(parents=True, exist_ok=True)
+
+        yearly_profile = profile.copy()
+        yearly_profile["year"] = yearly_profile["Delivery Date"].dt.year
+
+        for year, year_df in yearly_profile.groupby("year", sort=True):
+            matrix = build_month_hour_heatmap(year_df)
+            output_path = node_output_dir / f"{year}.png"
+            render_month_hour_heatmap(
+                matrix=matrix,
+                title=f"Mean Price Heatmap: {settlement_point_name} ({year})",
+                output_path=output_path,
+            )
+
+    return yearly_heatmaps_output_dir
+
+
 def save_yearly_line_plots(
     profiles: dict[str, pd.DataFrame], output_dir: str | Path = OUTPUT_DIR
 ) -> Path:
@@ -417,6 +443,7 @@ def main() -> None:
     profiles_output_dir = save_price_profiles(profiles)
     heatmaps_output_dir = save_month_hour_heatmaps(profiles)
     yearly_heatmaps_output_dir = save_yearly_month_hour_heatmaps_global_scale(profiles)
+    yearly_heatmaps_auto_scale_output_dir = save_yearly_month_hour_heatmaps_auto_scale(profiles)
     yearly_line_plots_output_dir = save_yearly_line_plots(profiles)
     paired_yearly_line_plots_output_dir = save_paired_yearly_line_plots(profiles)
     spread_yearly_line_plots_output_dir = save_spread_yearly_line_plots(profiles)
@@ -424,6 +451,7 @@ def main() -> None:
     print(f"Saved price profiles to {profiles_output_dir}")
     print(f"Saved heatmaps to {heatmaps_output_dir}")
     print(f"Saved yearly global-scale heatmaps to {yearly_heatmaps_output_dir}")
+    print(f"Saved yearly auto-scale heatmaps to {yearly_heatmaps_auto_scale_output_dir}")
     print(f"Saved yearly line plots to {yearly_line_plots_output_dir}")
     print(f"Saved paired yearly line plots to {paired_yearly_line_plots_output_dir}")
     print(f"Saved spread yearly line plots to {spread_yearly_line_plots_output_dir}")

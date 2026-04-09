@@ -188,7 +188,7 @@ def render_month_hour_heatmap(
         vmax=vmax,
     )
     colorbar = fig.colorbar(image, ax=ax)
-    colorbar.set_label("Mean Settlement Point Price")
+    colorbar.set_label("Mean Settlement Point Price ($/MWh)")
 
     ax.set_title(title)
     ax.set_xlabel("Delivery Hour")
@@ -321,7 +321,7 @@ def save_yearly_line_plots(
             ax.plot(year_df["timestamp"], year_df["Settlement Point Price"], linewidth=0.8)
             ax.set_title(f"Settlement Point Price: {settlement_point_name} ({year})")
             ax.set_xlabel("Timestamp")
-            ax.set_ylabel("Settlement Point Price")
+            ax.set_ylabel("Settlement Point Price ($/MWh)")
             ax.grid(True, alpha=0.3)
 
             fig.tight_layout()
@@ -387,7 +387,7 @@ def save_paired_yearly_line_plots(
             )
             ax.set_title(f"Settlement Point Price: {first_node} vs {second_node} ({year})")
             ax.set_xlabel("Timestamp")
-            ax.set_ylabel("Settlement Point Price")
+            ax.set_ylabel("Settlement Point Price ($/MWh)")
             ax.grid(True, alpha=0.3)
             ax.legend()
 
@@ -440,7 +440,7 @@ def save_spread_yearly_line_plots(
             ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.7)
             ax.set_title(f"Settlement Point Spread: {first_node} - {second_node} ({year})")
             ax.set_xlabel("Timestamp")
-            ax.set_ylabel("Price Spread")
+            ax.set_ylabel("Price Spread ($/MWh)")
             ax.grid(True, alpha=0.3)
 
             fig.tight_layout()
@@ -474,7 +474,7 @@ def save_spread_all_years_line_plots(
         ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.7)
         ax.set_title(f"Settlement Point Spread: {first_node} - {second_node} (All Years)")
         ax.set_xlabel("Timestamp")
-        ax.set_ylabel("Price Spread")
+        ax.set_ylabel("Price Spread ($/MWh)")
         ax.grid(True, alpha=0.3)
 
         fig.tight_layout()

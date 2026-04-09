@@ -15,6 +15,7 @@ HEATMAPS_DIR = "mean_month_hour_heatmaps"
 YEARLY_HEATMAPS_GLOBAL_SCALE_DIR = "yearly_month_hour_heatmaps_global_scale"
 YEARLY_LINE_PLOTS_DIR = "yearly_line_plots"
 PAIRED_YEARLY_LINE_PLOTS_DIR = "paired_yearly_line_plots"
+SPREAD_YEARLY_LINE_PLOTS_DIR = "spread_yearly_line_plots"
 LINE_PLOT_NODE_PAIRS = [
     ("HB_HOUSTON", "LZ_HOUSTON"),
     ("HB_WEST", "LZ_WEST"),
@@ -78,7 +79,7 @@ def prepare_price_data(df: pd.DataFrame) -> pd.DataFrame:
     prepared = prepared.loc[prepared["Settlement Point Name"] != ""].copy()
     prepared["timestamp"] = prepared["Delivery Date"] + pd.to_timedelta(
         prepared["Delivery Hour"] - 1, unit="h"
-    )
+    ) + pd.to_timedelta((prepared["Delivery Interval"] - 1) * 15, unit="m")
 
     return prepared
 
@@ -359,6 +360,58 @@ def save_paired_yearly_line_plots(
     return paired_output_dir
 
 
+def build_spread_profile(first_profile: pd.DataFrame, second_profile: pd.DataFrame) -> pd.DataFrame:
+    first_prices = first_profile.loc[:, ["timestamp", "Settlement Point Price"]].rename(
+        columns={"Settlement Point Price": "first_price"}
+    )
+    second_prices = second_profile.loc[:, ["timestamp", "Settlement Point Price"]].rename(
+        columns={"Settlement Point Price": "second_price"}
+    )
+
+    spread_profile = first_prices.merge(second_prices, on="timestamp", how="inner")
+    spread_profile["spread"] = spread_profile["first_price"] - spread_profile["second_price"]
+    spread_profile["year"] = spread_profile["timestamp"].dt.year
+    return spread_profile.sort_values("timestamp", kind="stable").reset_index(drop=True)
+
+
+def save_spread_yearly_line_plots(
+    profiles: dict[str, pd.DataFrame],
+    node_pairs: list[tuple[str, str]] = LINE_PLOT_NODE_PAIRS,
+    output_dir: str | Path = OUTPUT_DIR,
+) -> Path:
+    spread_output_dir = ensure_output_dir(output_dir) / SPREAD_YEARLY_LINE_PLOTS_DIR
+    spread_output_dir.mkdir(parents=True, exist_ok=True)
+
+    for first_node, second_node in node_pairs:
+        if first_node not in profiles or second_node not in profiles:
+            missing_nodes = [
+                node_name for node_name in (first_node, second_node) if node_name not in profiles
+            ]
+            raise ValueError(f"Missing price profiles for spread plot: {missing_nodes}")
+
+        pair_name = f"{safe_file_stem(first_node)}__minus__{safe_file_stem(second_node)}"
+        pair_output_dir = spread_output_dir / pair_name
+        pair_output_dir.mkdir(parents=True, exist_ok=True)
+
+        spread_profile = build_spread_profile(profiles[first_node], profiles[second_node])
+
+        for year, year_df in spread_profile.groupby("year", sort=True):
+            fig, ax = plt.subplots(figsize=(16, 6))
+            ax.plot(year_df["timestamp"], year_df["spread"], color="#2ca02c", linewidth=0.8)
+            ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.7)
+            ax.set_title(f"Settlement Point Spread: {first_node} - {second_node} ({year})")
+            ax.set_xlabel("Timestamp")
+            ax.set_ylabel("Price Spread")
+            ax.grid(True, alpha=0.3)
+
+            fig.tight_layout()
+            output_path = pair_output_dir / f"{year}.png"
+            fig.savefig(output_path, dpi=200)
+            plt.close(fig)
+
+    return spread_output_dir
+
+
 def main() -> None:
     profiles = load_price_profiles(INPUT_DIR)
     profiles_output_dir = save_price_profiles(profiles)
@@ -366,12 +419,14 @@ def main() -> None:
     yearly_heatmaps_output_dir = save_yearly_month_hour_heatmaps_global_scale(profiles)
     yearly_line_plots_output_dir = save_yearly_line_plots(profiles)
     paired_yearly_line_plots_output_dir = save_paired_yearly_line_plots(profiles)
+    spread_yearly_line_plots_output_dir = save_spread_yearly_line_plots(profiles)
     print(f"Loaded {len(profiles)} settlement point profiles from {INPUT_DIR}")
     print(f"Saved price profiles to {profiles_output_dir}")
     print(f"Saved heatmaps to {heatmaps_output_dir}")
     print(f"Saved yearly global-scale heatmaps to {yearly_heatmaps_output_dir}")
     print(f"Saved yearly line plots to {yearly_line_plots_output_dir}")
     print(f"Saved paired yearly line plots to {paired_yearly_line_plots_output_dir}")
+    print(f"Saved spread yearly line plots to {spread_yearly_line_plots_output_dir}")
 
 
 if __name__ == "__main__":

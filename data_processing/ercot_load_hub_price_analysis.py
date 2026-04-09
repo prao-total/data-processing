@@ -12,6 +12,7 @@ INPUT_DIR = "C:/Users/L1165683/GitHub_Repos/data-processing/inputs/price_inputs"
 OUTPUT_DIR = "C:/Users/L1165683/GitHub_Repos/data-processing/output/ercot_load_hub_price_analysis"
 PRICE_PROFILES_DIR = "price_profiles"
 HEATMAPS_DIR = "mean_month_hour_heatmaps"
+YEARLY_HEATMAPS_GLOBAL_SCALE_DIR = "yearly_month_hour_heatmaps_global_scale"
 YEARLY_LINE_PLOTS_DIR = "yearly_line_plots"
 
 REQUIRED_COLUMNS = [
@@ -133,36 +134,124 @@ def build_month_hour_heatmap(profile: pd.DataFrame) -> pd.DataFrame:
     return matrix
 
 
+def render_month_hour_heatmap(
+    matrix: pd.DataFrame,
+    title: str,
+    output_path: Path,
+    vmin: float | None = None,
+    vmax: float | None = None,
+) -> None:
+    month_labels = [
+        "Jan",
+        "Feb",
+        "Mar",
+        "Apr",
+        "May",
+        "Jun",
+        "Jul",
+        "Aug",
+        "Sep",
+        "Oct",
+        "Nov",
+        "Dec",
+    ]
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+    image = ax.imshow(
+        matrix.to_numpy(),
+        aspect="auto",
+        origin="upper",
+        cmap="coolwarm",
+        vmin=vmin,
+        vmax=vmax,
+    )
+    colorbar = fig.colorbar(image, ax=ax)
+    colorbar.set_label("Mean Settlement Point Price")
+
+    ax.set_title(title)
+    ax.set_xlabel("Delivery Hour")
+    ax.set_ylabel("Month")
+    ax.set_xticks(range(24))
+    ax.set_xticklabels(range(1, 25))
+    ax.set_yticks(range(12))
+    ax.set_yticklabels(month_labels)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
 def save_month_hour_heatmaps(
     profiles: dict[str, pd.DataFrame], output_dir: str | Path = OUTPUT_DIR
 ) -> Path:
     heatmaps_output_dir = ensure_output_dir(output_dir) / HEATMAPS_DIR
     heatmaps_output_dir.mkdir(parents=True, exist_ok=True)
 
-    month_labels = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-
     for settlement_point_name, profile in profiles.items():
         matrix = build_month_hour_heatmap(profile)
-
-        fig, ax = plt.subplots(figsize=(14, 7))
-        image = ax.imshow(matrix.to_numpy(), aspect="auto", origin="upper", cmap="coolwarm")
-        colorbar = fig.colorbar(image, ax=ax)
-        colorbar.set_label("Mean Settlement Point Price")
-
-        ax.set_title(f"Mean Price Heatmap: {settlement_point_name}")
-        ax.set_xlabel("Delivery Hour")
-        ax.set_ylabel("Month")
-        ax.set_xticks(range(24))
-        ax.set_xticklabels(range(1, 25))
-        ax.set_yticks(range(12))
-        ax.set_yticklabels(month_labels)
-
-        fig.tight_layout()
         output_path = heatmaps_output_dir / f"{safe_file_stem(settlement_point_name)}.png"
-        fig.savefig(output_path, dpi=200)
-        plt.close(fig)
+        render_month_hour_heatmap(
+            matrix=matrix,
+            title=f"Mean Price Heatmap: {settlement_point_name}",
+            output_path=output_path,
+        )
 
     return heatmaps_output_dir
+
+
+def compute_global_yearly_heatmap_scale(profiles: dict[str, pd.DataFrame]) -> tuple[float, float]:
+    global_min: float | None = None
+    global_max: float | None = None
+
+    for profile in profiles.values():
+        yearly_profile = profile.copy()
+        yearly_profile["year"] = yearly_profile["Delivery Date"].dt.year
+
+        for _, year_df in yearly_profile.groupby("year", sort=True):
+            matrix = build_month_hour_heatmap(year_df)
+            stacked = matrix.stack(dropna=True)
+            if stacked.empty:
+                continue
+
+            year_min = float(stacked.min())
+            year_max = float(stacked.max())
+
+            global_min = year_min if global_min is None else min(global_min, year_min)
+            global_max = year_max if global_max is None else max(global_max, year_max)
+
+    if global_min is None or global_max is None:
+        raise ValueError("Unable to compute global yearly heatmap scale from empty profiles.")
+
+    return global_min, global_max
+
+
+def save_yearly_month_hour_heatmaps_global_scale(
+    profiles: dict[str, pd.DataFrame], output_dir: str | Path = OUTPUT_DIR
+) -> Path:
+    yearly_heatmaps_output_dir = ensure_output_dir(output_dir) / YEARLY_HEATMAPS_GLOBAL_SCALE_DIR
+    yearly_heatmaps_output_dir.mkdir(parents=True, exist_ok=True)
+
+    global_min, global_max = compute_global_yearly_heatmap_scale(profiles)
+
+    for settlement_point_name, profile in profiles.items():
+        node_output_dir = yearly_heatmaps_output_dir / safe_file_stem(settlement_point_name)
+        node_output_dir.mkdir(parents=True, exist_ok=True)
+
+        yearly_profile = profile.copy()
+        yearly_profile["year"] = yearly_profile["Delivery Date"].dt.year
+
+        for year, year_df in yearly_profile.groupby("year", sort=True):
+            matrix = build_month_hour_heatmap(year_df)
+            output_path = node_output_dir / f"{year}.png"
+            render_month_hour_heatmap(
+                matrix=matrix,
+                title=f"Mean Price Heatmap: {settlement_point_name} ({year})",
+                output_path=output_path,
+                vmin=global_min,
+                vmax=global_max,
+            )
+
+    return yearly_heatmaps_output_dir
 
 
 def save_yearly_line_plots(
@@ -200,10 +289,12 @@ def main() -> None:
     profiles = load_price_profiles(INPUT_DIR)
     profiles_output_dir = save_price_profiles(profiles)
     heatmaps_output_dir = save_month_hour_heatmaps(profiles)
+    yearly_heatmaps_output_dir = save_yearly_month_hour_heatmaps_global_scale(profiles)
     yearly_line_plots_output_dir = save_yearly_line_plots(profiles)
     print(f"Loaded {len(profiles)} settlement point profiles from {INPUT_DIR}")
     print(f"Saved price profiles to {profiles_output_dir}")
     print(f"Saved heatmaps to {heatmaps_output_dir}")
+    print(f"Saved yearly global-scale heatmaps to {yearly_heatmaps_output_dir}")
     print(f"Saved yearly line plots to {yearly_line_plots_output_dir}")
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 
 import pandas as pd
@@ -12,6 +13,26 @@ OUTPUT_CSV_PATH = (
 )
 
 REQUIRED_COLUMNS = ["DATETIME", "AVGVALUE", "OBJECTNAME"]
+EXPECTED_HEADERS = [
+    "DATETIME",
+    "DAYOFWEEK",
+    "OBJECTID",
+    "OBJECTNAME",
+    "DATATYPE",
+    "AGG_LEVEL",
+    "MINVALUE",
+    "MAXVALUE",
+    "AVGVALUE",
+    "TIMEZONE",
+    "COUNTVALUE",
+    "SUMVALUE",
+    "STDDEVVALUE",
+    "HOURENDING",
+    "MARKETDAY",
+    "PEAKTYPE",
+    "MONTH",
+    "YEAR",
+]
 
 
 def find_matching_csvs(input_dir: str, name_filter: str) -> list[Path]:
@@ -37,6 +58,23 @@ def validate_columns(df: pd.DataFrame, csv_path: Path) -> None:
         raise ValueError(f"Missing required columns in {csv_path}: {missing_columns}")
 
 
+def has_expected_header_row(csv_path: Path) -> bool:
+    with csv_path.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.reader(handle)
+        first_row = next(reader, [])
+
+    normalized_row = [value.strip() for value in first_row]
+    return normalized_row == EXPECTED_HEADERS
+
+
+def repair_missing_header(csv_path: Path) -> None:
+    if has_expected_header_row(csv_path):
+        return
+
+    df = pd.read_csv(csv_path, header=None, names=EXPECTED_HEADERS)
+    df.to_csv(csv_path, index=False)
+
+
 def first_object_name(df: pd.DataFrame, csv_path: Path) -> str:
     non_null_names = df["OBJECTNAME"].dropna().astype(str).str.strip()
     non_empty_names = non_null_names[non_null_names != ""]
@@ -46,6 +84,7 @@ def first_object_name(df: pd.DataFrame, csv_path: Path) -> str:
 
 
 def build_series_frame(csv_path: Path, used_headers: set[str]) -> pd.DataFrame:
+    repair_missing_header(csv_path)
     df = pd.read_csv(csv_path)
     validate_columns(df, csv_path)
 

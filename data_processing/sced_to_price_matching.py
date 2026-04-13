@@ -466,6 +466,7 @@ def add_candidate(
             "yes_nodename": yes_row["NODENAME"] if yes_row is not None else "",
             "yes_primaryfuel": yes_row["PRIMARYFUEL"] if yes_row is not None else "",
             "yes_primemover": yes_row["PRIMEMOVER"] if yes_row is not None else "",
+            "yes_capacity_mw": yes_row["yes_capacity_mw"] if yes_row is not None else pd.NA,
             "rtlmp_name": rtlmp_row["NAME"] if rtlmp_row is not None else "",
             "rtlmp_objectid": rtlmp_row["OBJECTID"] if rtlmp_row is not None else "",
             "price_node_source": rtlmp_row["price_node_source"] if rtlmp_row is not None else "",
@@ -1124,7 +1125,9 @@ def build_match_tables(
 
 
 def build_simple_matches(best_matches_df: pd.DataFrame) -> pd.DataFrame:
-    simple_df = best_matches_df[["resource_name", "fuel_type", "rtlmp_name", "price_node_source"]].copy()
+    simple_df = best_matches_df[
+        ["resource_name", "fuel_type", "capacity_mw", "rtlmp_name", "price_node_source"]
+    ].copy()
     simple_df = simple_df.rename(columns={"rtlmp_name": "price_code"})
     simple_df["price_code"] = simple_df["price_code"].where(
         best_matches_df["match_status"].isin(["matched", "ambiguous"]),
@@ -1134,6 +1137,11 @@ def build_simple_matches(best_matches_df: pd.DataFrame) -> pd.DataFrame:
         best_matches_df["match_status"].isin(["matched", "ambiguous"]),
         "",
     )
+    if "yes_capacity_mw" in best_matches_df.columns:
+        simple_df["capacity_mw"] = simple_df["capacity_mw"].where(
+            simple_df["capacity_mw"].notna(),
+            best_matches_df["yes_capacity_mw"],
+        )
     return simple_df.sort_values("resource_name").reset_index(drop=True)
 
 

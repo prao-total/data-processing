@@ -8,8 +8,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 
-INPUT_DIR = r"/path/to/gis_input_dir"
-OUTPUT_DIR = r"/path/to/output_dir"
+INPUT_DIR = r"C:/Users/L1165683/GitHub_Repos/data-processing/inputs/gis_files"
+OUTPUT_DIR = r"C:/Users/L1165683/GitHub_Repos/data-processing/output/gis_outputs"
 GIS_STEM = ""
 OUTPUT_JSON = True
 

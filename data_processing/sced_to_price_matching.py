@@ -22,6 +22,7 @@ ALL_CANDIDATES_FILE_NAME = "sced_price_code_candidates.csv"
 SUMMARY_FILE_NAME = "sced_price_code_summary.csv"
 SIMPLE_MATCHES_FILE_NAME = "sced_to_price_simple_matches.csv"
 PLEXOS_MATCHES_FILE_NAME = "plexos_to_sced_price_matches.csv"
+PLEXOS_TECH_SUMMARY_FILE_NAME = "plexos_match_summary_by_technology.csv"
 
 SCED_PLANT_REQUIRED_COLUMNS = ["resource_name", "fuel_type"]
 SCED_NAME_REQUIRED_COLUMNS = [
@@ -1389,27 +1390,101 @@ def build_plexos_matches(
     return output_df[original_columns + appended_columns]
 
 
+def build_plexos_technology_summary(plexos_matches_df: pd.DataFrame) -> pd.DataFrame:
+    df = plexos_matches_df.copy()
+    df["technology"] = df["Category"].map(normalize_text).replace("", "UNKNOWN")
+    df["is_sced_matched"] = df["plexos_to_sced_match_status"].isin(["matched", "ambiguous"])
+    df["is_sced_exact"] = df["plexos_to_sced_match_method"].fillna("").isin(
+        ["ercot_unitcode_exact", "ercot_unitcode_key_exact"]
+    )
+    df["is_sced_ambiguous"] = df["plexos_to_sced_match_status"].eq("ambiguous")
+    df["is_sced_unmatched"] = df["plexos_to_sced_match_status"].eq("unmatched")
+    df["is_price_matched"] = df["matched_price_node"].fillna("").astype(str).str.strip().ne("")
+    df["is_price_from_rtlmp_bus"] = df["matched_price_node_source"].fillna("").eq("rtlmp_bus")
+    df["is_price_from_rtlmp"] = df["matched_price_node_source"].fillna("").eq("rtlmp")
+    df["is_price_blank"] = ~df["is_price_matched"]
+
+    grouped = (
+        df.groupby("technology", dropna=False)
+        .agg(
+            rows_total=("technology", "size"),
+            rows_sced_matched=("is_sced_matched", "sum"),
+            rows_sced_exact=("is_sced_exact", "sum"),
+            rows_sced_ambiguous=("is_sced_ambiguous", "sum"),
+            rows_sced_unmatched=("is_sced_unmatched", "sum"),
+            rows_price_matched=("is_price_matched", "sum"),
+            rows_price_from_rtlmp_bus=("is_price_from_rtlmp_bus", "sum"),
+            rows_price_from_rtlmp=("is_price_from_rtlmp", "sum"),
+            rows_price_blank=("is_price_blank", "sum"),
+        )
+        .reset_index()
+    )
+
+    for numerator, pct_col in [
+        ("rows_sced_matched", "pct_sced_matched"),
+        ("rows_sced_exact", "pct_sced_exact"),
+        ("rows_sced_ambiguous", "pct_sced_ambiguous"),
+        ("rows_price_matched", "pct_price_matched"),
+    ]:
+        grouped[pct_col] = (grouped[numerator] / grouped["rows_total"]).round(4)
+
+    overall = pd.DataFrame(
+        {
+            "technology": ["ALL"],
+            "rows_total": [len(df)],
+            "rows_sced_matched": [int(df["is_sced_matched"].sum())],
+            "rows_sced_exact": [int(df["is_sced_exact"].sum())],
+            "rows_sced_ambiguous": [int(df["is_sced_ambiguous"].sum())],
+            "rows_sced_unmatched": [int(df["is_sced_unmatched"].sum())],
+            "rows_price_matched": [int(df["is_price_matched"].sum())],
+            "rows_price_from_rtlmp_bus": [int(df["is_price_from_rtlmp_bus"].sum())],
+            "rows_price_from_rtlmp": [int(df["is_price_from_rtlmp"].sum())],
+            "rows_price_blank": [int(df["is_price_blank"].sum())],
+            "pct_sced_matched": [round(float(df["is_sced_matched"].mean()), 4)],
+            "pct_sced_exact": [round(float(df["is_sced_exact"].mean()), 4)],
+            "pct_sced_ambiguous": [round(float(df["is_sced_ambiguous"].mean()), 4)],
+            "pct_price_matched": [round(float(df["is_price_matched"].mean()), 4)],
+        }
+    )
+
+    summary_df = pd.concat(
+        [grouped.sort_values(["rows_total", "technology"], ascending=[False, True]), overall],
+        ignore_index=True,
+    )
+    return summary_df
+
+
 def save_outputs(
     best_matches_df: pd.DataFrame,
     candidates_df: pd.DataFrame,
     summary_df: pd.DataFrame,
     simple_matches_df: pd.DataFrame,
     plexos_matches_df: pd.DataFrame,
+    plexos_tech_summary_df: pd.DataFrame,
     output_dir: str = OUTPUT_DIR,
-) -> tuple[Path, Path, Path, Path, Path]:
+) -> tuple[Path, Path, Path, Path, Path, Path]:
     output_path = ensure_output_dir(output_dir)
     best_matches_path = output_path / BEST_MATCHES_FILE_NAME
     candidates_path = output_path / ALL_CANDIDATES_FILE_NAME
     summary_path = output_path / SUMMARY_FILE_NAME
     simple_matches_path = output_path / SIMPLE_MATCHES_FILE_NAME
     plexos_matches_path = output_path / PLEXOS_MATCHES_FILE_NAME
+    plexos_tech_summary_path = output_path / PLEXOS_TECH_SUMMARY_FILE_NAME
 
     best_matches_df.to_csv(best_matches_path, index=False)
     candidates_df.to_csv(candidates_path, index=False)
     summary_df.to_csv(summary_path, index=False)
     simple_matches_df.to_csv(simple_matches_path, index=False)
     plexos_matches_df.to_csv(plexos_matches_path, index=False)
-    return best_matches_path, candidates_path, summary_path, simple_matches_path, plexos_matches_path
+    plexos_tech_summary_df.to_csv(plexos_tech_summary_path, index=False)
+    return (
+        best_matches_path,
+        candidates_path,
+        summary_path,
+        simple_matches_path,
+        plexos_matches_path,
+        plexos_tech_summary_path,
+    )
 
 
 def main():
@@ -1435,12 +1510,21 @@ def main():
     simple_matches_df = build_simple_matches(best_matches_df)
     sced_reference_df = build_sced_reference_df(best_matches_df, simple_matches_df)
     plexos_matches_df = build_plexos_matches(plexos_df, sced_reference_df)
-    best_matches_path, candidates_path, summary_path, simple_matches_path, plexos_matches_path = save_outputs(
+    plexos_tech_summary_df = build_plexos_technology_summary(plexos_matches_df)
+    (
+        best_matches_path,
+        candidates_path,
+        summary_path,
+        simple_matches_path,
+        plexos_matches_path,
+        plexos_tech_summary_path,
+    ) = save_outputs(
         best_matches_df,
         candidates_df,
         summary_df,
         simple_matches_df,
         plexos_matches_df,
+        plexos_tech_summary_df,
     )
 
     print(f"Saved best matches to {best_matches_path}")
@@ -1448,6 +1532,7 @@ def main():
     print(f"Saved summary to {summary_path}")
     print(f"Saved simple matches to {simple_matches_path}")
     print(f"Saved PLEXOS matches to {plexos_matches_path}")
+    print(f"Saved PLEXOS technology summary to {plexos_tech_summary_path}")
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from difflib import get_close_matches
+from difflib import SequenceMatcher, get_close_matches
 from pathlib import Path
 
 import pandas as pd
@@ -14,12 +14,14 @@ YES_UNITS_LIST_PATH = "/Users/pradyrao/Downloads/ERCOT_YES_units_list (1).csv"
 RTLMP_BUS_LIST_PATH = "/Users/pradyrao/Downloads/rtlmp_bus_ercot_list.csv"
 RTLMP_LIST_PATH = "/Users/pradyrao/Downloads/rtlmp_ercot_list.csv"
 RESOURCE_NODE_MAPPING_PATH = "/Users/pradyrao/Downloads/SP_List_EB_Mapping 2/Resource_Node_to_Unit_02202026_094122.csv"
+PLEXOS_LIST_PATH = "/Users/pradyrao/Downloads/plexos_list.csv"
 
 OUTPUT_DIR = "/Users/pradyrao/VSCode/data-processing/data_processing/output/sced_to_price_matching"
 BEST_MATCHES_FILE_NAME = "sced_price_code_matches.csv"
 ALL_CANDIDATES_FILE_NAME = "sced_price_code_candidates.csv"
 SUMMARY_FILE_NAME = "sced_price_code_summary.csv"
 SIMPLE_MATCHES_FILE_NAME = "sced_to_price_simple_matches.csv"
+PLEXOS_MATCHES_FILE_NAME = "plexos_to_sced_price_matches.csv"
 
 SCED_PLANT_REQUIRED_COLUMNS = ["resource_name", "fuel_type"]
 SCED_NAME_REQUIRED_COLUMNS = [
@@ -39,6 +41,7 @@ YES_REQUIRED_COLUMNS = [
 ]
 RTLMP_REQUIRED_COLUMNS = ["OBJECTTYPE", "OBJECTID", "NAME", "ISO"]
 RESOURCE_NODE_MAPPING_REQUIRED_COLUMNS = ["RESOURCE_NODE", "UNIT_SUBSTATION", "UNIT_NAME"]
+PLEXOS_REQUIRED_COLUMNS = ["Class", "Name", "CDR Name", "ERCOT_UnitCode", "Fuel Reporting"]
 
 FUZZY_PLANT_MATCH_CUTOFF = 0.88
 FUZZY_STATION_TO_RTLMP_CUTOFF = 0.70
@@ -48,6 +51,9 @@ MAX_YES_FAMILY_ROWS = 12
 MAX_RTLMP_FAMILY_ROWS = 20
 MAX_STATION_FUZZY_POOL = 80
 MAX_RESOURCE_NODE_FUZZY_POOL = 50
+PLEXOS_ERCOT_UNIT_FUZZY_CUTOFF = 0.82
+PLEXOS_CDR_NAME_FUZZY_CUTOFF = 0.86
+PLEXOS_NAME_FUZZY_CUTOFF = 0.82
 
 
 @dataclass(frozen=True)
@@ -95,6 +101,14 @@ def node_family(value) -> str:
 
 def parse_numeric(value):
     return pd.to_numeric(value, errors="coerce")
+
+
+def similarity_score(left: str, right: str) -> float:
+    left = normalize_text(left)
+    right = normalize_text(right)
+    if not left or not right:
+        return 0.0
+    return SequenceMatcher(None, left, right).ratio()
 
 
 def fuel_key(value) -> str:
@@ -209,6 +223,16 @@ def prepare_resource_node_mapping_df(df: pd.DataFrame) -> pd.DataFrame:
         prepared["unit_substation_norm"] + "_" + prepared["unit_name_norm"]
     )
     prepared["resource_node_family"] = prepared["resource_node_norm"].map(node_family)
+    return prepared
+
+
+def prepare_plexos_df(df: pd.DataFrame) -> pd.DataFrame:
+    prepared = df.copy()
+    prepared["plexos_class_norm"] = prepared["Class"].map(normalize_text)
+    prepared["plexos_name_norm"] = prepared["Name"].map(normalize_text)
+    prepared["plexos_cdr_name_norm"] = prepared["CDR Name"].map(normalize_text)
+    prepared["plexos_ercot_unit_norm"] = prepared["ERCOT_UnitCode"].map(normalize_text)
+    prepared["plexos_fuel_norm"] = prepared["Fuel Reporting"].map(fuel_key)
     return prepared
 
 
@@ -1145,24 +1169,247 @@ def build_simple_matches(best_matches_df: pd.DataFrame) -> pd.DataFrame:
     return simple_df.sort_values("resource_name").reset_index(drop=True)
 
 
+def build_sced_reference_df(
+    best_matches_df: pd.DataFrame,
+    simple_matches_df: pd.DataFrame,
+) -> pd.DataFrame:
+    reference_df = best_matches_df[
+        ["resource_name", "station_code", "station_desc"]
+    ].merge(
+        simple_matches_df,
+        on="resource_name",
+        how="left",
+    )
+    reference_df["resource_name_norm"] = reference_df["resource_name"].map(normalize_text)
+    reference_df["resource_name_key"] = reference_df["resource_name"].map(normalize_key)
+    reference_df["station_code_norm"] = reference_df["station_code"].map(normalize_text)
+    reference_df["station_desc_norm"] = reference_df["station_desc"].map(normalize_text)
+    reference_df["matched_sced_fuel_norm"] = reference_df["fuel_type"].map(fuel_key)
+    return reference_df
+
+
+def score_plexos_candidate(
+    plexos_row: dict,
+    sced_row: dict,
+    base_score: int,
+    method: str,
+) -> dict:
+    score = base_score
+    if plexos_row["plexos_fuel_norm"] and plexos_row["plexos_fuel_norm"] == sced_row["matched_sced_fuel_norm"]:
+        score += 10
+    if sced_row.get("price_code"):
+        score += 5
+
+    ercot_unit_bonus = int(20 * similarity_score(
+        plexos_row.get("plexos_ercot_unit_norm", ""),
+        sced_row.get("resource_name_norm", ""),
+    ))
+    cdr_name_bonus = int(12 * similarity_score(
+        plexos_row.get("plexos_cdr_name_norm", ""),
+        sced_row.get("station_desc_norm", ""),
+    ))
+    name_bonus = int(8 * similarity_score(
+        plexos_row.get("plexos_name_norm", ""),
+        sced_row.get("station_desc_norm", ""),
+    ))
+    score += ercot_unit_bonus + cdr_name_bonus + name_bonus
+
+    return {
+        "matched_sced_node": sced_row["resource_name"],
+        "matched_sced_station_code": sced_row.get("station_code", ""),
+        "matched_sced_station_description": sced_row.get("station_desc", ""),
+        "matched_sced_fuel_type": sced_row.get("fuel_type", ""),
+        "matched_sced_capacity_mw": sced_row.get("capacity_mw", pd.NA),
+        "matched_price_node": sced_row.get("price_code", ""),
+        "matched_price_node_source": sced_row.get("price_node_source", ""),
+        "plexos_to_sced_match_method": method,
+        "plexos_to_sced_match_score": score,
+    }
+
+
+def build_plexos_reference_lookups(sced_reference_df: pd.DataFrame) -> dict[str, object]:
+    rows = sced_reference_df.to_dict("records")
+    by_resource_name = {}
+    by_resource_key = {}
+    by_station_desc = {}
+    resource_names = []
+    station_descs = []
+
+    for row in rows:
+        if row["resource_name_norm"]:
+            by_resource_name.setdefault(row["resource_name_norm"], []).append(row)
+            if row["resource_name_norm"] not in resource_names:
+                resource_names.append(row["resource_name_norm"])
+        if row["resource_name_key"]:
+            by_resource_key.setdefault(row["resource_name_key"], []).append(row)
+        if row["station_desc_norm"]:
+            by_station_desc.setdefault(row["station_desc_norm"], []).append(row)
+            if row["station_desc_norm"] not in station_descs:
+                station_descs.append(row["station_desc_norm"])
+
+    return {
+        "by_resource_name": by_resource_name,
+        "by_resource_key": by_resource_key,
+        "by_station_desc": by_station_desc,
+        "resource_names": resource_names,
+        "station_descs": station_descs,
+    }
+
+
+def choose_best_plexos_match(candidate_rows: list[dict]) -> dict:
+    if not candidate_rows:
+        return {
+            "matched_sced_node": "",
+            "matched_sced_station_code": "",
+            "matched_sced_station_description": "",
+            "matched_sced_fuel_type": "",
+            "matched_sced_capacity_mw": pd.NA,
+            "matched_price_node": "",
+            "matched_price_node_source": "",
+            "plexos_to_sced_match_method": "",
+            "plexos_to_sced_match_score": pd.NA,
+            "plexos_to_sced_match_status": "unmatched",
+        }
+
+    candidate_rows = sorted(
+        candidate_rows,
+        key=lambda row: (
+            row["plexos_to_sced_match_score"],
+            bool(row["matched_price_node"]),
+            row["matched_sced_node"],
+        ),
+        reverse=True,
+    )
+    best = candidate_rows[0].copy()
+    top_score = best["plexos_to_sced_match_score"]
+    top_nodes = []
+    for row in candidate_rows:
+        if row["plexos_to_sced_match_score"] != top_score:
+            continue
+        if row["matched_sced_node"] and row["matched_sced_node"] not in top_nodes:
+            top_nodes.append(row["matched_sced_node"])
+    best["plexos_to_sced_match_status"] = "ambiguous" if len(top_nodes) > 1 else "matched"
+    return best
+
+
+def collect_plexos_candidates(
+    plexos_row: dict,
+    lookups: dict[str, object],
+) -> list[dict]:
+    candidates: list[dict] = []
+    seen_nodes: set[tuple[str, str]] = set()
+
+    def add_candidates(rows: list[dict], base_score: int, method: str):
+        for sced_row in rows:
+            key = (method, sced_row["resource_name"])
+            if key in seen_nodes:
+                continue
+            seen_nodes.add(key)
+            candidates.append(score_plexos_candidate(plexos_row, sced_row, base_score, method))
+
+    ercot_unit_norm = plexos_row.get("plexos_ercot_unit_norm", "")
+    if ercot_unit_norm:
+        add_candidates(
+            lookups["by_resource_name"].get(ercot_unit_norm, []),
+            220,
+            "ercot_unitcode_exact",
+        )
+        add_candidates(
+            lookups["by_resource_key"].get(normalize_key(ercot_unit_norm), []),
+            210,
+            "ercot_unitcode_key_exact",
+        )
+        fuzzy_resource_names = get_close_matches(
+            ercot_unit_norm,
+            lookups["resource_names"],
+            n=5,
+            cutoff=PLEXOS_ERCOT_UNIT_FUZZY_CUTOFF,
+        )
+        for resource_name in fuzzy_resource_names:
+            add_candidates(
+                lookups["by_resource_name"].get(resource_name, []),
+                165,
+                "ercot_unitcode_fuzzy",
+            )
+
+    cdr_name_norm = plexos_row.get("plexos_cdr_name_norm", "")
+    if cdr_name_norm:
+        add_candidates(
+            lookups["by_station_desc"].get(cdr_name_norm, []),
+            170,
+            "cdr_name_exact_station_desc",
+        )
+        fuzzy_station_descs = get_close_matches(
+            cdr_name_norm,
+            lookups["station_descs"],
+            n=5,
+            cutoff=PLEXOS_CDR_NAME_FUZZY_CUTOFF,
+        )
+        for station_desc in fuzzy_station_descs:
+            add_candidates(
+                lookups["by_station_desc"].get(station_desc, []),
+                135,
+                "cdr_name_fuzzy_station_desc",
+            )
+
+    plexos_name_norm = plexos_row.get("plexos_name_norm", "")
+    if plexos_name_norm:
+        fuzzy_station_descs = get_close_matches(
+            plexos_name_norm,
+            lookups["station_descs"],
+            n=5,
+            cutoff=PLEXOS_NAME_FUZZY_CUTOFF,
+        )
+        for station_desc in fuzzy_station_descs:
+            add_candidates(
+                lookups["by_station_desc"].get(station_desc, []),
+                115,
+                "name_fuzzy_station_desc",
+            )
+
+    return candidates
+
+
+def build_plexos_matches(
+    plexos_df: pd.DataFrame,
+    sced_reference_df: pd.DataFrame,
+) -> pd.DataFrame:
+    plexos_prepared = prepare_plexos_df(plexos_df)
+    lookups = build_plexos_reference_lookups(sced_reference_df)
+
+    appended_rows = []
+    for row in plexos_prepared.to_dict("records"):
+        match = choose_best_plexos_match(collect_plexos_candidates(row, lookups))
+        appended_rows.append(match)
+
+    match_df = pd.DataFrame(appended_rows)
+    original_columns = list(plexos_df.columns)
+    output_df = pd.concat([plexos_df.reset_index(drop=True), match_df.reset_index(drop=True)], axis=1)
+    appended_columns = [column for column in output_df.columns if column not in original_columns]
+    return output_df[original_columns + appended_columns]
+
+
 def save_outputs(
     best_matches_df: pd.DataFrame,
     candidates_df: pd.DataFrame,
     summary_df: pd.DataFrame,
     simple_matches_df: pd.DataFrame,
+    plexos_matches_df: pd.DataFrame,
     output_dir: str = OUTPUT_DIR,
-) -> tuple[Path, Path, Path, Path]:
+) -> tuple[Path, Path, Path, Path, Path]:
     output_path = ensure_output_dir(output_dir)
     best_matches_path = output_path / BEST_MATCHES_FILE_NAME
     candidates_path = output_path / ALL_CANDIDATES_FILE_NAME
     summary_path = output_path / SUMMARY_FILE_NAME
     simple_matches_path = output_path / SIMPLE_MATCHES_FILE_NAME
+    plexos_matches_path = output_path / PLEXOS_MATCHES_FILE_NAME
 
     best_matches_df.to_csv(best_matches_path, index=False)
     candidates_df.to_csv(candidates_path, index=False)
     summary_df.to_csv(summary_path, index=False)
     simple_matches_df.to_csv(simple_matches_path, index=False)
-    return best_matches_path, candidates_path, summary_path, simple_matches_path
+    plexos_matches_df.to_csv(plexos_matches_path, index=False)
+    return best_matches_path, candidates_path, summary_path, simple_matches_path, plexos_matches_path
 
 
 def main():
@@ -1175,6 +1422,7 @@ def main():
         RESOURCE_NODE_MAPPING_PATH,
         RESOURCE_NODE_MAPPING_REQUIRED_COLUMNS,
     )
+    plexos_df = load_csv(PLEXOS_LIST_PATH, PLEXOS_REQUIRED_COLUMNS)
 
     best_matches_df, candidates_df, summary_df = build_match_tables(
         sced_plant_df,
@@ -1185,17 +1433,21 @@ def main():
         resource_node_mapping_df,
     )
     simple_matches_df = build_simple_matches(best_matches_df)
-    best_matches_path, candidates_path, summary_path, simple_matches_path = save_outputs(
+    sced_reference_df = build_sced_reference_df(best_matches_df, simple_matches_df)
+    plexos_matches_df = build_plexos_matches(plexos_df, sced_reference_df)
+    best_matches_path, candidates_path, summary_path, simple_matches_path, plexos_matches_path = save_outputs(
         best_matches_df,
         candidates_df,
         summary_df,
         simple_matches_df,
+        plexos_matches_df,
     )
 
     print(f"Saved best matches to {best_matches_path}")
     print(f"Saved all candidates to {candidates_path}")
     print(f"Saved summary to {summary_path}")
     print(f"Saved simple matches to {simple_matches_path}")
+    print(f"Saved PLEXOS matches to {plexos_matches_path}")
 
 
 if __name__ == "__main__":

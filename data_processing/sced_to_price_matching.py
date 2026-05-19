@@ -16,6 +16,7 @@ RTLMP_LIST_PATH = "/Users/pradyrao/Downloads/rtlmp_ercot_list.csv"
 RESOURCE_NODE_MAPPING_PATH = "/Users/pradyrao/Downloads/SP_List_EB_Mapping 2/Resource_Node_to_Unit_02202026_094122.csv"
 PLEXOS_LIST_PATH = "/Users/pradyrao/Downloads/plexos_list.csv"
 ERCOT_CDR_PATH = "/Users/pradyrao/Downloads/ercot_cdr_july.csv"
+FINAL_SIMPLE_MATCHES_PATH = None
 
 OUTPUT_DIR = "/Users/pradyrao/VSCode/data-processing/data_processing/output/sced_to_price_matching"
 BEST_MATCHES_FILE_NAME = "sced_price_code_matches.csv"
@@ -59,6 +60,7 @@ PLEXOS_CDR_NAME_FUZZY_CUTOFF = 0.86
 PLEXOS_NAME_FUZZY_CUTOFF = 0.82
 PLEXOS_CDR_UNIT_NAME_FUZZY_CUTOFF = 0.84
 PLEXOS_YES_PLANT_FUZZY_CUTOFF = 0.84
+PLEXOS_ERCOT_UNIT_LATE_FUZZY_CUTOFF = 0.72
 
 
 @dataclass(frozen=True)
@@ -1245,14 +1247,43 @@ def build_simple_matches(best_matches_df: pd.DataFrame) -> pd.DataFrame:
     return simple_df.sort_values("resource_name").reset_index(drop=True)
 
 
+def choose_simple_matches_source(generated_simple_matches_df: pd.DataFrame) -> pd.DataFrame:
+    if not FINAL_SIMPLE_MATCHES_PATH:
+        return generated_simple_matches_df
+
+    final_df = load_csv(
+        FINAL_SIMPLE_MATCHES_PATH,
+        ["resource_name", "fuel_type", "capacity_mw", "price_code", "price_node_source"],
+    ).copy()
+    return final_df
+
+
 def build_sced_reference_df(
-    best_matches_df: pd.DataFrame,
+    sced_name_df: pd.DataFrame,
     simple_matches_df: pd.DataFrame,
     ercot_cdr_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    reference_df = best_matches_df[
-        ["resource_name", "station_code", "station_desc"]
-    ].merge(
+    sced_reference_base = sced_name_df[
+        [
+            "Unit Code",
+            "Generator Station Code",
+            "Generator Station Description",
+            "Generator Type",
+            "Nameplate Capacity (MW)",
+        ]
+    ].copy()
+    sced_reference_base = sced_reference_base.rename(
+        columns={
+            "Unit Code": "resource_name",
+            "Generator Station Code": "station_code",
+            "Generator Station Description": "station_desc",
+            "Generator Type": "generator_type",
+            "Nameplate Capacity (MW)": "capacity_mw",
+        }
+    )
+    sced_reference_base["capacity_mw"] = sced_reference_base["capacity_mw"].map(parse_numeric)
+
+    reference_df = sced_reference_base.merge(
         simple_matches_df,
         on="resource_name",
         how="left",
@@ -1264,7 +1295,10 @@ def build_sced_reference_df(
     reference_df["resource_name_key"] = reference_df["resource_name"].map(normalize_key)
     reference_df["station_code_norm"] = reference_df["station_code"].map(normalize_text)
     reference_df["station_desc_norm"] = reference_df["station_desc"].map(normalize_text)
-    reference_df["matched_sced_fuel_norm"] = reference_df["fuel_type"].map(fuel_key)
+    reference_df["matched_sced_fuel_norm"] = reference_df["fuel_type"].where(
+        reference_df["fuel_type"].fillna("").astype(str).str.strip().ne(""),
+        reference_df["generator_type"],
+    ).map(fuel_key)
     reference_df["resource_unit_tokens"] = reference_df["resource_name"].map(extract_resource_unit_tokens)
     reference_df["price_code_norm"] = reference_df["price_code"].map(normalize_text)
     reference_df["price_code_key"] = reference_df["price_code"].map(normalize_key)
@@ -1499,6 +1533,19 @@ def collect_plexos_candidates(
                 165,
                 "ercot_unitcode_fuzzy",
             )
+        if not candidates:
+            late_fuzzy_resource_names = get_close_matches(
+                ercot_unit_norm,
+                lookups["resource_names"],
+                n=8,
+                cutoff=PLEXOS_ERCOT_UNIT_LATE_FUZZY_CUTOFF,
+            )
+            for resource_name in late_fuzzy_resource_names:
+                add_candidates(
+                    lookups["by_resource_name"].get(resource_name, []),
+                    135,
+                    "ercot_unitcode_fuzzy_late",
+                )
 
     name_base_norm = plexos_row.get("plexos_name_base_norm", "")
     if name_base_norm:
@@ -1784,7 +1831,8 @@ def main():
         resource_node_mapping_df,
     )
     simple_matches_df = build_simple_matches(best_matches_df)
-    sced_reference_df = build_sced_reference_df(best_matches_df, simple_matches_df, ercot_cdr_df)
+    simple_matches_for_plexos_df = choose_simple_matches_source(simple_matches_df)
+    sced_reference_df = build_sced_reference_df(sced_name_df, simple_matches_for_plexos_df, ercot_cdr_df)
     plexos_matches_df = build_plexos_matches(plexos_df, sced_reference_df, yes_df)
     plexos_tech_summary_df = build_plexos_technology_summary(plexos_matches_df)
     (

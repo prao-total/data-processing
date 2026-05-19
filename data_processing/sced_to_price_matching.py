@@ -17,6 +17,7 @@ RESOURCE_NODE_MAPPING_PATH = "/Users/pradyrao/Downloads/SP_List_EB_Mapping 2/Res
 PLEXOS_LIST_PATH = "/Users/pradyrao/Downloads/plexos_list.csv"
 ERCOT_CDR_PATH = "/Users/pradyrao/Downloads/ercot_cdr_july.csv"
 FINAL_SIMPLE_MATCHES_PATH = None
+FINAL_PLEXOS_MATCHES_PATH = None
 
 OUTPUT_DIR = "/Users/pradyrao/VSCode/data-processing/data_processing/output/sced_to_price_matching"
 BEST_MATCHES_FILE_NAME = "sced_price_code_matches.csv"
@@ -46,6 +47,33 @@ RTLMP_REQUIRED_COLUMNS = ["OBJECTTYPE", "OBJECTID", "NAME", "ISO"]
 RESOURCE_NODE_MAPPING_REQUIRED_COLUMNS = ["RESOURCE_NODE", "UNIT_SUBSTATION", "UNIT_NAME"]
 PLEXOS_REQUIRED_COLUMNS = ["Class", "Name", "CDR Name", "ERCOT_UnitCode", "County", "Fuel Reporting"]
 ERCOT_CDR_REQUIRED_COLUMNS = ["UNIT NAME", "UNIT CODE", "COUNTY", "FUEL"]
+FINAL_PLEXOS_MATCHES_REQUIRED_COLUMNS = [
+    "Class",
+    "Name",
+    "Category",
+    "Description",
+    "EIA Plant Code",
+    "EIA Gen Code",
+    "EIA_UnitCode",
+    "EIA_PM",
+    "CDR Name",
+    "ERCOT_INR Code",
+    "ERCOT_UnitCode",
+    "County",
+    "CDR Zone",
+    "Comments",
+    "Fuel Reporting",
+    "matched_sced_node",
+    "matched_sced_station_code",
+    "matched_sced_station_description",
+    "matched_sced_fuel_type",
+    "matched_sced_capacity_mw",
+    "matched_price_node",
+    "matched_price_node_source",
+    "plexos_to_sced_match_method",
+    "plexos_to_sced_match_score",
+    "plexos_to_sced_match_status",
+]
 
 FUZZY_PLANT_MATCH_CUTOFF = 0.88
 FUZZY_STATION_TO_RTLMP_CUTOFF = 0.70
@@ -1258,6 +1286,17 @@ def choose_simple_matches_source(generated_simple_matches_df: pd.DataFrame) -> p
     return final_df
 
 
+def choose_plexos_matches_source(generated_plexos_matches_df: pd.DataFrame) -> pd.DataFrame:
+    if not FINAL_PLEXOS_MATCHES_PATH:
+        return generated_plexos_matches_df
+
+    final_df = load_csv(
+        FINAL_PLEXOS_MATCHES_PATH,
+        FINAL_PLEXOS_MATCHES_REQUIRED_COLUMNS,
+    ).copy()
+    return final_df
+
+
 def build_sced_reference_df(
     sced_name_df: pd.DataFrame,
     simple_matches_df: pd.DataFrame,
@@ -1833,7 +1872,8 @@ def main():
     simple_matches_df = build_simple_matches(best_matches_df)
     simple_matches_for_plexos_df = choose_simple_matches_source(simple_matches_df)
     sced_reference_df = build_sced_reference_df(sced_name_df, simple_matches_for_plexos_df, ercot_cdr_df)
-    plexos_matches_df = build_plexos_matches(plexos_df, sced_reference_df, yes_df)
+    generated_plexos_matches_df = build_plexos_matches(plexos_df, sced_reference_df, yes_df)
+    plexos_matches_df = choose_plexos_matches_source(generated_plexos_matches_df)
     plexos_tech_summary_df = build_plexos_technology_summary(plexos_matches_df)
     (
         best_matches_path,

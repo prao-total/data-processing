@@ -26,6 +26,8 @@ SUMMARY_FILE_NAME = "sced_price_code_summary.csv"
 SIMPLE_MATCHES_FILE_NAME = "sced_to_price_simple_matches.csv"
 PLEXOS_MATCHES_FILE_NAME = "plexos_to_sced_price_matches.csv"
 PLEXOS_TECH_SUMMARY_FILE_NAME = "plexos_match_summary_by_technology.csv"
+SCED_PLEXOS_COVERAGE_DETAIL_FILE_NAME = "sced_coverage_from_plexos_detail.csv"
+SCED_PLEXOS_COVERAGE_SUMMARY_FILE_NAME = "sced_coverage_from_plexos_summary.csv"
 
 SCED_PLANT_REQUIRED_COLUMNS = ["resource_name", "fuel_type"]
 SCED_NAME_REQUIRED_COLUMNS = [
@@ -1298,32 +1300,26 @@ def choose_plexos_matches_source(generated_plexos_matches_df: pd.DataFrame) -> p
 
 
 def build_sced_reference_df(
-    sced_name_df: pd.DataFrame,
+    best_matches_df: pd.DataFrame,
     simple_matches_df: pd.DataFrame,
     ercot_cdr_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    sced_reference_base = sced_name_df[
-        [
-            "Unit Code",
-            "Generator Station Code",
-            "Generator Station Description",
-            "Generator Type",
-            "Nameplate Capacity (MW)",
-        ]
+    sced_reference_base = best_matches_df[
+        ["resource_name", "station_code", "station_desc", "generator_type", "capacity_mw", "fuel_type"]
     ].copy()
-    sced_reference_base = sced_reference_base.rename(
+
+    simple_reference = simple_matches_df[
+        ["resource_name", "fuel_type", "capacity_mw", "price_code", "price_node_source"]
+    ].copy()
+    simple_reference = simple_reference.rename(
         columns={
-            "Unit Code": "resource_name",
-            "Generator Station Code": "station_code",
-            "Generator Station Description": "station_desc",
-            "Generator Type": "generator_type",
-            "Nameplate Capacity (MW)": "capacity_mw",
+            "fuel_type": "matched_fuel_type",
+            "capacity_mw": "matched_capacity_mw",
         }
     )
-    sced_reference_base["capacity_mw"] = sced_reference_base["capacity_mw"].map(parse_numeric)
 
     reference_df = sced_reference_base.merge(
-        simple_matches_df,
+        simple_reference,
         on="resource_name",
         how="left",
     )
@@ -1334,6 +1330,10 @@ def build_sced_reference_df(
     reference_df["resource_name_key"] = reference_df["resource_name"].map(normalize_key)
     reference_df["station_code_norm"] = reference_df["station_code"].map(normalize_text)
     reference_df["station_desc_norm"] = reference_df["station_desc"].map(normalize_text)
+    reference_df["capacity_mw"] = reference_df["capacity_mw"].where(
+        reference_df["capacity_mw"].notna(),
+        reference_df["matched_capacity_mw"],
+    )
     reference_df["matched_sced_fuel_norm"] = reference_df["fuel_type"].where(
         reference_df["fuel_type"].fillna("").astype(str).str.strip().ne(""),
         reference_df["generator_type"],
@@ -1815,6 +1815,92 @@ def build_plexos_technology_summary(plexos_matches_df: pd.DataFrame) -> pd.DataF
     return summary_df
 
 
+def build_sced_plexos_coverage_outputs(
+    sced_reference_df: pd.DataFrame,
+    plexos_matches_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    sced_detail = sced_reference_df[
+        [
+            "resource_name",
+            "station_code",
+            "station_desc",
+            "fuel_type",
+            "generator_type",
+            "capacity_mw",
+            "price_code",
+            "price_node_source",
+        ]
+    ].copy()
+    sced_detail["sced_fuel"] = sced_detail["fuel_type"].where(
+        sced_detail["fuel_type"].fillna("").astype(str).str.strip().ne(""),
+        sced_detail["generator_type"],
+    )
+    sced_detail["sced_fuel"] = sced_detail["sced_fuel"].map(normalize_text).replace("", "UNKNOWN")
+
+    matched_plexos = plexos_matches_df[
+        plexos_matches_df["plexos_to_sced_match_status"].isin(["matched", "ambiguous"])
+        & plexos_matches_df["matched_sced_node"].fillna("").astype(str).str.strip().ne("")
+    ].copy()
+
+    plexos_counts = (
+        matched_plexos.groupby("matched_sced_node", dropna=False)
+        .agg(
+            plexos_match_count=("matched_sced_node", "size"),
+            plexos_exact_count=("plexos_to_sced_match_method", lambda s: int(s.fillna("").isin(["ercot_unitcode_exact", "ercot_unitcode_key_exact"]).sum())),
+            plexos_ambiguous_count=("plexos_to_sced_match_status", lambda s: int((s == "ambiguous").sum())),
+            plexos_rows=("Name", lambda s: " | ".join(sorted(dict.fromkeys(str(v) for v in s if pd.notna(v)))[:10])),
+        )
+        .reset_index()
+        .rename(columns={"matched_sced_node": "resource_name"})
+    )
+
+    sced_detail = sced_detail.merge(plexos_counts, on="resource_name", how="left")
+    sced_detail["plexos_match_count"] = sced_detail["plexos_match_count"].fillna(0).astype(int)
+    sced_detail["plexos_exact_count"] = sced_detail["plexos_exact_count"].fillna(0).astype(int)
+    sced_detail["plexos_ambiguous_count"] = sced_detail["plexos_ambiguous_count"].fillna(0).astype(int)
+    sced_detail["plexos_rows"] = sced_detail["plexos_rows"].fillna("")
+    sced_detail["is_matched_in_plexos"] = sced_detail["plexos_match_count"] > 0
+    sced_detail["is_duplicate_in_plexos"] = sced_detail["plexos_match_count"] > 1
+
+    summary_df = (
+        sced_detail.groupby("sced_fuel", dropna=False)
+        .agg(
+            sced_rows_total=("resource_name", "size"),
+            sced_rows_matched=("is_matched_in_plexos", "sum"),
+            sced_rows_unmatched=("is_matched_in_plexos", lambda s: int((~s).sum())),
+            sced_rows_duplicated=("is_duplicate_in_plexos", "sum"),
+            plexos_links_total=("plexos_match_count", "sum"),
+        )
+        .reset_index()
+        .rename(columns={"sced_fuel": "fuel"})
+    )
+    summary_df["pct_sced_rows_matched"] = (summary_df["sced_rows_matched"] / summary_df["sced_rows_total"]).round(4)
+    summary_df["pct_sced_rows_duplicated"] = (summary_df["sced_rows_duplicated"] / summary_df["sced_rows_total"]).round(4)
+
+    overall = pd.DataFrame(
+        {
+            "fuel": ["ALL"],
+            "sced_rows_total": [len(sced_detail)],
+            "sced_rows_matched": [int(sced_detail["is_matched_in_plexos"].sum())],
+            "sced_rows_unmatched": [int((~sced_detail["is_matched_in_plexos"]).sum())],
+            "sced_rows_duplicated": [int(sced_detail["is_duplicate_in_plexos"].sum())],
+            "plexos_links_total": [int(sced_detail["plexos_match_count"].sum())],
+            "pct_sced_rows_matched": [round(float(sced_detail["is_matched_in_plexos"].mean()), 4)],
+            "pct_sced_rows_duplicated": [round(float(sced_detail["is_duplicate_in_plexos"].mean()), 4)],
+        }
+    )
+    summary_df = pd.concat(
+        [summary_df.sort_values(["sced_rows_total", "fuel"], ascending=[False, True]), overall],
+        ignore_index=True,
+    )
+
+    sced_detail = sced_detail.sort_values(
+        ["is_matched_in_plexos", "plexos_match_count", "resource_name"],
+        ascending=[False, False, True],
+    ).reset_index(drop=True)
+    return sced_detail, summary_df
+
+
 def save_outputs(
     best_matches_df: pd.DataFrame,
     candidates_df: pd.DataFrame,
@@ -1822,8 +1908,10 @@ def save_outputs(
     simple_matches_df: pd.DataFrame,
     plexos_matches_df: pd.DataFrame,
     plexos_tech_summary_df: pd.DataFrame,
+    sced_plexos_coverage_detail_df: pd.DataFrame,
+    sced_plexos_coverage_summary_df: pd.DataFrame,
     output_dir: str = OUTPUT_DIR,
-) -> tuple[Path, Path, Path, Path, Path, Path]:
+) -> tuple[Path, Path, Path, Path, Path, Path, Path, Path]:
     output_path = ensure_output_dir(output_dir)
     best_matches_path = output_path / BEST_MATCHES_FILE_NAME
     candidates_path = output_path / ALL_CANDIDATES_FILE_NAME
@@ -1831,6 +1919,8 @@ def save_outputs(
     simple_matches_path = output_path / SIMPLE_MATCHES_FILE_NAME
     plexos_matches_path = output_path / PLEXOS_MATCHES_FILE_NAME
     plexos_tech_summary_path = output_path / PLEXOS_TECH_SUMMARY_FILE_NAME
+    sced_plexos_coverage_detail_path = output_path / SCED_PLEXOS_COVERAGE_DETAIL_FILE_NAME
+    sced_plexos_coverage_summary_path = output_path / SCED_PLEXOS_COVERAGE_SUMMARY_FILE_NAME
 
     best_matches_df.to_csv(best_matches_path, index=False)
     candidates_df.to_csv(candidates_path, index=False)
@@ -1838,6 +1928,8 @@ def save_outputs(
     simple_matches_df.to_csv(simple_matches_path, index=False)
     plexos_matches_df.to_csv(plexos_matches_path, index=False)
     plexos_tech_summary_df.to_csv(plexos_tech_summary_path, index=False)
+    sced_plexos_coverage_detail_df.to_csv(sced_plexos_coverage_detail_path, index=False)
+    sced_plexos_coverage_summary_df.to_csv(sced_plexos_coverage_summary_path, index=False)
     return (
         best_matches_path,
         candidates_path,
@@ -1845,6 +1937,8 @@ def save_outputs(
         simple_matches_path,
         plexos_matches_path,
         plexos_tech_summary_path,
+        sced_plexos_coverage_detail_path,
+        sced_plexos_coverage_summary_path,
     )
 
 
@@ -1871,10 +1965,14 @@ def main():
     )
     simple_matches_df = build_simple_matches(best_matches_df)
     simple_matches_for_plexos_df = choose_simple_matches_source(simple_matches_df)
-    sced_reference_df = build_sced_reference_df(sced_name_df, simple_matches_for_plexos_df, ercot_cdr_df)
+    sced_reference_df = build_sced_reference_df(best_matches_df, simple_matches_for_plexos_df, ercot_cdr_df)
     generated_plexos_matches_df = build_plexos_matches(plexos_df, sced_reference_df, yes_df)
     plexos_matches_df = choose_plexos_matches_source(generated_plexos_matches_df)
     plexos_tech_summary_df = build_plexos_technology_summary(plexos_matches_df)
+    sced_plexos_coverage_detail_df, sced_plexos_coverage_summary_df = build_sced_plexos_coverage_outputs(
+        sced_reference_df,
+        plexos_matches_df,
+    )
     (
         best_matches_path,
         candidates_path,
@@ -1882,6 +1980,8 @@ def main():
         simple_matches_path,
         plexos_matches_path,
         plexos_tech_summary_path,
+        sced_plexos_coverage_detail_path,
+        sced_plexos_coverage_summary_path,
     ) = save_outputs(
         best_matches_df,
         candidates_df,
@@ -1889,6 +1989,8 @@ def main():
         simple_matches_df,
         plexos_matches_df,
         plexos_tech_summary_df,
+        sced_plexos_coverage_detail_df,
+        sced_plexos_coverage_summary_df,
     )
 
     print(f"Saved best matches to {best_matches_path}")
@@ -1897,6 +1999,8 @@ def main():
     print(f"Saved simple matches to {simple_matches_path}")
     print(f"Saved PLEXOS matches to {plexos_matches_path}")
     print(f"Saved PLEXOS technology summary to {plexos_tech_summary_path}")
+    print(f"Saved SCED coverage detail to {sced_plexos_coverage_detail_path}")
+    print(f"Saved SCED coverage summary to {sced_plexos_coverage_summary_path}")
 
 
 if __name__ == "__main__":

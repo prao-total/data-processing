@@ -28,6 +28,7 @@ PLEXOS_MATCHES_FILE_NAME = "plexos_to_sced_price_matches.csv"
 PLEXOS_TECH_SUMMARY_FILE_NAME = "plexos_match_summary_by_technology.csv"
 SCED_PLEXOS_COVERAGE_DETAIL_FILE_NAME = "sced_coverage_from_plexos_detail.csv"
 SCED_PLEXOS_COVERAGE_SUMMARY_FILE_NAME = "sced_coverage_from_plexos_summary.csv"
+SCED_PLEXOS_DUPLICATES_FILE_NAME = "sced_coverage_from_plexos_duplicates.csv"
 
 SCED_PLANT_REQUIRED_COLUMNS = ["resource_name", "fuel_type"]
 SCED_NAME_REQUIRED_COLUMNS = [
@@ -1818,7 +1819,7 @@ def build_plexos_technology_summary(plexos_matches_df: pd.DataFrame) -> pd.DataF
 def build_sced_plexos_coverage_outputs(
     sced_reference_df: pd.DataFrame,
     plexos_matches_df: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     sced_detail = sced_reference_df[
         [
             "resource_name",
@@ -1898,7 +1899,8 @@ def build_sced_plexos_coverage_outputs(
         ["is_matched_in_plexos", "plexos_match_count", "resource_name"],
         ascending=[False, False, True],
     ).reset_index(drop=True)
-    return sced_detail, summary_df
+    sced_duplicates_df = sced_detail[sced_detail["is_duplicate_in_plexos"]].copy().reset_index(drop=True)
+    return sced_detail, summary_df, sced_duplicates_df
 
 
 def save_outputs(
@@ -1910,8 +1912,9 @@ def save_outputs(
     plexos_tech_summary_df: pd.DataFrame,
     sced_plexos_coverage_detail_df: pd.DataFrame,
     sced_plexos_coverage_summary_df: pd.DataFrame,
+    sced_plexos_duplicates_df: pd.DataFrame,
     output_dir: str = OUTPUT_DIR,
-) -> tuple[Path, Path, Path, Path, Path, Path, Path, Path]:
+) -> tuple[Path, Path, Path, Path, Path, Path, Path, Path, Path]:
     output_path = ensure_output_dir(output_dir)
     best_matches_path = output_path / BEST_MATCHES_FILE_NAME
     candidates_path = output_path / ALL_CANDIDATES_FILE_NAME
@@ -1921,6 +1924,7 @@ def save_outputs(
     plexos_tech_summary_path = output_path / PLEXOS_TECH_SUMMARY_FILE_NAME
     sced_plexos_coverage_detail_path = output_path / SCED_PLEXOS_COVERAGE_DETAIL_FILE_NAME
     sced_plexos_coverage_summary_path = output_path / SCED_PLEXOS_COVERAGE_SUMMARY_FILE_NAME
+    sced_plexos_duplicates_path = output_path / SCED_PLEXOS_DUPLICATES_FILE_NAME
 
     best_matches_df.to_csv(best_matches_path, index=False)
     candidates_df.to_csv(candidates_path, index=False)
@@ -1930,6 +1934,7 @@ def save_outputs(
     plexos_tech_summary_df.to_csv(plexos_tech_summary_path, index=False)
     sced_plexos_coverage_detail_df.to_csv(sced_plexos_coverage_detail_path, index=False)
     sced_plexos_coverage_summary_df.to_csv(sced_plexos_coverage_summary_path, index=False)
+    sced_plexos_duplicates_df.to_csv(sced_plexos_duplicates_path, index=False)
     return (
         best_matches_path,
         candidates_path,
@@ -1939,6 +1944,7 @@ def save_outputs(
         plexos_tech_summary_path,
         sced_plexos_coverage_detail_path,
         sced_plexos_coverage_summary_path,
+        sced_plexos_duplicates_path,
     )
 
 
@@ -1969,7 +1975,11 @@ def main():
     generated_plexos_matches_df = build_plexos_matches(plexos_df, sced_reference_df, yes_df)
     plexos_matches_df = choose_plexos_matches_source(generated_plexos_matches_df)
     plexos_tech_summary_df = build_plexos_technology_summary(plexos_matches_df)
-    sced_plexos_coverage_detail_df, sced_plexos_coverage_summary_df = build_sced_plexos_coverage_outputs(
+    (
+        sced_plexos_coverage_detail_df,
+        sced_plexos_coverage_summary_df,
+        sced_plexos_duplicates_df,
+    ) = build_sced_plexos_coverage_outputs(
         sced_reference_df,
         plexos_matches_df,
     )
@@ -1982,6 +1992,7 @@ def main():
         plexos_tech_summary_path,
         sced_plexos_coverage_detail_path,
         sced_plexos_coverage_summary_path,
+        sced_plexos_duplicates_path,
     ) = save_outputs(
         best_matches_df,
         candidates_df,
@@ -1991,6 +2002,7 @@ def main():
         plexos_tech_summary_df,
         sced_plexos_coverage_detail_df,
         sced_plexos_coverage_summary_df,
+        sced_plexos_duplicates_df,
     )
 
     print(f"Saved best matches to {best_matches_path}")
@@ -2001,6 +2013,7 @@ def main():
     print(f"Saved PLEXOS technology summary to {plexos_tech_summary_path}")
     print(f"Saved SCED coverage detail to {sced_plexos_coverage_detail_path}")
     print(f"Saved SCED coverage summary to {sced_plexos_coverage_summary_path}")
+    print(f"Saved SCED duplicates to {sced_plexos_duplicates_path}")
 
 
 if __name__ == "__main__":

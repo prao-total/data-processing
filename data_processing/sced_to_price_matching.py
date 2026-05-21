@@ -77,6 +77,19 @@ FINAL_PLEXOS_MATCHES_REQUIRED_COLUMNS = [
     "plexos_to_sced_match_score",
     "plexos_to_sced_match_status",
 ]
+PLEXOS_OVERRIDE_KEY_COLUMNS = ["Class", "Name", "ERCOT_UnitCode", "CDR Name"]
+PLEXOS_OVERRIDE_COLUMNS = [
+    "matched_sced_node",
+    "matched_sced_station_code",
+    "matched_sced_station_description",
+    "matched_sced_fuel_type",
+    "matched_sced_capacity_mw",
+    "matched_price_node",
+    "matched_price_node_source",
+    "plexos_to_sced_match_method",
+    "plexos_to_sced_match_score",
+    "plexos_to_sced_match_status",
+]
 
 FUZZY_PLANT_MATCH_CUTOFF = 0.88
 FUZZY_STATION_TO_RTLMP_CUTOFF = 0.70
@@ -1289,15 +1302,43 @@ def choose_simple_matches_source(generated_simple_matches_df: pd.DataFrame) -> p
     return final_df
 
 
-def choose_plexos_matches_source(generated_plexos_matches_df: pd.DataFrame) -> pd.DataFrame:
+def build_override_key(df: pd.DataFrame, key_columns: list[str]) -> pd.Series:
+    normalized_parts = [df[column].map(normalize_text) for column in key_columns]
+    return pd.Series(["||".join(values) for values in zip(*normalized_parts)], index=df.index)
+
+
+def manual_override_has_value(value) -> bool:
+    if pd.isna(value):
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
+
+
+def apply_plexos_match_overrides(generated_plexos_matches_df: pd.DataFrame) -> pd.DataFrame:
     if not FINAL_PLEXOS_MATCHES_PATH:
         return generated_plexos_matches_df
 
-    final_df = load_csv(
+    override_df = load_csv(
         FINAL_PLEXOS_MATCHES_PATH,
         FINAL_PLEXOS_MATCHES_REQUIRED_COLUMNS,
     ).copy()
-    return final_df
+    merged_df = generated_plexos_matches_df.copy()
+    merged_df["_override_key"] = build_override_key(merged_df, PLEXOS_OVERRIDE_KEY_COLUMNS)
+    override_df["_override_key"] = build_override_key(override_df, PLEXOS_OVERRIDE_KEY_COLUMNS)
+
+    override_df = override_df.drop_duplicates(subset="_override_key", keep="last")
+    override_df = override_df.set_index("_override_key")
+
+    for column in PLEXOS_OVERRIDE_COLUMNS:
+        override_values = merged_df["_override_key"].map(override_df[column])
+        merged_df[column] = [
+            override if manual_override_has_value(override) else current
+            for current, override in zip(merged_df[column], override_values)
+        ]
+
+    merged_df = merged_df.drop(columns="_override_key")
+    return merged_df
 
 
 def build_sced_reference_df(
@@ -1973,7 +2014,7 @@ def main():
     simple_matches_for_plexos_df = choose_simple_matches_source(simple_matches_df)
     sced_reference_df = build_sced_reference_df(best_matches_df, simple_matches_for_plexos_df, ercot_cdr_df)
     generated_plexos_matches_df = build_plexos_matches(plexos_df, sced_reference_df, yes_df)
-    plexos_matches_df = choose_plexos_matches_source(generated_plexos_matches_df)
+    plexos_matches_df = apply_plexos_match_overrides(generated_plexos_matches_df)
     plexos_tech_summary_df = build_plexos_technology_summary(plexos_matches_df)
     (
         sced_plexos_coverage_detail_df,

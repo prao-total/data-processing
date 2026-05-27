@@ -16,6 +16,7 @@ RTLMP_LIST_PATH = "/Users/pradyrao/Downloads/rtlmp_ercot_list.csv"
 RESOURCE_NODE_MAPPING_PATH = "/Users/pradyrao/Downloads/SP_List_EB_Mapping 2/Resource_Node_to_Unit_02202026_094122.csv"
 PLEXOS_LIST_PATH = "/Users/pradyrao/Downloads/plexos_list.csv"
 ERCOT_CDR_PATH = "/Users/pradyrao/Downloads/ercot_cdr_july.csv"
+PUN_GENERATION_REPORT_PATH = "/Users/pradyrao/Downloads/PUN_Generation_Report/PUN_Generation_Report.csv"
 FINAL_SIMPLE_MATCHES_PATH = None
 FINAL_PLEXOS_MATCHES_PATH = None
 
@@ -29,6 +30,7 @@ PLEXOS_TECH_SUMMARY_FILE_NAME = "plexos_match_summary_by_technology.csv"
 SCED_PLEXOS_COVERAGE_DETAIL_FILE_NAME = "sced_coverage_from_plexos_detail.csv"
 SCED_PLEXOS_COVERAGE_SUMMARY_FILE_NAME = "sced_coverage_from_plexos_summary.csv"
 SCED_PLEXOS_DUPLICATES_FILE_NAME = "sced_coverage_from_plexos_duplicates.csv"
+PUN_PLEXOS_PRESENCE_FILE_NAME = "pun_generation_report_with_plexos_flag.csv"
 
 SCED_PLANT_REQUIRED_COLUMNS = ["resource_name", "fuel_type"]
 SCED_NAME_REQUIRED_COLUMNS = [
@@ -50,6 +52,7 @@ RTLMP_REQUIRED_COLUMNS = ["OBJECTTYPE", "OBJECTID", "NAME", "ISO"]
 RESOURCE_NODE_MAPPING_REQUIRED_COLUMNS = ["RESOURCE_NODE", "UNIT_SUBSTATION", "UNIT_NAME"]
 PLEXOS_REQUIRED_COLUMNS = ["Class", "Name", "CDR Name", "ERCOT_UnitCode", "County", "Fuel Reporting"]
 ERCOT_CDR_REQUIRED_COLUMNS = ["UNIT NAME", "UNIT CODE", "COUNTY", "FUEL"]
+PUN_REQUIRED_COLUMNS = ["SubstationName", "UnitName"]
 FINAL_PLEXOS_MATCHES_REQUIRED_COLUMNS = [
     "Class",
     "Name",
@@ -1944,6 +1947,72 @@ def build_sced_plexos_coverage_outputs(
     return sced_detail, summary_df, sced_duplicates_df
 
 
+def add_pun_presence_flag_to_plexos_matches(
+    pun_df: pd.DataFrame,
+    plexos_matches_df: pd.DataFrame,
+) -> pd.DataFrame:
+    pun_combo_series = (
+        pun_df["SubstationName"].fillna("").astype(str).str.strip()
+        + "_"
+        + pun_df["UnitName"].fillna("").astype(str).str.strip()
+    )
+    pun_combo_keys = {
+        normalize_key(value)
+        for value in pun_combo_series
+        if normalize_key(value)
+    }
+
+    output_df = plexos_matches_df.copy()
+    comparison_series = pd.concat(
+        [
+            output_df["ERCOT_UnitCode"],
+            output_df["matched_sced_node"],
+        ],
+        ignore_index=True,
+    )
+    comparison_keys = [
+        normalize_key(value) if pd.notna(value) else ""
+        for value in comparison_series
+    ]
+    first_half = comparison_keys[: len(output_df)]
+    second_half = comparison_keys[len(output_df) :]
+    output_df["in_pun_generation_report"] = [
+        "Y" if eia_key in pun_combo_keys or sced_key in pun_combo_keys else "N"
+        for eia_key, sced_key in zip(first_half, second_half)
+    ]
+    return output_df
+
+
+def build_pun_presence_output(
+    pun_df: pd.DataFrame,
+    plexos_matches_df: pd.DataFrame,
+) -> pd.DataFrame:
+    output_df = pun_df.copy()
+    output_df["pun_combo"] = (
+        output_df["SubstationName"].fillna("").astype(str).str.strip()
+        + "_"
+        + output_df["UnitName"].fillna("").astype(str).str.strip()
+    )
+    pun_combo_keys = output_df["pun_combo"].map(normalize_key)
+
+    lookup_series = pd.concat(
+        [
+            plexos_matches_df["ERCOT_UnitCode"],
+            plexos_matches_df["matched_sced_node"],
+        ],
+        ignore_index=True,
+    )
+    lookup_keys = {
+        normalize_key(value)
+        for value in lookup_series.dropna().astype(str)
+        if normalize_key(value)
+    }
+    output_df["in_plexos_match_list"] = pun_combo_keys.map(
+        lambda value: "Y" if value in lookup_keys else "N"
+    )
+    return output_df
+
+
 def save_outputs(
     best_matches_df: pd.DataFrame,
     candidates_df: pd.DataFrame,
@@ -1954,8 +2023,9 @@ def save_outputs(
     sced_plexos_coverage_detail_df: pd.DataFrame,
     sced_plexos_coverage_summary_df: pd.DataFrame,
     sced_plexos_duplicates_df: pd.DataFrame,
+    pun_presence_df: pd.DataFrame,
     output_dir: str = OUTPUT_DIR,
-) -> tuple[Path, Path, Path, Path, Path, Path, Path, Path, Path]:
+) -> tuple[Path, Path, Path, Path, Path, Path, Path, Path, Path, Path]:
     output_path = ensure_output_dir(output_dir)
     best_matches_path = output_path / BEST_MATCHES_FILE_NAME
     candidates_path = output_path / ALL_CANDIDATES_FILE_NAME
@@ -1966,6 +2036,7 @@ def save_outputs(
     sced_plexos_coverage_detail_path = output_path / SCED_PLEXOS_COVERAGE_DETAIL_FILE_NAME
     sced_plexos_coverage_summary_path = output_path / SCED_PLEXOS_COVERAGE_SUMMARY_FILE_NAME
     sced_plexos_duplicates_path = output_path / SCED_PLEXOS_DUPLICATES_FILE_NAME
+    pun_plexos_presence_path = output_path / PUN_PLEXOS_PRESENCE_FILE_NAME
 
     best_matches_df.to_csv(best_matches_path, index=False)
     candidates_df.to_csv(candidates_path, index=False)
@@ -1976,6 +2047,7 @@ def save_outputs(
     sced_plexos_coverage_detail_df.to_csv(sced_plexos_coverage_detail_path, index=False)
     sced_plexos_coverage_summary_df.to_csv(sced_plexos_coverage_summary_path, index=False)
     sced_plexos_duplicates_df.to_csv(sced_plexos_duplicates_path, index=False)
+    pun_presence_df.to_csv(pun_plexos_presence_path, index=False)
     return (
         best_matches_path,
         candidates_path,
@@ -1986,6 +2058,7 @@ def save_outputs(
         sced_plexos_coverage_detail_path,
         sced_plexos_coverage_summary_path,
         sced_plexos_duplicates_path,
+        pun_plexos_presence_path,
     )
 
 
@@ -2001,6 +2074,7 @@ def main():
     )
     plexos_df = load_csv(PLEXOS_LIST_PATH, PLEXOS_REQUIRED_COLUMNS)
     ercot_cdr_df = load_csv(ERCOT_CDR_PATH, ERCOT_CDR_REQUIRED_COLUMNS)
+    pun_df = load_csv(PUN_GENERATION_REPORT_PATH, PUN_REQUIRED_COLUMNS)
 
     best_matches_df, candidates_df, summary_df = build_match_tables(
         sced_plant_df,
@@ -2015,6 +2089,8 @@ def main():
     sced_reference_df = build_sced_reference_df(best_matches_df, simple_matches_for_plexos_df, ercot_cdr_df)
     generated_plexos_matches_df = build_plexos_matches(plexos_df, sced_reference_df, yes_df)
     plexos_matches_df = apply_plexos_match_overrides(generated_plexos_matches_df)
+    plexos_matches_df = add_pun_presence_flag_to_plexos_matches(pun_df, plexos_matches_df)
+    pun_presence_df = build_pun_presence_output(pun_df, plexos_matches_df)
     plexos_tech_summary_df = build_plexos_technology_summary(plexos_matches_df)
     (
         sced_plexos_coverage_detail_df,
@@ -2034,6 +2110,7 @@ def main():
         sced_plexos_coverage_detail_path,
         sced_plexos_coverage_summary_path,
         sced_plexos_duplicates_path,
+        pun_plexos_presence_path,
     ) = save_outputs(
         best_matches_df,
         candidates_df,
@@ -2044,6 +2121,7 @@ def main():
         sced_plexos_coverage_detail_df,
         sced_plexos_coverage_summary_df,
         sced_plexos_duplicates_df,
+        pun_presence_df,
     )
 
     print(f"Saved best matches to {best_matches_path}")
@@ -2055,6 +2133,7 @@ def main():
     print(f"Saved SCED coverage detail to {sced_plexos_coverage_detail_path}")
     print(f"Saved SCED coverage summary to {sced_plexos_coverage_summary_path}")
     print(f"Saved SCED duplicates to {sced_plexos_duplicates_path}")
+    print(f"Saved PUN presence output to {pun_plexos_presence_path}")
 
 
 if __name__ == "__main__":

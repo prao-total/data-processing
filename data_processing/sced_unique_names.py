@@ -11,10 +11,10 @@ CSV_PATHS = [
 
 # TODO: Replace with real output directory.
 OUTPUT_DIR = "C:/Users/L1165683/GitHub_Repos/data-processing/data_processing/output/sced_unique_names"
-OUTPUT_FILE_NAME = "unique_resource_name_fuel_type.csv"
+OUTPUT_FILE_NAME = "resource_name_fuel_type_avg_base_point.csv"
 
 REQUIRED_COLUMNS = ["resource_name", "fuel_type", "avg_base_point"]
-UNIQUE_COLUMNS = ["resource_name", "fuel_type"]
+GROUP_COLUMNS = ["resource_name", "fuel_type"]
 
 
 def ensure_output_dir(output_dir=OUTPUT_DIR):
@@ -31,22 +31,25 @@ def load_csv(csv_path):
     return df
 
 
-def extract_unique_resource_fuel_rows(csv_paths=CSV_PATHS):
+def aggregate_resource_fuel_rows(csv_paths=CSV_PATHS):
     frames = []
     for csv_path in csv_paths:
         df = load_csv(csv_path)
-        frames.append(df[UNIQUE_COLUMNS].copy())
+        reduced_df = df[REQUIRED_COLUMNS].copy()
+        reduced_df["avg_base_point"] = pd.to_numeric(reduced_df["avg_base_point"], errors="coerce")
+        frames.append(reduced_df)
 
     combined = pd.concat(frames, ignore_index=True)
-    unique_rows = (
-        combined.drop_duplicates(subset=UNIQUE_COLUMNS)
-        .sort_values(UNIQUE_COLUMNS, na_position="last")
+    aggregated_rows = (
+        combined.groupby(GROUP_COLUMNS, dropna=False, as_index=False)
+        .agg(avg_base_point=("avg_base_point", "mean"))
+        .sort_values(GROUP_COLUMNS, na_position="last")
         .reset_index(drop=True)
     )
-    return unique_rows
+    return aggregated_rows
 
 
-def save_unique_rows(df, output_dir=OUTPUT_DIR, output_file_name=OUTPUT_FILE_NAME):
+def save_aggregated_rows(df, output_dir=OUTPUT_DIR, output_file_name=OUTPUT_FILE_NAME):
     output_path = ensure_output_dir(output_dir)
     out_file = output_path / output_file_name
     df.to_csv(out_file, index=False)
@@ -54,9 +57,9 @@ def save_unique_rows(df, output_dir=OUTPUT_DIR, output_file_name=OUTPUT_FILE_NAM
 
 
 def main():
-    unique_rows = extract_unique_resource_fuel_rows()
-    output_file = save_unique_rows(unique_rows)
-    print(f"Saved unique resource/fuel rows to {output_file}")
+    aggregated_rows = aggregate_resource_fuel_rows()
+    output_file = save_aggregated_rows(aggregated_rows)
+    print(f"Saved aggregated resource/fuel rows to {output_file}")
 
 
 if __name__ == "__main__":

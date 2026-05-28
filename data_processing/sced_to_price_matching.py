@@ -2061,6 +2061,52 @@ def build_pun_presence_output(
     return output_df
 
 
+def add_sced_plant_units_to_plexos_matches(
+    sced_plant_df: pd.DataFrame,
+    plexos_matches_df: pd.DataFrame,
+) -> pd.DataFrame:
+    sced_units = sced_plant_df[["resource_name"]].copy()
+    sced_units["sced_plant_id"] = sced_units["resource_name"].map(derive_sced_plant_id)
+    plant_units_lookup = (
+        sced_units.groupby("sced_plant_id", dropna=False)["resource_name"]
+        .agg(joined_examples)
+        .to_dict()
+    )
+
+    output_df = plexos_matches_df.copy()
+    output_df["matched_sced_plant_units"] = output_df["matched_sced_node"].map(
+        lambda node: plant_units_lookup.get(derive_sced_plant_id(node), "") if pd.notna(node) and str(node).strip() else ""
+    )
+    return output_df
+
+
+def add_duplicate_sced_node_reference(
+    sced_plant_df: pd.DataFrame,
+    plexos_matches_df: pd.DataFrame,
+) -> pd.DataFrame:
+    sced_lookup = sced_plant_df[["resource_name", "avg_base_point"]].copy()
+    sced_lookup["avg_base_point"] = parse_numeric(sced_lookup["avg_base_point"])
+    avg_base_point_lookup = sced_lookup.set_index("resource_name")["avg_base_point"].to_dict()
+
+    output_df = plexos_matches_df.copy()
+    duplicate_counts = output_df["matched_sced_node"].fillna("").astype(str).str.strip()
+    duplicate_counts = duplicate_counts[duplicate_counts.ne("")].value_counts()
+
+    def build_duplicate_reference(node) -> str:
+        if pd.isna(node):
+            return ""
+        node_text = str(node).strip()
+        if not node_text or duplicate_counts.get(node_text, 0) <= 1:
+            return ""
+        avg_base_point = avg_base_point_lookup.get(node_text)
+        if pd.notna(avg_base_point):
+            return f"{node_text} | avg_base_point={avg_base_point:.6f}"
+        return node_text
+
+    output_df["duplicate_matched_sced_node_reference"] = output_df["matched_sced_node"].map(build_duplicate_reference)
+    return output_df
+
+
 def build_plant_basepoint_reconciliation_outputs(
     sced_plant_df: pd.DataFrame,
     plexos_matches_df: pd.DataFrame,
@@ -2281,6 +2327,8 @@ def main():
     generated_plexos_matches_df = build_plexos_matches(plexos_df, sced_reference_df, yes_df)
     plexos_matches_df = apply_plexos_match_overrides(generated_plexos_matches_df)
     plexos_matches_df = add_pun_presence_flag_to_plexos_matches(pun_df, plexos_matches_df)
+    plexos_matches_df = add_sced_plant_units_to_plexos_matches(sced_plant_df, plexos_matches_df)
+    plexos_matches_df = add_duplicate_sced_node_reference(sced_plant_df, plexos_matches_df)
     pun_presence_df = build_pun_presence_output(pun_df, plexos_matches_df)
     plexos_tech_summary_df = build_plexos_technology_summary(plexos_matches_df)
     (

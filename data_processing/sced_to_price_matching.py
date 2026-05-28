@@ -169,6 +169,22 @@ def similarity_score(left: str, right: str) -> float:
     return SequenceMatcher(None, left, right).ratio()
 
 
+def is_terminal_plexos_unit_descriptor(inner: str, full_text: str) -> bool:
+    inner_norm = normalize_text(inner)
+    compact = inner_norm.replace(" ", "")
+    if not compact:
+        return False
+    if compact == "ERCOT":
+        return True
+    if re.fullmatch(r"(?:U)?\d+", compact):
+        return True
+    if re.fullmatch(r"[A-Z]{1,8}-?\d+[A-Z]*", compact):
+        return True
+    if "(" in full_text[: full_text.rfind("(")] and re.fullmatch(r"[A-Z0-9-]{1,12}", compact):
+        return True
+    return False
+
+
 def parse_plexos_name_parts(name: str) -> dict[str, str]:
     raw = "" if pd.isna(name) else str(name).strip()
     normalized = normalize_text(raw)
@@ -180,18 +196,19 @@ def parse_plexos_name_parts(name: str) -> dict[str, str]:
         if not parenthetical_match:
             break
         inner = parenthetical_match.group(1).strip().upper()
-        if inner == "ERCOT":
-            base = base[: parenthetical_match.start()].strip()
-            continue
-        if re.fullmatch(r"(?:U)?\d+", inner) or re.fullmatch(r"[A-Z]{1,6}\d+[A-Z]*", inner):
-            if not unit_hint:
-                unit_hint = inner
+        if is_terminal_plexos_unit_descriptor(inner, base):
+            if not unit_hint and normalize_text(inner).replace(" ", "") != "ERCOT":
+                unit_hint = normalize_text(inner).replace(" ", "")
             base = base[: parenthetical_match.start()].strip()
             continue
         break
 
     if not unit_hint:
-        trailing_match = re.search(r"\b((?:U|UNIT|CT|ST|GT|CC|GEN|TG|HRSG|GTG|CTG|STG)\s*\d+[A-Z]*)\s*$", raw, re.IGNORECASE)
+        trailing_match = re.search(
+            r"\b((?:U|UNIT|CT|ST|GT|CC|GEN|TG|HRSG|GTG|CTG|STG)\s*-?\s*\d+[A-Z]*)\s*$",
+            raw,
+            re.IGNORECASE,
+        )
         if trailing_match:
             unit_hint = normalize_text(trailing_match.group(1)).replace(" ", "")
             base = raw[: trailing_match.start()].strip()

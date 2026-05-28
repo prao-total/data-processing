@@ -31,6 +31,8 @@ SCED_PLEXOS_COVERAGE_DETAIL_FILE_NAME = "sced_coverage_from_plexos_detail.csv"
 SCED_PLEXOS_COVERAGE_SUMMARY_FILE_NAME = "sced_coverage_from_plexos_summary.csv"
 SCED_PLEXOS_DUPLICATES_FILE_NAME = "sced_coverage_from_plexos_duplicates.csv"
 PUN_PLEXOS_PRESENCE_FILE_NAME = "pun_generation_report_with_plexos_flag.csv"
+PLANT_RECONCILIATION_FILE_NAME = "plant_capacity_vs_basepoint_reconciliation.csv"
+PLANT_RECONCILIATION_FLAGS_FILE_NAME = "plant_capacity_vs_basepoint_discrepancies.csv"
 
 SCED_PLANT_REQUIRED_COLUMNS = ["resource_name", "fuel_type"]
 SCED_NAME_REQUIRED_COLUMNS = [
@@ -108,6 +110,8 @@ PLEXOS_NAME_FUZZY_CUTOFF = 0.82
 PLEXOS_CDR_UNIT_NAME_FUZZY_CUTOFF = 0.84
 PLEXOS_YES_PLANT_FUZZY_CUTOFF = 0.84
 PLEXOS_ERCOT_UNIT_LATE_FUZZY_CUTOFF = 0.72
+PLANT_DISCREPANCY_MW_THRESHOLD = 20.0
+PLANT_DISCREPANCY_PCT_THRESHOLD = 0.25
 
 
 @dataclass(frozen=True)
@@ -171,15 +175,23 @@ def parse_plexos_name_parts(name: str) -> dict[str, str]:
     unit_hint = ""
     base = raw
 
-    parenthetical_match = re.search(r"\(([^)]+)\)\s*$", raw)
-    if parenthetical_match:
+    while True:
+        parenthetical_match = re.search(r"\(([^)]+)\)\s*$", base)
+        if not parenthetical_match:
+            break
         inner = parenthetical_match.group(1).strip().upper()
-        if re.fullmatch(r"(?:U)?\d+", inner) or re.fullmatch(r"(?:CT|ST|GT|CC)\d+", inner):
-            unit_hint = inner
-            base = raw[: parenthetical_match.start()].strip()
+        if inner == "ERCOT":
+            base = base[: parenthetical_match.start()].strip()
+            continue
+        if re.fullmatch(r"(?:U)?\d+", inner) or re.fullmatch(r"[A-Z]{1,6}\d+[A-Z]*", inner):
+            if not unit_hint:
+                unit_hint = inner
+            base = base[: parenthetical_match.start()].strip()
+            continue
+        break
 
     if not unit_hint:
-        trailing_match = re.search(r"\b((?:U|UNIT|CT|ST|GT|CC)\s*\d+)\s*$", raw, re.IGNORECASE)
+        trailing_match = re.search(r"\b((?:U|UNIT|CT|ST|GT|CC|GEN|TG|HRSG|GTG|CTG|STG)\s*\d+[A-Z]*)\s*$", raw, re.IGNORECASE)
         if trailing_match:
             unit_hint = normalize_text(trailing_match.group(1)).replace(" ", "")
             base = raw[: trailing_match.start()].strip()
@@ -221,6 +233,26 @@ def extract_resource_unit_tokens(resource_name: str) -> set[str]:
             tokens.add(number)
             tokens.add(f"{prefix}{number}")
     return tokens
+
+
+def is_unit_like_token(token: str) -> bool:
+    token = normalize_text(token)
+    if not token:
+        return False
+    return bool(
+        re.fullmatch(r"\d+", token)
+        or re.fullmatch(r"(?:UNIT|U|CT|ST|GT|CC|G|GEN|TG|HRSG)\d+[A-Z]*", token)
+    )
+
+
+def derive_sced_plant_id(resource_name: str) -> str:
+    text = normalize_text(resource_name)
+    if not text:
+        return ""
+    parts = text.split("_")
+    if len(parts) >= 3 and parts[1] and is_unit_like_token(parts[2]):
+        return "_".join(parts[:2])
+    return parts[0]
 
 
 def fuel_key(value) -> str:
@@ -283,6 +315,22 @@ def extract_stems(resource_name: str) -> list[str]:
     add(tokens[0])
 
     return stems
+
+
+def joined_examples(values, limit: int = 10) -> str:
+    ordered = []
+    seen = set()
+    for value in values:
+        if pd.isna(value):
+            continue
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        ordered.append(text)
+        if len(ordered) >= limit:
+            break
+    return " | ".join(ordered)
 
 
 def prepare_sced_name_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -2013,6 +2061,141 @@ def build_pun_presence_output(
     return output_df
 
 
+def build_plant_basepoint_reconciliation_outputs(
+    sced_plant_df: pd.DataFrame,
+    plexos_matches_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    sced_units = sced_plant_df.copy()
+    sced_units["sced_plant_id"] = sced_units["resource_name"].map(derive_sced_plant_id)
+    sced_units["avg_base_point"] = parse_numeric(sced_units["avg_base_point"])
+    sced_units["sced_fuel_norm"] = sced_units["fuel_type"].map(fuel_key).replace("", "UNKNOWN")
+
+    sced_plants = (
+        sced_units.groupby("sced_plant_id", dropna=False)
+        .agg(
+            sced_avg_base_point_sum=("avg_base_point", "sum"),
+            sced_avg_base_point_mean=("avg_base_point", "mean"),
+            sced_unit_count=("resource_name", "size"),
+            sced_fuel=("sced_fuel_norm", lambda s: s.mode().iloc[0] if not s.mode().empty else "UNKNOWN"),
+            sced_example_nodes=("resource_name", joined_examples),
+        )
+        .reset_index()
+    )
+
+    plexos_units = plexos_matches_df.copy()
+    name_parts = plexos_units["Name"].map(parse_plexos_name_parts)
+    plexos_units["plexos_plant_id"] = name_parts.map(lambda parts: parts["name_base_norm"])
+    plexos_units["linked_sced_plant_id"] = plexos_units["matched_sced_node"].map(derive_sced_plant_id)
+    plexos_units["matched_sced_capacity_mw"] = parse_numeric(plexos_units["matched_sced_capacity_mw"])
+    plexos_units["has_sced_match"] = plexos_units["matched_sced_node"].fillna("").astype(str).str.strip().ne("")
+
+    linked_units = plexos_units[plexos_units["has_sced_match"]].copy()
+    plant_links = (
+        linked_units.groupby(["plexos_plant_id", "linked_sced_plant_id"], dropna=False)
+        .agg(linked_unit_count=("matched_sced_node", "size"))
+        .reset_index()
+    )
+    plant_links = plant_links.sort_values(
+        ["plexos_plant_id", "linked_unit_count", "linked_sced_plant_id"],
+        ascending=[True, False, True],
+    )
+    dominant_links = plant_links.drop_duplicates(subset="plexos_plant_id", keep="first").rename(
+        columns={"linked_sced_plant_id": "dominant_sced_plant_id"}
+    )
+    plant_link_counts = (
+        plant_links.groupby("plexos_plant_id", dropna=False)
+        .agg(
+            distinct_sced_plants=("linked_sced_plant_id", "nunique"),
+            total_linked_units=("linked_unit_count", "sum"),
+            linked_sced_plants=("linked_sced_plant_id", joined_examples),
+        )
+        .reset_index()
+    )
+
+    plexos_plants = (
+        plexos_units.groupby("plexos_plant_id", dropna=False)
+        .agg(
+            plexos_unit_count=("Name", "size"),
+            matched_unit_count=("has_sced_match", "sum"),
+            plexos_capacity_sum_mw=("matched_sced_capacity_mw", "sum"),
+            plexos_example_names=("Name", joined_examples),
+            plexos_matched_sced_nodes=("matched_sced_node", joined_examples),
+            plexos_categories=("Category", joined_examples),
+            plexos_price_nodes=("matched_price_node", joined_examples),
+        )
+        .reset_index()
+    )
+    plexos_plants = plexos_plants.merge(dominant_links, on="plexos_plant_id", how="left")
+    plexos_plants = plexos_plants.merge(plant_link_counts, on="plexos_plant_id", how="left")
+    plexos_plants["distinct_sced_plants"] = plexos_plants["distinct_sced_plants"].fillna(0).astype(int)
+    plexos_plants["total_linked_units"] = plexos_plants["total_linked_units"].fillna(0).astype(int)
+    plexos_plants["linked_sced_plants"] = plexos_plants["linked_sced_plants"].fillna("")
+    plexos_plants["plant_match_status"] = plexos_plants["distinct_sced_plants"].map(
+        lambda count: "unmatched" if count == 0 else ("resolved" if count == 1 else "ambiguous")
+    )
+
+    reconciliation_df = plexos_plants.merge(
+        sced_plants,
+        left_on="dominant_sced_plant_id",
+        right_on="sced_plant_id",
+        how="left",
+    )
+    reconciliation_df["difference_mw"] = (
+        reconciliation_df["plexos_capacity_sum_mw"] - reconciliation_df["sced_avg_base_point_sum"]
+    )
+    reconciliation_df["difference_pct"] = reconciliation_df["difference_mw"] / reconciliation_df[
+        "plexos_capacity_sum_mw"
+    ].where(reconciliation_df["plexos_capacity_sum_mw"].abs() > 0)
+    reconciliation_df["abs_difference_mw"] = reconciliation_df["difference_mw"].abs()
+    reconciliation_df["abs_difference_pct"] = reconciliation_df["difference_pct"].abs()
+    reconciliation_df["has_comparable_values"] = (
+        (reconciliation_df["plant_match_status"] == "resolved")
+        & reconciliation_df["plexos_capacity_sum_mw"].notna()
+        & reconciliation_df["sced_avg_base_point_sum"].notna()
+        & (reconciliation_df["plexos_capacity_sum_mw"] > 0)
+    )
+    reconciliation_df["is_discrepant"] = (
+        reconciliation_df["has_comparable_values"]
+        & (
+            (reconciliation_df["abs_difference_mw"] >= PLANT_DISCREPANCY_MW_THRESHOLD)
+            | (reconciliation_df["abs_difference_pct"] >= PLANT_DISCREPANCY_PCT_THRESHOLD)
+        )
+    )
+
+    reconciliation_df = reconciliation_df.sort_values(
+        ["is_discrepant", "abs_difference_mw", "plexos_plant_id"],
+        ascending=[False, False, True],
+        na_position="last",
+    ).reset_index(drop=True)
+    reconciliation_df = reconciliation_df[
+        [
+            "plexos_plant_id",
+            "dominant_sced_plant_id",
+            "plant_match_status",
+            "distinct_sced_plants",
+            "linked_sced_plants",
+            "plexos_unit_count",
+            "matched_unit_count",
+            "sced_unit_count",
+            "plexos_capacity_sum_mw",
+            "sced_avg_base_point_sum",
+            "sced_avg_base_point_mean",
+            "difference_mw",
+            "difference_pct",
+            "is_discrepant",
+            "sced_fuel",
+            "plexos_categories",
+            "plexos_example_names",
+            "plexos_matched_sced_nodes",
+            "sced_example_nodes",
+            "plexos_price_nodes",
+        ]
+    ]
+
+    discrepancy_df = reconciliation_df[reconciliation_df["is_discrepant"]].copy().reset_index(drop=True)
+    return reconciliation_df, discrepancy_df
+
+
 def save_outputs(
     best_matches_df: pd.DataFrame,
     candidates_df: pd.DataFrame,
@@ -2024,8 +2207,10 @@ def save_outputs(
     sced_plexos_coverage_summary_df: pd.DataFrame,
     sced_plexos_duplicates_df: pd.DataFrame,
     pun_presence_df: pd.DataFrame,
+    plant_reconciliation_df: pd.DataFrame,
+    plant_discrepancies_df: pd.DataFrame,
     output_dir: str = OUTPUT_DIR,
-) -> tuple[Path, Path, Path, Path, Path, Path, Path, Path, Path, Path]:
+) -> tuple[Path, Path, Path, Path, Path, Path, Path, Path, Path, Path, Path, Path]:
     output_path = ensure_output_dir(output_dir)
     best_matches_path = output_path / BEST_MATCHES_FILE_NAME
     candidates_path = output_path / ALL_CANDIDATES_FILE_NAME
@@ -2037,6 +2222,8 @@ def save_outputs(
     sced_plexos_coverage_summary_path = output_path / SCED_PLEXOS_COVERAGE_SUMMARY_FILE_NAME
     sced_plexos_duplicates_path = output_path / SCED_PLEXOS_DUPLICATES_FILE_NAME
     pun_plexos_presence_path = output_path / PUN_PLEXOS_PRESENCE_FILE_NAME
+    plant_reconciliation_path = output_path / PLANT_RECONCILIATION_FILE_NAME
+    plant_discrepancies_path = output_path / PLANT_RECONCILIATION_FLAGS_FILE_NAME
 
     best_matches_df.to_csv(best_matches_path, index=False)
     candidates_df.to_csv(candidates_path, index=False)
@@ -2048,6 +2235,8 @@ def save_outputs(
     sced_plexos_coverage_summary_df.to_csv(sced_plexos_coverage_summary_path, index=False)
     sced_plexos_duplicates_df.to_csv(sced_plexos_duplicates_path, index=False)
     pun_presence_df.to_csv(pun_plexos_presence_path, index=False)
+    plant_reconciliation_df.to_csv(plant_reconciliation_path, index=False)
+    plant_discrepancies_df.to_csv(plant_discrepancies_path, index=False)
     return (
         best_matches_path,
         candidates_path,
@@ -2059,6 +2248,8 @@ def save_outputs(
         sced_plexos_coverage_summary_path,
         sced_plexos_duplicates_path,
         pun_plexos_presence_path,
+        plant_reconciliation_path,
+        plant_discrepancies_path,
     )
 
 
@@ -2100,6 +2291,10 @@ def main():
         sced_reference_df,
         plexos_matches_df,
     )
+    plant_reconciliation_df, plant_discrepancies_df = build_plant_basepoint_reconciliation_outputs(
+        sced_plant_df,
+        plexos_matches_df,
+    )
     (
         best_matches_path,
         candidates_path,
@@ -2111,6 +2306,8 @@ def main():
         sced_plexos_coverage_summary_path,
         sced_plexos_duplicates_path,
         pun_plexos_presence_path,
+        plant_reconciliation_path,
+        plant_discrepancies_path,
     ) = save_outputs(
         best_matches_df,
         candidates_df,
@@ -2122,6 +2319,8 @@ def main():
         sced_plexos_coverage_summary_df,
         sced_plexos_duplicates_df,
         pun_presence_df,
+        plant_reconciliation_df,
+        plant_discrepancies_df,
     )
 
     print(f"Saved best matches to {best_matches_path}")
@@ -2134,6 +2333,8 @@ def main():
     print(f"Saved SCED coverage summary to {sced_plexos_coverage_summary_path}")
     print(f"Saved SCED duplicates to {sced_plexos_duplicates_path}")
     print(f"Saved PUN presence output to {pun_plexos_presence_path}")
+    print(f"Saved plant reconciliation to {plant_reconciliation_path}")
+    print(f"Saved plant discrepancies to {plant_discrepancies_path}")
 
 
 if __name__ == "__main__":

@@ -2202,9 +2202,14 @@ def build_plant_basepoint_reconciliation_outputs(
     )
     reconciliation_df["is_discrepant"] = (
         reconciliation_df["has_comparable_values"]
+        & (reconciliation_df["sced_avg_base_point_sum"] > reconciliation_df["plexos_capacity_sum_mw"])
         & (
-            (reconciliation_df["abs_difference_mw"] >= PLANT_DISCREPANCY_MW_THRESHOLD)
-            | (reconciliation_df["abs_difference_pct"] >= PLANT_DISCREPANCY_PCT_THRESHOLD)
+            ((reconciliation_df["sced_avg_base_point_sum"] - reconciliation_df["plexos_capacity_sum_mw"]) >= PLANT_DISCREPANCY_MW_THRESHOLD)
+            | (
+                ((reconciliation_df["sced_avg_base_point_sum"] - reconciliation_df["plexos_capacity_sum_mw"])
+                / reconciliation_df["plexos_capacity_sum_mw"].where(reconciliation_df["plexos_capacity_sum_mw"].abs() > 0))
+                >= PLANT_DISCREPANCY_PCT_THRESHOLD
+            )
         )
     )
 

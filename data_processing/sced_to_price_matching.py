@@ -112,6 +112,8 @@ PLEXOS_YES_PLANT_FUZZY_CUTOFF = 0.84
 PLEXOS_ERCOT_UNIT_LATE_FUZZY_CUTOFF = 0.72
 PLANT_DISCREPANCY_MW_THRESHOLD = 20.0
 PLANT_DISCREPANCY_PCT_THRESHOLD = 0.25
+WIND_BASEPOINT_CAPACITY_RATIO_THRESHOLD = 0.60
+SOLAR_BASEPOINT_CAPACITY_RATIO_THRESHOLD = 0.50
 
 
 @dataclass(frozen=True)
@@ -2209,6 +2211,9 @@ def build_plant_basepoint_reconciliation_outputs(
     reconciliation_df["difference_pct"] = reconciliation_df["difference_mw"] / reconciliation_df[
         "plexos_capacity_sum_mw"
     ].where(reconciliation_df["plexos_capacity_sum_mw"].abs() > 0)
+    reconciliation_df["basepoint_to_capacity_ratio"] = reconciliation_df["sced_avg_base_point_sum"] / reconciliation_df[
+        "plexos_capacity_sum_mw"
+    ].where(reconciliation_df["plexos_capacity_sum_mw"].abs() > 0)
     reconciliation_df["abs_difference_mw"] = reconciliation_df["difference_mw"].abs()
     reconciliation_df["abs_difference_pct"] = reconciliation_df["difference_pct"].abs()
     reconciliation_df["has_comparable_values"] = (
@@ -2217,8 +2222,16 @@ def build_plant_basepoint_reconciliation_outputs(
         & reconciliation_df["sced_avg_base_point_sum"].notna()
         & (reconciliation_df["plexos_capacity_sum_mw"] > 0)
     )
-    reconciliation_df["is_discrepant"] = (
+    reconciliation_df["discrepancy_rule_type"] = "other_over_capacity"
+    reconciliation_df.loc[reconciliation_df["sced_fuel"] == "WIND", "discrepancy_rule_type"] = "wind_ratio"
+    reconciliation_df.loc[reconciliation_df["sced_fuel"] == "SOLAR", "discrepancy_rule_type"] = "solar_ratio"
+    reconciliation_df["discrepancy_threshold"] = pd.NA
+    reconciliation_df.loc[reconciliation_df["discrepancy_rule_type"] == "wind_ratio", "discrepancy_threshold"] = WIND_BASEPOINT_CAPACITY_RATIO_THRESHOLD
+    reconciliation_df.loc[reconciliation_df["discrepancy_rule_type"] == "solar_ratio", "discrepancy_threshold"] = SOLAR_BASEPOINT_CAPACITY_RATIO_THRESHOLD
+
+    other_rule_mask = (
         reconciliation_df["has_comparable_values"]
+        & (reconciliation_df["discrepancy_rule_type"] == "other_over_capacity")
         & (reconciliation_df["sced_avg_base_point_sum"] > reconciliation_df["plexos_capacity_sum_mw"])
         & (
             ((reconciliation_df["sced_avg_base_point_sum"] - reconciliation_df["plexos_capacity_sum_mw"]) >= PLANT_DISCREPANCY_MW_THRESHOLD)
@@ -2229,6 +2242,17 @@ def build_plant_basepoint_reconciliation_outputs(
             )
         )
     )
+    wind_rule_mask = (
+        reconciliation_df["has_comparable_values"]
+        & (reconciliation_df["discrepancy_rule_type"] == "wind_ratio")
+        & (reconciliation_df["basepoint_to_capacity_ratio"] >= WIND_BASEPOINT_CAPACITY_RATIO_THRESHOLD)
+    )
+    solar_rule_mask = (
+        reconciliation_df["has_comparable_values"]
+        & (reconciliation_df["discrepancy_rule_type"] == "solar_ratio")
+        & (reconciliation_df["basepoint_to_capacity_ratio"] >= SOLAR_BASEPOINT_CAPACITY_RATIO_THRESHOLD)
+    )
+    reconciliation_df["is_discrepant"] = other_rule_mask | wind_rule_mask | solar_rule_mask
 
     reconciliation_df = reconciliation_df.sort_values(
         ["is_discrepant", "abs_difference_mw", "plexos_plant_id"],
@@ -2250,7 +2274,10 @@ def build_plant_basepoint_reconciliation_outputs(
             "sced_avg_base_point_mean",
             "difference_mw",
             "difference_pct",
+            "basepoint_to_capacity_ratio",
             "is_discrepant",
+            "discrepancy_rule_type",
+            "discrepancy_threshold",
             "sced_fuel",
             "plexos_categories",
             "plexos_example_names",

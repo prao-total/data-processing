@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher, get_close_matches
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import pandas as pd
 
 
@@ -33,6 +34,7 @@ SCED_PLEXOS_DUPLICATES_FILE_NAME = "sced_coverage_from_plexos_duplicates.csv"
 PUN_PLEXOS_PRESENCE_FILE_NAME = "pun_generation_report_with_plexos_flag.csv"
 PLANT_RECONCILIATION_FILE_NAME = "plant_capacity_vs_basepoint_reconciliation.csv"
 PLANT_RECONCILIATION_FLAGS_FILE_NAME = "plant_capacity_vs_basepoint_discrepancies.csv"
+SCED_COVERAGE_PLOT_FILE_NAME = "sced_coverage_from_plexos_summary.png"
 
 SCED_PLANT_REQUIRED_COLUMNS = ["resource_name", "fuel_type"]
 SCED_NAME_REQUIRED_COLUMNS = [
@@ -2291,6 +2293,50 @@ def build_plant_basepoint_reconciliation_outputs(
     return reconciliation_df, discrepancy_df
 
 
+def save_sced_coverage_plot(
+    sced_plexos_coverage_summary_df: pd.DataFrame,
+    output_dir: str = OUTPUT_DIR,
+) -> Path:
+    output_path = ensure_output_dir(output_dir)
+    plot_path = output_path / SCED_COVERAGE_PLOT_FILE_NAME
+
+    plot_df = sced_plexos_coverage_summary_df[
+        sced_plexos_coverage_summary_df["fuel"].fillna("").astype(str).str.upper().ne("ALL")
+    ].copy()
+    plot_df = plot_df.sort_values("sced_rows_total", ascending=False).reset_index(drop=True)
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    x_positions = list(range(len(plot_df)))
+    bar_width = 0.38
+
+    ax.bar(
+        [x - bar_width / 2 for x in x_positions],
+        plot_df["sced_rows_total"],
+        width=bar_width,
+        label="Total SCED Units",
+        color="#9AA5B1",
+    )
+    ax.bar(
+        [x + bar_width / 2 for x in x_positions],
+        plot_df["sced_rows_matched"],
+        width=bar_width,
+        label="Matched SCED Units",
+        color="#2B6CB0",
+    )
+
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(plot_df["fuel"], rotation=35, ha="right")
+    ax.set_ylabel("Count")
+    ax.set_xlabel("Fuel")
+    ax.set_title("SCED Coverage by Fuel")
+    ax.legend()
+    ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return plot_path
+
+
 def save_outputs(
     best_matches_df: pd.DataFrame,
     candidates_df: pd.DataFrame,
@@ -2419,6 +2465,7 @@ def main():
         plant_reconciliation_df,
         plant_discrepancies_df,
     )
+    sced_coverage_plot_path = save_sced_coverage_plot(sced_plexos_coverage_summary_df)
 
     print(f"Saved best matches to {best_matches_path}")
     print(f"Saved all candidates to {candidates_path}")
@@ -2432,6 +2479,7 @@ def main():
     print(f"Saved PUN presence output to {pun_plexos_presence_path}")
     print(f"Saved plant reconciliation to {plant_reconciliation_path}")
     print(f"Saved plant discrepancies to {plant_discrepancies_path}")
+    print(f"Saved SCED coverage plot to {sced_coverage_plot_path}")
 
 
 if __name__ == "__main__":

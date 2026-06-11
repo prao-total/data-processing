@@ -10,7 +10,8 @@ nested ZIPs for:
 
 For all matched CSV rows, writes one summary CSV with each unique
 Resource Name / Resource Type pair, its first and final SCED timestamp, and
-the total source row count.
+the total source row count. It also computes average, minimum, and maximum
+values for selected SCED offer/cost columns.
 """
 
 from __future__ import annotations
@@ -36,6 +37,13 @@ TARGET_FILENAME_PATTERNS = (
     re.compile(r"^60d_ESR_Data_in_SCED-.*\.csv$", re.IGNORECASE),
 )
 REQUIRED_COLUMNS = ("Resource Name", "Resource Type", "SCED Time Stamp")
+METRIC_COLUMNS = (
+    "Base Point",
+    "Start Up Cold Offer",
+    "Start Up Hot Offer",
+    "Start Up Inter Offer",
+    "Min Gen Cost",
+)
 OUTPUT_FILE_NAME = "sced_unique_resource_name_type_pairs.csv"
 
 
@@ -187,9 +195,26 @@ def iter_target_csv_streams(root_folder: Path) -> Iterator[tuple[str, BinaryIO]]
                 continue
 
 
+def summary_columns(include_internal_metric_columns: bool = True) -> list[str]:
+    columns = ["Resource Name", "Resource Type", "first_sced_time_stamp", "final_sced_time_stamp", "row_count"]
+    for metric in METRIC_COLUMNS:
+        if include_internal_metric_columns:
+            columns.extend([f"{metric}_sum", f"{metric}_count"])
+        columns.extend([f"{metric}_min", f"{metric}_max"])
+    return columns
+
+
+def output_columns() -> list[str]:
+    columns = ["Resource Name", "Resource Type", "first_sced_time_stamp", "final_sced_time_stamp", "row_count"]
+    for metric in METRIC_COLUMNS:
+        columns.extend([f"{metric}_avg", f"{metric}_min", f"{metric}_max"])
+    return columns
+
+
 def read_required_columns(csv_fp: BinaryIO, source_label: str, cfg: Config) -> Optional[pd.DataFrame]:
+    wanted_columns = set(REQUIRED_COLUMNS) | set(METRIC_COLUMNS)
     read_kwargs: dict[str, object] = {
-        "usecols": lambda col: str(col).strip() in REQUIRED_COLUMNS,
+        "usecols": lambda col: str(col).strip() in wanted_columns,
     }
     if cfg.csv_encoding:
         read_kwargs["encoding"] = cfg.csv_encoding
@@ -211,7 +236,11 @@ def read_required_columns(csv_fp: BinaryIO, source_label: str, cfg: Config) -> O
         log(f"[WARN] {source_label}: missing columns {missing_columns}; skipping.", cfg)
         return None
 
-    return df.loc[:, list(REQUIRED_COLUMNS)]
+    for metric in METRIC_COLUMNS:
+        if metric not in df.columns:
+            df[metric] = pd.NA
+
+    return df.loc[:, list(REQUIRED_COLUMNS) + list(METRIC_COLUMNS)]
 
 
 def summarize_resource_pairs(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
@@ -237,17 +266,25 @@ def summarize_resource_pairs(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
     tmp = tmp[tmp["SCED Time Stamp"].notna()]
     if tmp.empty:
-        return pd.DataFrame(
-            columns=["Resource Name", "Resource Type", "first_sced_time_stamp", "final_sced_time_stamp", "row_count"]
-        )
+        return pd.DataFrame(columns=summary_columns())
+
+    for metric in METRIC_COLUMNS:
+        tmp[metric] = pd.to_numeric(tmp[metric], errors="coerce")
+
+    aggregations: dict[str, tuple[str, str]] = {
+        "first_sced_time_stamp": ("SCED Time Stamp", "min"),
+        "final_sced_time_stamp": ("SCED Time Stamp", "max"),
+        "row_count": ("SCED Time Stamp", "size"),
+    }
+    for metric in METRIC_COLUMNS:
+        aggregations[f"{metric}_sum"] = (metric, "sum")
+        aggregations[f"{metric}_count"] = (metric, "count")
+        aggregations[f"{metric}_min"] = (metric, "min")
+        aggregations[f"{metric}_max"] = (metric, "max")
 
     return (
         tmp.groupby(["Resource Name", "Resource Type"], dropna=False, as_index=False)
-        .agg(
-            first_sced_time_stamp=("SCED Time Stamp", "min"),
-            final_sced_time_stamp=("SCED Time Stamp", "max"),
-            row_count=("SCED Time Stamp", "size"),
-        )
+        .agg(**aggregations)
     )
 
 
@@ -258,27 +295,41 @@ def merge_summary(running: pd.DataFrame, next_summary: pd.DataFrame) -> pd.DataF
         return running
 
     combined = pd.concat([running, next_summary], ignore_index=True)
+    aggregations: dict[str, tuple[str, str]] = {
+        "first_sced_time_stamp": ("first_sced_time_stamp", "min"),
+        "final_sced_time_stamp": ("final_sced_time_stamp", "max"),
+        "row_count": ("row_count", "sum"),
+    }
+    for metric in METRIC_COLUMNS:
+        aggregations[f"{metric}_sum"] = (f"{metric}_sum", "sum")
+        aggregations[f"{metric}_count"] = (f"{metric}_count", "sum")
+        aggregations[f"{metric}_min"] = (f"{metric}_min", "min")
+        aggregations[f"{metric}_max"] = (f"{metric}_max", "max")
+
     return (
         combined.groupby(["Resource Name", "Resource Type"], dropna=False, as_index=False)
-        .agg(
-            first_sced_time_stamp=("first_sced_time_stamp", "min"),
-            final_sced_time_stamp=("final_sced_time_stamp", "max"),
-            row_count=("row_count", "sum"),
-        )
+        .agg(**aggregations)
     )
 
 
 def format_output(summary: pd.DataFrame, timestamp_format: str) -> pd.DataFrame:
+    if summary.empty:
+        return pd.DataFrame(columns=output_columns())
+
     output = summary.sort_values(["Resource Name", "Resource Type"], kind="stable").reset_index(drop=True)
     for column in ("first_sced_time_stamp", "final_sced_time_stamp"):
         output[column] = pd.to_datetime(output[column], errors="coerce").dt.strftime(timestamp_format)
-    return output
+
+    for metric in METRIC_COLUMNS:
+        metric_count = pd.to_numeric(output[f"{metric}_count"], errors="coerce")
+        metric_sum = pd.to_numeric(output[f"{metric}_sum"], errors="coerce")
+        output[f"{metric}_avg"] = metric_sum.div(metric_count.where(metric_count != 0))
+
+    return output.loc[:, output_columns()]
 
 
 def build_unique_resource_summary(cfg: Config) -> tuple[pd.DataFrame, int]:
-    running_summary = pd.DataFrame(
-        columns=["Resource Name", "Resource Type", "first_sced_time_stamp", "final_sced_time_stamp", "row_count"]
-    )
+    running_summary = pd.DataFrame(columns=summary_columns())
     matched_csv_count = 0
 
     for source_label, csv_fp in iter_target_csv_streams(cfg.root_folder):

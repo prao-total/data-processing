@@ -243,6 +243,17 @@ def read_required_columns(csv_fp: BinaryIO, source_label: str, cfg: Config) -> O
     return df.loc[:, list(REQUIRED_COLUMNS) + list(METRIC_COLUMNS)]
 
 
+def parse_sced_timestamps(values: pd.Series, cfg: Config) -> pd.Series:
+    if not cfg.timestamp_format:
+        return pd.to_datetime(values, errors="coerce")
+
+    parsed = pd.to_datetime(values, format=cfg.timestamp_format, errors="coerce")
+    missing_mask = parsed.isna() & values.notna()
+    if missing_mask.any():
+        parsed.loc[missing_mask] = pd.to_datetime(values.loc[missing_mask], errors="coerce")
+    return parsed
+
+
 def summarize_resource_pairs(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     tmp = df.copy()
     tmp["Resource Name"] = tmp["Resource Name"].astype("string").str.strip()
@@ -255,14 +266,7 @@ def summarize_resource_pairs(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         & (tmp["Resource Type"] != "")
     ]
 
-    if cfg.timestamp_format:
-        tmp["SCED Time Stamp"] = pd.to_datetime(
-            tmp["SCED Time Stamp"],
-            format=cfg.timestamp_format,
-            errors="coerce",
-        )
-    else:
-        tmp["SCED Time Stamp"] = pd.to_datetime(tmp["SCED Time Stamp"], errors="coerce")
+    tmp["SCED Time Stamp"] = parse_sced_timestamps(tmp["SCED Time Stamp"], cfg)
 
     tmp = tmp[tmp["SCED Time Stamp"].notna()]
     if tmp.empty:

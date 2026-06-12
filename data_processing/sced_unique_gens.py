@@ -54,6 +54,13 @@ PLOT_METRICS = (
     "Start Up Inter Offer_avg",
     "Min Gen Cost_avg",
 )
+RESOURCE_TYPE_GROUPS = {
+    "all": None,
+    "gas": {"CCLE90", "CCGT90", "GSNONR", "GSREH", "GSSUP", "SCGT90", "SCLE90"},
+    "renewables": {"PVGR", "WIND", "RENEW", "HYDRO"},
+    "storage": {"ESR", "PWRSTR"},
+    "other": {"NUC", "DSL", "CLLIG"},
+}
 
 
 @dataclass(frozen=True)
@@ -388,6 +395,10 @@ def safe_plot_file_stem(metric: str) -> str:
     return re.sub(r"[^0-9A-Za-z]+", "_", metric).strip("_").lower()
 
 
+def plot_metric_dir_name(metric: str) -> str:
+    return safe_plot_file_stem(metric.removesuffix("_avg"))
+
+
 def load_plot_data(input_path: Path) -> pd.DataFrame:
     required_columns = {"Resource Type", "final_sced_time_stamp", *PLOT_METRICS}
     if not input_path.exists():
@@ -420,7 +431,12 @@ def load_plot_data(input_path: Path) -> pd.DataFrame:
     return plot_df
 
 
-def plot_metric_by_resource_type_year(plot_df: pd.DataFrame, metric: str, output_path: Path) -> bool:
+def plot_metric_by_resource_type_year(
+    plot_df: pd.DataFrame,
+    metric: str,
+    output_path: Path,
+    group_label: str = "all",
+) -> bool:
     metric_df = plot_df[plot_df[metric].notna()].copy()
     if metric_df.empty:
         return False
@@ -483,7 +499,8 @@ def plot_metric_by_resource_type_year(plot_df: pd.DataFrame, metric: str, output
         patch.set_linewidth(0.9)
 
     title_metric = metric.replace("_avg", " Average")
-    ax.set_title(f"{title_metric} by Resource Type and Year")
+    title_group = "All Resource Types" if group_label == "all" else group_label.title()
+    ax.set_title(f"{title_metric} by Resource Type and Year ({title_group})")
     ax.set_xlabel("Resource Type")
     ax.set_ylabel(title_metric)
     ax.set_xticks(x_centers)
@@ -507,13 +524,27 @@ def run_plots(cfg: Config) -> None:
 
     plot_df = load_plot_data(cfg.output_path)
     written_count = 0
-    for metric in PLOT_METRICS:
-        output_path = plots_dir / f"{safe_plot_file_stem(metric)}_boxplot_by_resource_type_year.png"
-        if plot_metric_by_resource_type_year(plot_df, metric, output_path):
-            written_count += 1
-            log(f"[DONE] Wrote {output_path}", cfg)
+    for group_label, resource_types in RESOURCE_TYPE_GROUPS.items():
+        if resource_types is None:
+            group_df = plot_df
         else:
-            log(f"[INFO] Skipped {metric}: no non-null values available.", cfg)
+            group_df = plot_df[plot_df["Resource Type"].isin(resource_types)]
+
+        if group_df.empty:
+            log(f"[INFO] Skipped {group_label}: no matching resource types available.", cfg)
+            continue
+
+        for metric in PLOT_METRICS:
+            output_path = (
+                plots_dir
+                / plot_metric_dir_name(metric)
+                / f"{safe_plot_file_stem(metric)}_boxplot_by_resource_type_year_{group_label}.png"
+            )
+            if plot_metric_by_resource_type_year(group_df, metric, output_path, group_label):
+                written_count += 1
+                log(f"[DONE] Wrote {output_path}", cfg)
+            else:
+                log(f"[INFO] Skipped {metric} ({group_label}): no non-null values available.", cfg)
 
     if written_count == 0:
         raise SystemExit("ERROR: no plots were written because all metric values were null.")

@@ -16,6 +16,7 @@ values for selected SCED offer/cost columns.
 
 from __future__ import annotations
 
+import argparse
 import io
 import os
 import re
@@ -45,6 +46,8 @@ METRIC_COLUMNS = (
     "Min Gen Cost",
 )
 OUTPUT_FILE_NAME = "sced_unique_resource_name_type_pairs.csv"
+PLOTS_DIR_NAME = "plots"
+BASE_POINT_AVG_BOXPLOT_FILE_NAME = "base_point_avg_boxplot_by_resource_type_year.png"
 
 
 @dataclass(frozen=True)
@@ -332,6 +335,16 @@ def format_output(summary: pd.DataFrame, timestamp_format: str) -> pd.DataFrame:
     return output.loc[:, output_columns()]
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build or plot the unique SCED resource summary.")
+    parser.add_argument(
+        "--plots",
+        action="store_true",
+        help="Read the existing final summary CSV and create plots instead of scanning ZIP files.",
+    )
+    return parser.parse_args()
+
+
 def build_unique_resource_summary(cfg: Config) -> tuple[pd.DataFrame, int]:
     running_summary = pd.DataFrame(columns=summary_columns())
     matched_csv_count = 0
@@ -349,8 +362,7 @@ def build_unique_resource_summary(cfg: Config) -> tuple[pd.DataFrame, int]:
     return running_summary, matched_csv_count
 
 
-def main() -> None:
-    cfg = load_config()
+def run_aggregation(cfg: Config) -> None:
     cfg.save_agg_dir.mkdir(parents=True, exist_ok=True)
 
     log(f"ROOT_FOLDER  = {cfg.root_folder}", cfg)
@@ -364,6 +376,134 @@ def main() -> None:
     log(f"[DONE] Matched CSV files: {matched_csv_count}", cfg)
     log(f"[DONE] Unique Resource Name / Resource Type pairs: {len(output)}", cfg)
     log(f"[DONE] Wrote {cfg.output_path}", cfg)
+
+
+def load_base_point_plot_data(input_path: Path) -> pd.DataFrame:
+    required_columns = {"Resource Type", "final_sced_time_stamp", "Base Point_avg"}
+    if not input_path.exists():
+        raise SystemExit(f"ERROR: plot input CSV does not exist: {input_path}")
+
+    df = pd.read_csv(input_path)
+    df.rename(columns=lambda col: str(col).strip(), inplace=True)
+
+    missing_columns = sorted(required_columns - set(df.columns))
+    if missing_columns:
+        raise SystemExit(f"ERROR: plot input CSV is missing columns: {missing_columns}")
+
+    plot_df = df.loc[:, ["Resource Type", "final_sced_time_stamp", "Base Point_avg"]].copy()
+    plot_df["Resource Type"] = plot_df["Resource Type"].astype("string").str.strip()
+    plot_df["final_sced_time_stamp"] = pd.to_datetime(plot_df["final_sced_time_stamp"], errors="coerce")
+    plot_df["Year"] = plot_df["final_sced_time_stamp"].dt.year
+    plot_df["Base Point_avg"] = pd.to_numeric(plot_df["Base Point_avg"], errors="coerce")
+
+    plot_df = plot_df[
+        plot_df["Resource Type"].notna()
+        & (plot_df["Resource Type"] != "")
+        & plot_df["Year"].notna()
+        & plot_df["Base Point_avg"].notna()
+    ]
+
+    if plot_df.empty:
+        raise SystemExit("ERROR: no valid rows available for the Base Point_avg box plot.")
+
+    plot_df["Year"] = plot_df["Year"].astype(int)
+    return plot_df
+
+
+def plot_base_point_avg_by_resource_type_year(plot_df: pd.DataFrame, output_path: Path) -> None:
+    os.environ.setdefault("MPLCONFIGDIR", str(output_path.parent / ".matplotlib"))
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+
+    resource_types = sorted(plot_df["Resource Type"].dropna().unique())
+    years = sorted(plot_df["Year"].dropna().unique())
+
+    group_width = 0.78
+    box_width = min(0.16, group_width / max(len(years), 1) * 0.72)
+    x_centers = list(range(len(resource_types)))
+
+    data: list[pd.Series] = []
+    positions: list[float] = []
+    colors: list[object] = []
+
+    cmap = plt.get_cmap("tab10")
+    year_colors = {year: cmap(idx % 10) for idx, year in enumerate(years)}
+
+    for resource_idx, resource_type in enumerate(resource_types):
+        year_count = len(years)
+        for year_idx, year in enumerate(years):
+            values = plot_df.loc[
+                (plot_df["Resource Type"] == resource_type) & (plot_df["Year"] == year),
+                "Base Point_avg",
+            ]
+            if values.empty:
+                continue
+
+            offset = (year_idx - (year_count - 1) / 2) * (group_width / max(year_count, 1))
+            data.append(values)
+            positions.append(resource_idx + offset)
+            colors.append(year_colors[year])
+
+    figure_width = max(12.0, min(36.0, len(resource_types) * max(0.65, 0.18 * len(years))))
+    fig, ax = plt.subplots(figsize=(figure_width, 7.5))
+
+    boxplot = ax.boxplot(
+        data,
+        positions=positions,
+        widths=box_width,
+        patch_artist=True,
+        showfliers=False,
+        medianprops={"color": "#1f2933", "linewidth": 1.2},
+        whiskerprops={"color": "#52606d", "linewidth": 1.0},
+        capprops={"color": "#52606d", "linewidth": 1.0},
+    )
+
+    for patch, color in zip(boxplot["boxes"], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.78)
+        patch.set_edgecolor("#1f2933")
+        patch.set_linewidth(0.9)
+
+    ax.set_title("Base Point Average by Resource Type and Year")
+    ax.set_xlabel("Resource Type")
+    ax.set_ylabel("Base Point Average")
+    ax.set_xticks(x_centers)
+    ax.set_xticklabels(resource_types, rotation=45, ha="right")
+    ax.grid(axis="y", alpha=0.25)
+
+    legend_handles = [Patch(facecolor=year_colors[year], edgecolor="#1f2933", label=str(year), alpha=0.78) for year in years]
+    ax.legend(handles=legend_handles, title="Year", loc="best")
+
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def run_plots(cfg: Config) -> None:
+    plots_dir = cfg.save_agg_dir / PLOTS_DIR_NAME
+    output_path = plots_dir / BASE_POINT_AVG_BOXPLOT_FILE_NAME
+
+    log(f"PLOT INPUT = {cfg.output_path}", cfg)
+    log(f"PLOT OUTPUT = {output_path}", cfg)
+
+    plot_df = load_base_point_plot_data(cfg.output_path)
+    plot_base_point_avg_by_resource_type_year(plot_df, output_path)
+    log(f"[DONE] Wrote {output_path}", cfg)
+
+
+def main() -> None:
+    args = parse_args()
+    cfg = load_config()
+
+    if args.plots:
+        run_plots(cfg)
+    else:
+        run_aggregation(cfg)
 
 
 if __name__ == "__main__":

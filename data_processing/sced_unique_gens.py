@@ -47,7 +47,13 @@ METRIC_COLUMNS = (
 )
 OUTPUT_FILE_NAME = "sced_unique_resource_name_type_pairs.csv"
 PLOTS_DIR_NAME = "plots"
-BASE_POINT_AVG_BOXPLOT_FILE_NAME = "base_point_avg_boxplot_by_resource_type_year.png"
+PLOT_METRICS = (
+    "Base Point_avg",
+    "Start Up Cold Offer_avg",
+    "Start Up Hot Offer_avg",
+    "Start Up Inter Offer_avg",
+    "Min Gen Cost_avg",
+)
 
 
 @dataclass(frozen=True)
@@ -378,8 +384,12 @@ def run_aggregation(cfg: Config) -> None:
     log(f"[DONE] Wrote {cfg.output_path}", cfg)
 
 
-def load_base_point_plot_data(input_path: Path) -> pd.DataFrame:
-    required_columns = {"Resource Type", "final_sced_time_stamp", "Base Point_avg"}
+def safe_plot_file_stem(metric: str) -> str:
+    return re.sub(r"[^0-9A-Za-z]+", "_", metric).strip("_").lower()
+
+
+def load_plot_data(input_path: Path) -> pd.DataFrame:
+    required_columns = {"Resource Type", "final_sced_time_stamp", *PLOT_METRICS}
     if not input_path.exists():
         raise SystemExit(f"ERROR: plot input CSV does not exist: {input_path}")
 
@@ -390,27 +400,31 @@ def load_base_point_plot_data(input_path: Path) -> pd.DataFrame:
     if missing_columns:
         raise SystemExit(f"ERROR: plot input CSV is missing columns: {missing_columns}")
 
-    plot_df = df.loc[:, ["Resource Type", "final_sced_time_stamp", "Base Point_avg"]].copy()
+    plot_df = df.loc[:, ["Resource Type", "final_sced_time_stamp", *PLOT_METRICS]].copy()
     plot_df["Resource Type"] = plot_df["Resource Type"].astype("string").str.strip()
     plot_df["final_sced_time_stamp"] = pd.to_datetime(plot_df["final_sced_time_stamp"], errors="coerce")
     plot_df["Year"] = plot_df["final_sced_time_stamp"].dt.year
-    plot_df["Base Point_avg"] = pd.to_numeric(plot_df["Base Point_avg"], errors="coerce")
+    for metric in PLOT_METRICS:
+        plot_df[metric] = pd.to_numeric(plot_df[metric], errors="coerce")
 
     plot_df = plot_df[
         plot_df["Resource Type"].notna()
         & (plot_df["Resource Type"] != "")
         & plot_df["Year"].notna()
-        & plot_df["Base Point_avg"].notna()
     ]
 
     if plot_df.empty:
-        raise SystemExit("ERROR: no valid rows available for the Base Point_avg box plot.")
+        raise SystemExit("ERROR: no valid rows available for plotting.")
 
     plot_df["Year"] = plot_df["Year"].astype(int)
     return plot_df
 
 
-def plot_base_point_avg_by_resource_type_year(plot_df: pd.DataFrame, output_path: Path) -> None:
+def plot_metric_by_resource_type_year(plot_df: pd.DataFrame, metric: str, output_path: Path) -> bool:
+    metric_df = plot_df[plot_df[metric].notna()].copy()
+    if metric_df.empty:
+        return False
+
     os.environ.setdefault("MPLCONFIGDIR", str(output_path.parent / ".matplotlib"))
 
     import matplotlib
@@ -419,8 +433,8 @@ def plot_base_point_avg_by_resource_type_year(plot_df: pd.DataFrame, output_path
     import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
 
-    resource_types = sorted(plot_df["Resource Type"].dropna().unique())
-    years = sorted(plot_df["Year"].dropna().unique())
+    resource_types = sorted(metric_df["Resource Type"].dropna().unique())
+    years = sorted(metric_df["Year"].dropna().unique())
 
     group_width = 0.78
     box_width = min(0.16, group_width / max(len(years), 1) * 0.72)
@@ -436,9 +450,9 @@ def plot_base_point_avg_by_resource_type_year(plot_df: pd.DataFrame, output_path
     for resource_idx, resource_type in enumerate(resource_types):
         year_count = len(years)
         for year_idx, year in enumerate(years):
-            values = plot_df.loc[
-                (plot_df["Resource Type"] == resource_type) & (plot_df["Year"] == year),
-                "Base Point_avg",
+            values = metric_df.loc[
+                (metric_df["Resource Type"] == resource_type) & (metric_df["Year"] == year),
+                metric,
             ]
             if values.empty:
                 continue
@@ -468,9 +482,10 @@ def plot_base_point_avg_by_resource_type_year(plot_df: pd.DataFrame, output_path
         patch.set_edgecolor("#1f2933")
         patch.set_linewidth(0.9)
 
-    ax.set_title("Base Point Average by Resource Type and Year")
+    title_metric = metric.replace("_avg", " Average")
+    ax.set_title(f"{title_metric} by Resource Type and Year")
     ax.set_xlabel("Resource Type")
-    ax.set_ylabel("Base Point Average")
+    ax.set_ylabel(title_metric)
     ax.set_xticks(x_centers)
     ax.set_xticklabels(resource_types, rotation=45, ha="right")
     ax.grid(axis="y", alpha=0.25)
@@ -482,18 +497,26 @@ def plot_base_point_avg_by_resource_type_year(plot_df: pd.DataFrame, output_path
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
+    return True
 
 
 def run_plots(cfg: Config) -> None:
     plots_dir = cfg.save_agg_dir / PLOTS_DIR_NAME
-    output_path = plots_dir / BASE_POINT_AVG_BOXPLOT_FILE_NAME
 
     log(f"PLOT INPUT = {cfg.output_path}", cfg)
-    log(f"PLOT OUTPUT = {output_path}", cfg)
 
-    plot_df = load_base_point_plot_data(cfg.output_path)
-    plot_base_point_avg_by_resource_type_year(plot_df, output_path)
-    log(f"[DONE] Wrote {output_path}", cfg)
+    plot_df = load_plot_data(cfg.output_path)
+    written_count = 0
+    for metric in PLOT_METRICS:
+        output_path = plots_dir / f"{safe_plot_file_stem(metric)}_boxplot_by_resource_type_year.png"
+        if plot_metric_by_resource_type_year(plot_df, metric, output_path):
+            written_count += 1
+            log(f"[DONE] Wrote {output_path}", cfg)
+        else:
+            log(f"[INFO] Skipped {metric}: no non-null values available.", cfg)
+
+    if written_count == 0:
+        raise SystemExit("ERROR: no plots were written because all metric values were null.")
 
 
 def main() -> None:

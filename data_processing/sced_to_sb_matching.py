@@ -948,8 +948,10 @@ def confidence_band(row: pd.Series) -> str:
 
 
 def build_sb_confidence_band_by_fuel(sb_matches_df: pd.DataFrame) -> pd.DataFrame:
-    df = sb_matches_df.copy()
-    df["fuel"] = df["cdr_fuel"].fillna("").astype(str).str.strip().replace("", "UNKNOWN")
+    df = sb_matches_df[
+        sb_matches_df["matched_sced_node"].fillna("").astype(str).str.strip().ne("")
+    ].copy()
+    df["fuel"] = df["matched_sced_resource_type"].fillna("").astype(str).str.strip().replace("", "UNKNOWN")
     df["confidence_band"] = df.apply(confidence_band, axis=1)
 
     grouped = (
@@ -1001,8 +1003,8 @@ def save_sb_confidence_band_plot(confidence_df: pd.DataFrame, output_dir: str = 
             "Unmatched": "#777777",
         },
     )
-    ax.set_title("SB to SCED Match Confidence Bands by Fuel")
-    ax.set_xlabel("SB fuel")
+    ax.set_title("Matched SB to SCED Confidence Bands by SCED Fuel")
+    ax.set_xlabel("Matched SCED fuel")
     ax.set_ylabel("SB rows")
     ax.legend(title="Confidence band")
     ax.grid(axis="y", alpha=0.25)

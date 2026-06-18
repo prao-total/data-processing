@@ -67,6 +67,7 @@ SB_OVERRIDE_COLUMNS = [
 
 FUZZY_RESOURCE_CODE_CUTOFF = 0.82
 FUZZY_UNIT_NAME_CUTOFF = 0.82
+STRONG_UNIT_NAME_FUZZY_CUTOFF = 0.94
 CONFIDENCE_BAND_ORDER = ["High", "Medium", "Low", "Unmatched"]
 
 
@@ -171,6 +172,66 @@ def extract_resource_unit_tokens(resource_name: str) -> set[str]:
     return tokens
 
 
+def split_plant_unit_descriptor(value: str) -> tuple[str, str]:
+    text = normalize_text(value)
+    if not text:
+        return "", ""
+    if "_" in text:
+        plant, unit = text.split("_", 1)
+        return plant.strip(), unit.strip()
+
+    unit_match = re.search(
+        r"\b((?:UNIT|U|GEN|G|GT|CT|ST|TG|GTG|CTG|STG)\s*-?\s*\d+[A-Z]*)\s*$",
+        text,
+    )
+    if unit_match:
+        return text[: unit_match.start()].strip(), normalize_text(unit_match.group(1)).replace(" ", "")
+    return text, ""
+
+
+def unit_tokens_from_text(value: str) -> set[str]:
+    text = normalize_text(value)
+    tokens = extract_resource_unit_tokens(text)
+    unit_match = re.search(
+        r"\b((?:UNIT|U|GEN|G|GT|CT|ST|TG|GTG|CTG|STG)\s*-?\s*\d+[A-Z]*)\b",
+        text,
+    )
+    if unit_match:
+        compact = normalize_text(unit_match.group(1)).replace(" ", "")
+        tokens.add(compact)
+        number_match = re.search(r"(\d+)", compact)
+        if number_match:
+            tokens.add(number_match.group(1))
+            tokens.add(f"U{number_match.group(1)}")
+            tokens.add(f"UNIT{number_match.group(1)}")
+    return tokens
+
+
+def derive_sb_plant_descriptor(row: pd.Series) -> str:
+    cdr_unit_code = normalize_text(row.get("cdr_unit_code", ""))
+    if "_" in cdr_unit_code:
+        return cdr_unit_code.split("_", 1)[0]
+
+    unit_name = normalize_text(row.get("unit_name", ""))
+    cdr_gen_id = normalize_text(row.get("cdr_gen_id", "")).replace(" ", "")
+    if cdr_gen_id and unit_name.endswith(cdr_gen_id):
+        return unit_name[: -len(cdr_gen_id)].strip()
+
+    plant, _ = split_plant_unit_descriptor(unit_name)
+    return plant
+
+
+def derive_sb_unit_descriptor(row: pd.Series) -> str:
+    cdr_gen_id = normalize_text(row.get("cdr_gen_id", "")).replace(" ", "")
+    if cdr_gen_id:
+        return cdr_gen_id
+    cdr_unit_code = normalize_text(row.get("cdr_unit_code", ""))
+    if "_" in cdr_unit_code:
+        return cdr_unit_code.split("_", 1)[1].strip()
+    _, unit = split_plant_unit_descriptor(row.get("unit_name", ""))
+    return unit
+
+
 def prepare_sced_resource_df(df: pd.DataFrame) -> pd.DataFrame:
     prepared = df.copy()
     prepared = prepared.rename(
@@ -188,7 +249,15 @@ def prepare_sced_resource_df(df: pd.DataFrame) -> pd.DataFrame:
     prepared["resource_name_key"] = prepared["resource_name"].map(normalize_key)
     prepared["resource_family"] = prepared["resource_name_norm"].map(node_family)
     prepared["resource_type_norm"] = prepared["resource_type"].map(fuel_key)
+    name_parts = prepared["resource_name"].map(split_plant_unit_descriptor)
+    prepared["sced_plant_descriptor"] = name_parts.map(lambda parts: parts[0])
+    prepared["sced_plant_descriptor_key"] = prepared["sced_plant_descriptor"].map(normalize_key)
+    prepared["sced_unit_descriptor"] = name_parts.map(lambda parts: parts[1])
     prepared["resource_unit_tokens"] = prepared["resource_name"].map(extract_resource_unit_tokens)
+    prepared["resource_unit_tokens"] = [
+        tokens.union(unit_tokens_from_text(unit_descriptor))
+        for tokens, unit_descriptor in zip(prepared["resource_unit_tokens"], prepared["sced_unit_descriptor"])
+    ]
 
     for column in [
         "avg_base_point",
@@ -212,6 +281,9 @@ def prepare_sb_df(df: pd.DataFrame) -> pd.DataFrame:
     prepared["sb_county_norm"] = prepared["county"].map(normalize_text)
     prepared["sb_fuel_norm"] = prepared["cdr_fuel"].map(fuel_key)
     prepared["sb_capacity_mw"] = parse_numeric(prepared["cdr_capacity_mw"])
+    prepared["sb_plant_descriptor"] = prepared.apply(derive_sb_plant_descriptor, axis=1)
+    prepared["sb_plant_descriptor_key"] = prepared["sb_plant_descriptor"].map(normalize_key)
+    prepared["sb_unit_descriptor"] = prepared.apply(derive_sb_unit_descriptor, axis=1)
 
     for source_column, norm_column, key_column in [
         ("eia_unit_code", "sb_eia_unit_code_norm", "sb_eia_unit_code_key"),
@@ -228,12 +300,18 @@ def prepare_sb_df(df: pd.DataFrame) -> pd.DataFrame:
     return prepared
 
 
+def filter_sb_rows_for_matching(sb_df: pd.DataFrame) -> pd.DataFrame:
+    return sb_df[sb_df["unit_name"].fillna("").astype(str).str.strip().ne("")].copy().reset_index(drop=True)
+
+
 def build_sced_lookups(sced_df: pd.DataFrame) -> dict[str, object]:
     rows = sced_df.to_dict("records")
     by_resource_name: dict[str, list[dict]] = {}
     by_resource_key: dict[str, list[dict]] = {}
     by_resource_family: dict[str, list[dict]] = {}
+    by_plant_key: dict[str, list[dict]] = {}
     resource_names: list[str] = []
+    plant_keys: list[str] = []
 
     for row in rows:
         if row["resource_name_norm"]:
@@ -244,12 +322,18 @@ def build_sced_lookups(sced_df: pd.DataFrame) -> dict[str, object]:
             by_resource_key.setdefault(row["resource_name_key"], []).append(row)
         if row["resource_family"]:
             by_resource_family.setdefault(row["resource_family"], []).append(row)
+        if row["sced_plant_descriptor_key"]:
+            by_plant_key.setdefault(row["sced_plant_descriptor_key"], []).append(row)
+            if row["sced_plant_descriptor_key"] not in plant_keys:
+                plant_keys.append(row["sced_plant_descriptor_key"])
 
     return {
         "by_resource_name": by_resource_name,
         "by_resource_key": by_resource_key,
         "by_resource_family": by_resource_family,
+        "by_plant_key": by_plant_key,
         "resource_names": resource_names,
+        "plant_keys": plant_keys,
     }
 
 
@@ -266,6 +350,8 @@ def sb_code_fields(sb_row: dict) -> list[tuple[str, str, str]]:
 def sb_unit_hint_tokens(sb_row: dict) -> set[str]:
     tokens: set[str] = set()
     for value in [
+        sb_row.get("sb_unit_name_norm", ""),
+        sb_row.get("sb_unit_descriptor", ""),
         sb_row.get("sb_cdr_gen_id_norm", ""),
         sb_row.get("sb_cdr_inr_norm", ""),
         sb_row.get("sb_eia_generator_id_norm", ""),
@@ -274,6 +360,7 @@ def sb_unit_hint_tokens(sb_row: dict) -> set[str]:
         if not text:
             continue
         tokens.add(text)
+        tokens.update(unit_tokens_from_text(text))
         number_match = re.search(r"(\d+)$", text)
         if number_match:
             tokens.add(number_match.group(1))
@@ -287,6 +374,8 @@ def matched_sced_fields(sced_row: dict | None) -> dict:
         return {
             "matched_sced_node": "",
             "matched_sced_resource_type": "",
+            "matched_sced_plant_descriptor": "",
+            "matched_sced_unit_descriptor": "",
             "matched_sced_final_sced_time_stamp": "",
             "matched_sced_base_point_avg": pd.NA,
             "matched_sced_start_up_cold_offer_avg": pd.NA,
@@ -297,6 +386,8 @@ def matched_sced_fields(sced_row: dict | None) -> dict:
     return {
         "matched_sced_node": sced_row.get("resource_name", ""),
         "matched_sced_resource_type": sced_row.get("resource_type", ""),
+        "matched_sced_plant_descriptor": sced_row.get("sced_plant_descriptor", ""),
+        "matched_sced_unit_descriptor": sced_row.get("sced_unit_descriptor", ""),
         "matched_sced_final_sced_time_stamp": sced_row.get("final_sced_time_stamp", ""),
         "matched_sced_base_point_avg": sced_row.get("avg_base_point", pd.NA),
         "matched_sced_start_up_cold_offer_avg": sced_row.get("avg_start_up_cold_offer", pd.NA),
@@ -329,6 +420,12 @@ def score_sb_candidate(sb_row: dict, sced_row: dict, base_score: int, method: st
 
     return {
         **matched_sced_fields(sced_row),
+        "sb_plant_descriptor": sb_row.get("sb_plant_descriptor", ""),
+        "sb_unit_descriptor": sb_row.get("sb_unit_descriptor", ""),
+        "plant_match_method": "",
+        "plant_match_score": pd.NA,
+        "unit_assignment_method": method,
+        "unit_assignment_score": score,
         "sb_to_sced_match_method": method,
         "sb_to_sced_match_score": score,
     }
@@ -364,6 +461,7 @@ def collect_sb_candidates(sb_row: dict, lookups: dict[str, object]) -> list[dict
 
     unit_name_norm = sb_row.get("sb_unit_name_norm", "")
     if unit_name_norm:
+        add_candidates(lookups["by_resource_key"].get(normalize_key(unit_name_norm), []), 205, "unit_name_key_exact")
         for resource_name in get_close_matches(
             unit_name_norm,
             lookups["resource_names"],
@@ -371,6 +469,13 @@ def collect_sb_candidates(sb_row: dict, lookups: dict[str, object]) -> list[dict
             cutoff=FUZZY_UNIT_NAME_CUTOFF,
         ):
             add_candidates(lookups["by_resource_name"].get(resource_name, []), 135, "unit_name_fuzzy")
+        for resource_name in get_close_matches(
+            unit_name_norm,
+            lookups["resource_names"],
+            n=3,
+            cutoff=STRONG_UNIT_NAME_FUZZY_CUTOFF,
+        ):
+            add_candidates(lookups["by_resource_name"].get(resource_name, []), 190, "unit_name_strong_fuzzy")
 
     for _, norm_value, _ in sb_code_fields(sb_row):
         family = node_family(norm_value)
@@ -384,6 +489,12 @@ def choose_best_sb_match(candidate_rows: list[dict]) -> dict:
     if not candidate_rows:
         return {
             **matched_sced_fields(None),
+            "sb_plant_descriptor": "",
+            "sb_unit_descriptor": "",
+            "plant_match_method": "",
+            "plant_match_score": pd.NA,
+            "unit_assignment_method": "",
+            "unit_assignment_score": pd.NA,
             "sb_to_sced_match_method": "",
             "sb_to_sced_match_score": pd.NA,
             "sb_to_sced_match_status": "unmatched",
@@ -406,13 +517,179 @@ def choose_best_sb_match(candidate_rows: list[dict]) -> dict:
     return best
 
 
+def is_strong_direct_match(match: dict) -> bool:
+    method = str(match.get("sb_to_sced_match_method", ""))
+    score = match.get("sb_to_sced_match_score", pd.NA)
+    if method.endswith("_exact") or method.endswith("_key_exact"):
+        return True
+    if method == "unit_name_strong_fuzzy" and pd.notna(score) and float(score) >= 205:
+        return True
+    return False
+
+
+def plant_match_score(sb_group: list[dict], sced_rows: list[dict], method: str, base_score: int) -> int:
+    score = base_score
+    sb_fuels = {row.get("sb_fuel_norm", "") for row in sb_group if row.get("sb_fuel_norm", "")}
+    sced_fuels = {row.get("resource_type_norm", "") for row in sced_rows if row.get("resource_type_norm", "")}
+    if sb_fuels.intersection(sced_fuels):
+        score += 10
+    for sb_row in sb_group:
+        for sced_row in sced_rows:
+            if normalize_key(sb_row.get("sb_cdr_unit_code_norm", "")) == sced_row.get("resource_name_key", ""):
+                score += 30
+                break
+    return score
+
+
+def choose_sced_plant_group(sb_group: list[dict], lookups: dict[str, object]) -> tuple[list[dict], str, int]:
+    if not sb_group:
+        return [], "", 0
+
+    plant_key = sb_group[0].get("sb_plant_descriptor_key", "")
+    candidate_groups: list[tuple[list[dict], str, int]] = []
+    if plant_key:
+        exact_rows = lookups["by_plant_key"].get(plant_key, [])
+        if exact_rows:
+            candidate_groups.append((exact_rows, "plant_descriptor_exact", plant_match_score(sb_group, exact_rows, "plant_descriptor_exact", 180)))
+
+        fuzzy_keys = get_close_matches(plant_key, lookups["plant_keys"], n=3, cutoff=0.88)
+        for fuzzy_key in fuzzy_keys:
+            if fuzzy_key == plant_key:
+                continue
+            rows = lookups["by_plant_key"].get(fuzzy_key, [])
+            candidate_groups.append((rows, "plant_descriptor_fuzzy", plant_match_score(sb_group, rows, "plant_descriptor_fuzzy", 145)))
+
+    if not candidate_groups:
+        return [], "", 0
+
+    best_rows, best_method, best_score = sorted(candidate_groups, key=lambda item: item[2], reverse=True)[0]
+    return best_rows, best_method, best_score
+
+
+def score_unit_pair(sb_row: dict, sced_row: dict) -> int:
+    score = 0
+    sb_tokens = sb_unit_hint_tokens(sb_row)
+    sced_tokens = sced_row.get("resource_unit_tokens", set())
+    if sb_tokens and sced_tokens and sb_tokens.intersection(sced_tokens):
+        score += 80
+    if normalize_key(sb_row.get("sb_cdr_unit_code_norm", "")) == sced_row.get("resource_name_key", ""):
+        score += 120
+    if sb_row.get("sb_fuel_norm") and sb_row["sb_fuel_norm"] == sced_row.get("resource_type_norm", ""):
+        score += 15
+    score += int(20 * similarity_score(sb_row.get("sb_cdr_unit_code_norm", ""), sced_row.get("resource_name_norm", "")))
+
+    capacity = sb_row.get("sb_capacity_mw", pd.NA)
+    base_point = sced_row.get("avg_base_point", pd.NA)
+    if pd.notna(capacity) and pd.notna(base_point) and float(capacity) > 0:
+        ratio = abs(float(capacity) - float(base_point)) / float(capacity)
+        if ratio <= 0.10:
+            score += 10
+        elif ratio <= 0.25:
+            score += 5
+    return score
+
+
+def best_basepoint_sced_row(sced_rows: list[dict], excluded_nodes: set[str] | None = None) -> dict | None:
+    excluded_nodes = excluded_nodes or set()
+    available_rows = [row for row in sced_rows if row.get("resource_name", "") not in excluded_nodes]
+    if not available_rows:
+        available_rows = sced_rows
+    if not available_rows:
+        return None
+    return sorted(
+        available_rows,
+        key=lambda row: (
+            -1 if pd.isna(row.get("avg_base_point", pd.NA)) else float(row.get("avg_base_point", 0)),
+            row.get("resource_name", ""),
+        ),
+        reverse=True,
+    )[0]
+
+
+def build_plant_unit_match(
+    sb_row: dict,
+    sced_row: dict,
+    plant_method: str,
+    plant_score: int,
+    unit_method: str,
+    unit_score: int,
+) -> dict:
+    total_score = plant_score + unit_score
+    return {
+        **matched_sced_fields(sced_row),
+        "sb_plant_descriptor": sb_row.get("sb_plant_descriptor", ""),
+        "sb_unit_descriptor": sb_row.get("sb_unit_descriptor", ""),
+        "plant_match_method": plant_method,
+        "plant_match_score": plant_score,
+        "unit_assignment_method": unit_method,
+        "unit_assignment_score": unit_score,
+        "sb_to_sced_match_method": f"{plant_method}:{unit_method}",
+        "sb_to_sced_match_score": total_score,
+        "sb_to_sced_match_status": "matched",
+    }
+
+
+def assign_units_within_plant(sb_group: list[dict], sced_rows: list[dict], plant_method: str, plant_score: int) -> dict[int, dict]:
+    assignments: dict[int, dict] = {}
+    used_sced_nodes: set[str] = set()
+    pair_scores = []
+
+    for sb_row in sb_group:
+        for sced_row in sced_rows:
+            pair_scores.append((score_unit_pair(sb_row, sced_row), sb_row, sced_row))
+
+    for unit_score, sb_row, sced_row in sorted(pair_scores, key=lambda item: item[0], reverse=True):
+        if unit_score <= 0:
+            break
+        if sb_row["_sb_match_index"] in assignments:
+            continue
+        if sced_row["resource_name"] in used_sced_nodes:
+            continue
+        assignments[sb_row["_sb_match_index"]] = build_plant_unit_match(
+            sb_row,
+            sced_row,
+            plant_method,
+            plant_score,
+            "distinct_unit_token_match",
+            unit_score,
+        )
+        used_sced_nodes.add(sced_row["resource_name"])
+
+    remaining_sb_rows = [row for row in sb_group if row["_sb_match_index"] not in assignments]
+    remaining_sced_count = len([row for row in sced_rows if row["resource_name"] not in used_sced_nodes])
+    reuse_highest_basepoint = len(remaining_sb_rows) > remaining_sced_count
+
+    for sb_row in remaining_sb_rows:
+        sced_row = best_basepoint_sced_row(sced_rows, set() if reuse_highest_basepoint else used_sced_nodes)
+        if not sced_row:
+            continue
+        unit_score = score_unit_pair(sb_row, sced_row)
+        method = "highest_basepoint_reuse" if reuse_highest_basepoint else "highest_basepoint_unit"
+        assignments[sb_row["_sb_match_index"]] = build_plant_unit_match(
+            sb_row,
+            sced_row,
+            plant_method,
+            plant_score,
+            method,
+            unit_score,
+        )
+        if not reuse_highest_basepoint:
+            used_sced_nodes.add(sced_row["resource_name"])
+
+    return assignments
+
+
 def build_sb_matches(sb_df: pd.DataFrame, sced_prepared_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     sb_prepared = prepare_sb_df(sb_df)
+    sb_prepared["_sb_match_index"] = range(len(sb_prepared))
     sced_lookups = build_sced_lookups(sced_prepared_df)
 
-    match_rows = []
+    match_by_index: dict[int, dict] = {}
     candidate_rows = []
-    for row_index, row in enumerate(sb_prepared.to_dict("records")):
+
+    sb_records = sb_prepared.to_dict("records")
+    for row in sb_records:
+        row_index = row["_sb_match_index"]
         candidates = collect_sb_candidates(row, sced_lookups)
         for candidate in candidates:
             candidate_rows.append(
@@ -423,7 +700,41 @@ def build_sb_matches(sb_df: pd.DataFrame, sced_prepared_df: pd.DataFrame) -> tup
                     **candidate,
                 }
             )
-        match_rows.append(choose_best_sb_match(candidates))
+        best_match = choose_best_sb_match(candidates)
+        if is_strong_direct_match(best_match):
+            match_by_index[row_index] = best_match
+
+    remaining_rows = [row for row in sb_records if row["_sb_match_index"] not in match_by_index]
+    plant_groups: dict[str, list[dict]] = {}
+    for row in remaining_rows:
+        plant_key = row.get("sb_plant_descriptor_key", "")
+        if plant_key:
+            plant_groups.setdefault(plant_key, []).append(row)
+
+    for sb_group in plant_groups.values():
+        sced_rows, plant_method, plant_score = choose_sced_plant_group(sb_group, sced_lookups)
+        if not sced_rows:
+            continue
+        match_by_index.update(assign_units_within_plant(sb_group, sced_rows, plant_method, plant_score))
+
+    match_rows = []
+    for row in sb_records:
+        row_index = row["_sb_match_index"]
+        if row_index in match_by_index:
+            match_rows.append(match_by_index[row_index])
+            continue
+        fallback_match = choose_best_sb_match(collect_sb_candidates(row, sced_lookups))
+        fallback_match["sb_plant_descriptor"] = row.get("sb_plant_descriptor", "")
+        fallback_match["sb_unit_descriptor"] = row.get("sb_unit_descriptor", "")
+        if not fallback_match.get("plant_match_method"):
+            fallback_match["plant_match_method"] = ""
+        if "plant_match_score" not in fallback_match:
+            fallback_match["plant_match_score"] = pd.NA
+        if not fallback_match.get("unit_assignment_method"):
+            fallback_match["unit_assignment_method"] = fallback_match.get("sb_to_sced_match_method", "")
+        if "unit_assignment_score" not in fallback_match:
+            fallback_match["unit_assignment_score"] = fallback_match.get("sb_to_sced_match_score", pd.NA)
+        match_rows.append(fallback_match)
 
     match_df = pd.DataFrame(match_rows)
     original_columns = list(sb_df.columns)
@@ -791,7 +1102,7 @@ def save_sb_outputs(
 
 def main():
     sced_resource_df = load_csv(SCED_RESOURCE_LIST_PATH, SCED_RESOURCE_REQUIRED_COLUMNS)
-    sb_df = load_csv(SB_LIST_PATH, SB_REQUIRED_COLUMNS)
+    sb_df = filter_sb_rows_for_matching(load_csv(SB_LIST_PATH, SB_REQUIRED_COLUMNS))
     pun_df = load_csv(PUN_GENERATION_REPORT_PATH, PUN_REQUIRED_COLUMNS)
 
     sced_prepared_df = prepare_sced_resource_df(sced_resource_df)

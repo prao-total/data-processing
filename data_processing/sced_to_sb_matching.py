@@ -303,7 +303,9 @@ def prepare_sb_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def filter_sb_rows_for_matching(sb_df: pd.DataFrame) -> pd.DataFrame:
-    return sb_df[sb_df["unit_name"].fillna("").astype(str).str.strip().ne("")].copy().reset_index(drop=True)
+    unit_name_present = sb_df["unit_name"].fillna("").astype(str).str.strip().ne("")
+    capacity_positive = parse_numeric(sb_df["cdr_capacity_mw"]).fillna(0).gt(0)
+    return sb_df[unit_name_present & capacity_positive].copy().reset_index(drop=True)
 
 
 def build_sced_lookups(sced_df: pd.DataFrame) -> dict[str, object]:

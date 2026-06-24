@@ -71,6 +71,20 @@ FUZZY_RESOURCE_CODE_CUTOFF = 0.82
 FUZZY_UNIT_NAME_CUTOFF = 0.82
 STRONG_UNIT_NAME_FUZZY_CUTOFF = 0.94
 CONFIDENCE_BAND_ORDER = ["High", "Medium", "Low", "Unmatched"]
+UNMATCHED_STATUS_ORDER = [
+    "unmatched",
+    "unmatched_cancelled",
+    "unmatched_retired",
+    "unmatched_inactive",
+    "unmatched_in_progress",
+]
+UNMATCHED_STATUS_LABELS = {
+    "unmatched": "Unmatched",
+    "unmatched_cancelled": "Cancelled",
+    "unmatched_retired": "Retired",
+    "unmatched_inactive": "Inactive",
+    "unmatched_in_progress": "In progress",
+}
 
 
 def load_csv(csv_path: str, required_columns: list[str]) -> pd.DataFrame:
@@ -1203,19 +1217,49 @@ def save_sb_confidence_band_plot(confidence_df: pd.DataFrame, output_dir: str = 
 def build_sb_unmatched_by_cdr_fuel(sb_matches_df: pd.DataFrame) -> pd.DataFrame:
     df = sb_matches_df.copy()
     df["cdr_fuel_group"] = df["cdr_fuel"].fillna("").astype(str).str.strip().replace("", "UNKNOWN")
-    df["is_unmatched"] = df["matched_sced_node"].fillna("").astype(str).str.strip().eq("")
+    df = df[df["sb_to_sced_match_status"].isin(UNMATCHED_STATUS_ORDER)].copy()
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "cdr_fuel_group",
+                "unmatched_status",
+                "status_label",
+                "rows",
+                "fuel_unmatched_total",
+                "pct_of_unmatched_fuel",
+            ]
+        )
 
     grouped = (
-        df.groupby("cdr_fuel_group", dropna=False)
-        .agg(
-            rows_total=("cdr_fuel_group", "size"),
-            rows_unmatched=("is_unmatched", "sum"),
-        )
+        df.groupby(["cdr_fuel_group", "sb_to_sced_match_status"], dropna=False)
+        .size()
+        .reset_index(name="rows")
+        .rename(columns={"sb_to_sced_match_status": "unmatched_status"})
+    )
+
+    full_index = pd.MultiIndex.from_product(
+        [sorted(df["cdr_fuel_group"].unique()), UNMATCHED_STATUS_ORDER],
+        names=["cdr_fuel_group", "unmatched_status"],
+    )
+    grouped = (
+        grouped.set_index(["cdr_fuel_group", "unmatched_status"])
+        .reindex(full_index, fill_value=0)
         .reset_index()
     )
-    grouped["rows_matched"] = grouped["rows_total"] - grouped["rows_unmatched"]
-    grouped["pct_unmatched"] = grouped["rows_unmatched"].div(grouped["rows_total"]).fillna(0).round(4)
-    return grouped.sort_values(["rows_unmatched", "cdr_fuel_group"], ascending=[False, True]).reset_index(drop=True)
+    grouped["status_label"] = grouped["unmatched_status"].map(UNMATCHED_STATUS_LABELS)
+    grouped["fuel_unmatched_total"] = grouped.groupby("cdr_fuel_group")["rows"].transform("sum")
+    grouped["pct_of_unmatched_fuel"] = (
+        grouped["rows"]
+        .div(grouped["fuel_unmatched_total"].where(grouped["fuel_unmatched_total"].ne(0)))
+        .fillna(0)
+        .round(4)
+    )
+    grouped["unmatched_status"] = pd.Categorical(
+        grouped["unmatched_status"],
+        categories=UNMATCHED_STATUS_ORDER,
+        ordered=True,
+    )
+    return grouped.sort_values(["fuel_unmatched_total", "cdr_fuel_group", "unmatched_status"], ascending=[False, True, True]).reset_index(drop=True)
 
 
 def save_sb_unmatched_by_cdr_fuel_plot(unmatched_df: pd.DataFrame, output_dir: str = OUTPUT_DIR) -> Path:
@@ -1224,18 +1268,46 @@ def save_sb_unmatched_by_cdr_fuel_plot(unmatched_df: pd.DataFrame, output_dir: s
 
     output_path = ensure_output_dir(output_dir)
     plot_path = output_path / SB_UNMATCHED_BY_CDR_FUEL_PLOT_FILE_NAME
-    plot_df = unmatched_df[unmatched_df["rows_unmatched"] > 0].copy()
+    plot_df = unmatched_df[unmatched_df["fuel_unmatched_total"] > 0].copy()
+    plot_df["status_label"] = pd.Categorical(
+        plot_df["status_label"],
+        categories=[UNMATCHED_STATUS_LABELS[status] for status in UNMATCHED_STATUS_ORDER],
+        ordered=True,
+    )
+    pivot_df = (
+        plot_df.pivot(index="cdr_fuel_group", columns="status_label", values="rows")
+        .fillna(0)
+    )
+    fuel_order = (
+        plot_df[["cdr_fuel_group", "fuel_unmatched_total"]]
+        .drop_duplicates()
+        .sort_values(["fuel_unmatched_total", "cdr_fuel_group"], ascending=[False, True])["cdr_fuel_group"]
+    )
+    status_columns = [UNMATCHED_STATUS_LABELS[status] for status in UNMATCHED_STATUS_ORDER]
+    pivot_df = pivot_df.reindex(index=fuel_order, columns=status_columns, fill_value=0)
 
-    fig, ax = plt.subplots(figsize=(12, 7))
-    ax.bar(plot_df["cdr_fuel_group"], plot_df["rows_unmatched"], color="#777777")
-    ax.set_title("Unmatched SB Rows by CDR Fuel")
+    ax = pivot_df.plot(
+        kind="bar",
+        stacked=True,
+        figsize=(12, 7),
+        width=0.82,
+        color={
+            "Unmatched": "#777777",
+            "Cancelled": "#7b3294",
+            "Retired": "#b35806",
+            "Inactive": "#d95f02",
+            "In progress": "#1b9e77",
+        },
+    )
+    ax.set_title("Unmatched SB Rows by CDR Fuel and Status")
     ax.set_xlabel("SB CDR fuel")
     ax.set_ylabel("Unmatched SB rows")
+    ax.legend(title="Unmatched status")
     ax.grid(axis="y", alpha=0.25)
     plt.xticks(rotation=35, ha="right")
     plt.tight_layout()
     plt.savefig(plot_path, dpi=200)
-    plt.close(fig)
+    plt.close()
     return plot_path
 
 

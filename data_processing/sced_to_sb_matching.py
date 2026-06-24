@@ -890,6 +890,104 @@ def replace_storage_pwrstr_matches_with_esr(
     return output_df
 
 
+def mark_unmatched_in_progress(
+    sb_matches_df: pd.DataFrame,
+    sced_prepared_df: pd.DataFrame,
+) -> pd.DataFrame:
+    max_sced_timestamp = pd.to_datetime(
+        sced_prepared_df["final_sced_time_stamp"],
+        errors="coerce",
+    ).max()
+    if pd.isna(max_sced_timestamp):
+        return sb_matches_df
+
+    output_df = sb_matches_df.copy()
+    is_unmatched = (
+        output_df["matched_sced_node"].fillna("").astype(str).str.strip().eq("")
+        & output_df["sb_to_sced_match_status"].eq("unmatched")
+    )
+
+    cdr_sync_date = pd.to_datetime(output_df.get("cdr_sync_date", pd.Series(index=output_df.index)), errors="coerce")
+    gis_projected_cod = pd.to_datetime(output_df.get("gis_projected_cod", pd.Series(index=output_df.index)), errors="coerce")
+    eia_operating_year = pd.to_numeric(
+        output_df.get("eia_operating_year", pd.Series(index=output_df.index)),
+        errors="coerce",
+    )
+
+    date_after_sced = cdr_sync_date.gt(max_sced_timestamp) | gis_projected_cod.gt(max_sced_timestamp)
+    year_after_sced = eia_operating_year.gt(max_sced_timestamp.year)
+    output_df.loc[is_unmatched & (date_after_sced | year_after_sced), "sb_to_sced_match_status"] = "unmatched_in_progress"
+    return output_df
+
+
+def mark_unmatched_retired(
+    sb_matches_df: pd.DataFrame,
+    sced_prepared_df: pd.DataFrame,
+) -> pd.DataFrame:
+    max_sced_timestamp = pd.to_datetime(
+        sced_prepared_df["final_sced_time_stamp"],
+        errors="coerce",
+    ).max()
+    if pd.isna(max_sced_timestamp):
+        return sb_matches_df
+
+    output_df = sb_matches_df.copy()
+    is_unmatched = (
+        output_df["matched_sced_node"].fillna("").astype(str).str.strip().eq("")
+        & output_df["sb_to_sced_match_status"].eq("unmatched")
+    )
+    planned_retirement_year = pd.to_numeric(
+        output_df.get("eia_planned_retirement_year", pd.Series(index=output_df.index)),
+        errors="coerce",
+    )
+    output_df.loc[
+        is_unmatched & planned_retirement_year.lt(max_sced_timestamp.year),
+        "sb_to_sced_match_status",
+    ] = "unmatched_retired"
+    return output_df
+
+
+def mark_unmatched_cancelled(sb_matches_df: pd.DataFrame) -> pd.DataFrame:
+    output_df = sb_matches_df.copy()
+    is_unmatched = (
+        output_df["matched_sced_node"].fillna("").astype(str).str.strip().eq("")
+        & output_df["sb_to_sced_match_status"].eq("unmatched")
+    )
+    if "cnl_cancel_date" not in output_df.columns:
+        return output_df
+
+    cancel_present = output_df["cnl_cancel_date"].fillna("").astype(str).str.strip().ne("")
+    output_df.loc[is_unmatched & cancel_present, "sb_to_sced_match_status"] = "unmatched_cancelled"
+    return output_df
+
+
+def mark_unmatched_inactive(sb_matches_df: pd.DataFrame) -> pd.DataFrame:
+    output_df = sb_matches_df.copy()
+    is_unmatched = (
+        output_df["matched_sced_node"].fillna("").astype(str).str.strip().eq("")
+        & output_df["sb_to_sced_match_status"].eq("unmatched")
+    )
+
+    inactive_present = pd.Series(False, index=output_df.index)
+    for column in ["cnl_inactive", "cnl_inactive_date"]:
+        if column in output_df.columns:
+            inactive_present = inactive_present | output_df[column].fillna("").astype(str).str.strip().ne("")
+
+    output_df.loc[is_unmatched & inactive_present, "sb_to_sced_match_status"] = "unmatched_inactive"
+    return output_df
+
+
+def apply_unmatched_status_priority(
+    sb_matches_df: pd.DataFrame,
+    sced_prepared_df: pd.DataFrame,
+) -> pd.DataFrame:
+    output_df = mark_unmatched_cancelled(sb_matches_df)
+    output_df = mark_unmatched_retired(output_df, sced_prepared_df)
+    output_df = mark_unmatched_inactive(output_df)
+    output_df = mark_unmatched_in_progress(output_df, sced_prepared_df)
+    return output_df
+
+
 def build_sced_price_matches(sced_prepared_df: pd.DataFrame) -> pd.DataFrame:
     sced_price_input_df = sced_prepared_df[["resource_name", "resource_type"]].rename(
         columns={"resource_type": "fuel_type"}
@@ -1008,6 +1106,10 @@ def build_sb_summary(sb_matches_df: pd.DataFrame) -> pd.DataFrame:
                 "rows_matched": int(status_counts.get("matched", 0)),
                 "rows_ambiguous": int(status_counts.get("ambiguous", 0)),
                 "rows_unmatched": int(status_counts.get("unmatched", 0)),
+                "rows_unmatched_cancelled": int(status_counts.get("unmatched_cancelled", 0)),
+                "rows_unmatched_retired": int(status_counts.get("unmatched_retired", 0)),
+                "rows_unmatched_inactive": int(status_counts.get("unmatched_inactive", 0)),
+                "rows_unmatched_in_progress": int(status_counts.get("unmatched_in_progress", 0)),
                 "pct_matched_or_ambiguous": round(
                     (status_counts.get("matched", 0) + status_counts.get("ambiguous", 0)) / total_rows,
                     4,
@@ -1237,6 +1339,7 @@ def main():
     generated_sb_matches_df, sb_candidates_df = build_sb_matches(sb_df, sced_prepared_df)
     sb_matches_df = apply_sb_match_overrides(generated_sb_matches_df, sced_prepared_df)
     sb_matches_df = replace_storage_pwrstr_matches_with_esr(sb_matches_df, sced_prepared_df)
+    sb_matches_df = apply_unmatched_status_priority(sb_matches_df, sced_prepared_df)
     sced_price_matches_df = build_sced_price_matches(sced_prepared_df)
     sced_price_summary_df = build_sced_price_summary(sced_price_matches_df)
     sb_matches_df = add_price_nodes_to_sb_matches(sb_matches_df, sced_price_matches_df)

@@ -376,6 +376,7 @@ def sb_unit_hint_tokens(sb_row: dict) -> set[str]:
 def matched_sced_fields(sced_row: dict | None) -> dict:
     if not sced_row:
         return {
+            "alternative_sced_node": "",
             "matched_sced_node": "",
             "matched_sced_resource_type": "",
             "matched_sced_plant_descriptor": "",
@@ -388,6 +389,7 @@ def matched_sced_fields(sced_row: dict | None) -> dict:
             "matched_sced_min_gen_cost_avg": pd.NA,
         }
     return {
+        "alternative_sced_node": "",
         "matched_sced_node": sced_row.get("resource_name", ""),
         "matched_sced_resource_type": sced_row.get("resource_type", ""),
         "matched_sced_plant_descriptor": sced_row.get("sced_plant_descriptor", ""),
@@ -787,6 +789,11 @@ def apply_sb_match_overrides(sb_matches_df: pd.DataFrame, sced_prepared_df: pd.D
 
 def hydrate_matched_sced_fields(sb_matches_df: pd.DataFrame, sced_prepared_df: pd.DataFrame) -> pd.DataFrame:
     output_df = sb_matches_df.copy()
+    existing_alternative = (
+        output_df["alternative_sced_node"].copy()
+        if "alternative_sced_node" in output_df.columns
+        else pd.Series([""] * len(output_df), index=output_df.index)
+    )
     sced_lookup = {
         normalize_key(row["resource_name"]): row
         for row in sced_prepared_df.to_dict("records")
@@ -802,12 +809,84 @@ def hydrate_matched_sced_fields(sb_matches_df: pd.DataFrame, sced_prepared_df: p
     hydrated_df = pd.DataFrame(hydrated_rows)
     for column in sced_field_columns:
         output_df[column] = hydrated_df[column]
+    output_df["alternative_sced_node"] = existing_alternative.fillna("")
 
     manually_matched = output_df["matched_sced_node"].fillna("").astype(str).str.strip().ne("")
     output_df.loc[
         manually_matched & output_df["sb_to_sced_match_status"].eq("unmatched"),
         "sb_to_sced_match_status",
     ] = "matched"
+    return output_df
+
+
+def choose_esr_replacement(sb_row: pd.Series, esr_rows: list[dict]) -> dict | None:
+    if not esr_rows:
+        return None
+
+    sb_tokens = sb_unit_hint_tokens(sb_row.to_dict())
+    capacity = parse_numeric(pd.Series([sb_row.get("cdr_capacity_mw", pd.NA)])).iloc[0]
+
+    def replacement_score(esr_row: dict) -> tuple[int, float, str]:
+        score = 0
+        if sb_tokens and sb_tokens.intersection(esr_row.get("resource_unit_tokens", set())):
+            score += 100
+        if pd.notna(capacity) and pd.notna(esr_row.get("avg_base_point", pd.NA)) and float(capacity) > 0:
+            ratio = abs(float(capacity) - float(esr_row.get("avg_base_point", 0))) / float(capacity)
+            if ratio <= 0.10:
+                score += 20
+            elif ratio <= 0.25:
+                score += 10
+        base_point = 0.0 if pd.isna(esr_row.get("avg_base_point", pd.NA)) else float(esr_row.get("avg_base_point", 0))
+        return score, base_point, esr_row.get("resource_name", "")
+
+    return sorted(esr_rows, key=replacement_score, reverse=True)[0]
+
+
+def replace_storage_pwrstr_matches_with_esr(
+    sb_matches_df: pd.DataFrame,
+    sced_prepared_df: pd.DataFrame,
+) -> pd.DataFrame:
+    output_df = sb_matches_df.copy()
+    if "alternative_sced_node" not in output_df.columns:
+        output_df["alternative_sced_node"] = ""
+
+    esr_by_plant_key: dict[str, list[dict]] = {}
+    for sced_row in sced_prepared_df.to_dict("records"):
+        if normalize_text(sced_row.get("resource_type", "")) != "ESR":
+            continue
+        plant_key = sced_row.get("sced_plant_descriptor_key", "")
+        if plant_key:
+            esr_by_plant_key.setdefault(plant_key, []).append(sced_row)
+
+    replacement_count = 0
+    for index, row in output_df.iterrows():
+        if normalize_text(row.get("cdr_fuel", "")) != "STORAGE":
+            continue
+        if normalize_text(row.get("matched_sced_resource_type", "")) != "PWRSTR":
+            continue
+        matched_node = row.get("matched_sced_node", "")
+        if not normalize_text(matched_node):
+            continue
+
+        plant_key = normalize_key(row.get("matched_sced_plant_descriptor", "")) or normalize_key(split_plant_unit_descriptor(matched_node)[0])
+        esr_row = choose_esr_replacement(row, esr_by_plant_key.get(plant_key, []))
+        if not esr_row:
+            continue
+
+        original_node = row["matched_sced_node"]
+        for column, value in matched_sced_fields(esr_row).items():
+            if column == "alternative_sced_node":
+                continue
+            output_df.at[index, column] = value
+        output_df.at[index, "alternative_sced_node"] = original_node
+        output_df.at[index, "sb_to_sced_match_method"] = f"{row.get('sb_to_sced_match_method', '')}:storage_esr_replacement"
+        output_df.at[index, "unit_assignment_method"] = f"{row.get('unit_assignment_method', '')}:storage_esr_replacement"
+        replacement_count += 1
+
+    if replacement_count:
+        output_df["storage_esr_replacement_applied"] = output_df["alternative_sced_node"].fillna("").astype(str).str.strip().ne("")
+    else:
+        output_df["storage_esr_replacement_applied"] = False
     return output_df
 
 
@@ -1157,6 +1236,7 @@ def main():
     sced_prepared_df = prepare_sced_resource_df(sced_resource_df)
     generated_sb_matches_df, sb_candidates_df = build_sb_matches(sb_df, sced_prepared_df)
     sb_matches_df = apply_sb_match_overrides(generated_sb_matches_df, sced_prepared_df)
+    sb_matches_df = replace_storage_pwrstr_matches_with_esr(sb_matches_df, sced_prepared_df)
     sced_price_matches_df = build_sced_price_matches(sced_prepared_df)
     sced_price_summary_df = build_sced_price_summary(sced_price_matches_df)
     sb_matches_df = add_price_nodes_to_sb_matches(sb_matches_df, sced_price_matches_df)

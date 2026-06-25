@@ -40,8 +40,8 @@ SB_CONFIDENCE_BAND_BY_FUEL_FILE_NAME = "sb_to_sced_confidence_band_by_fuel.csv"
 SB_CONFIDENCE_BAND_BY_FUEL_PLOT_FILE_NAME = "sb_to_sced_confidence_band_by_fuel.png"
 SB_UNMATCHED_BY_CDR_FUEL_FILE_NAME = "sb_to_sced_unmatched_by_cdr_fuel.csv"
 SB_UNMATCHED_BY_CDR_FUEL_PLOT_FILE_NAME = "sb_to_sced_unmatched_by_cdr_fuel.png"
-SB_INPUT_BY_CDR_FUEL_FILE_NAME = "sb_input_by_cdr_fuel.csv"
-SB_INPUT_BY_CDR_FUEL_PLOT_FILE_NAME = "sb_input_by_cdr_fuel_capacity_count.png"
+SB_INPUT_BY_CDR_FUEL_FILE_NAME = "sb_input_lifecycle_by_cdr_fuel.csv"
+SB_INPUT_BY_CDR_FUEL_PLOT_FILE_NAME = "sb_input_lifecycle_by_cdr_fuel_capacity_count.png"
 SCED_COVERAGE_DETAIL_FILE_NAME = "sced_coverage_from_sb_detail.csv"
 SCED_COVERAGE_SUMMARY_FILE_NAME = "sced_coverage_from_sb_summary.csv"
 SCED_COVERAGE_PLOT_FILE_NAME = "sced_coverage_from_sb_by_resource_type.png"
@@ -90,6 +90,7 @@ UNMATCHED_STATUS_LABELS = {
     "unmatched_inactive": "Inactive",
     "unmatched_in_progress": "In progress",
 }
+SB_LIFECYCLE_STATUS_ORDER = ["Operating", "Cancelled", "Retired", "Inactive", "In progress"]
 
 
 def load_csv(csv_path: str, required_columns: list[str]) -> pd.DataFrame:
@@ -1316,19 +1317,96 @@ def save_sb_unmatched_by_cdr_fuel_plot(unmatched_df: pd.DataFrame, output_dir: s
     return plot_path
 
 
-def build_sb_input_by_cdr_fuel(sb_df: pd.DataFrame) -> pd.DataFrame:
+def classify_sb_lifecycle_status(sb_df: pd.DataFrame, sced_prepared_df: pd.DataFrame) -> pd.Series:
+    max_sced_timestamp = pd.to_datetime(
+        sced_prepared_df["final_sced_time_stamp"],
+        errors="coerce",
+    ).max()
+    statuses = pd.Series("Operating", index=sb_df.index)
+
+    cancelled = (
+        sb_df["cnl_cancel_date"].fillna("").astype(str).str.strip().ne("")
+        if "cnl_cancel_date" in sb_df.columns
+        else pd.Series(False, index=sb_df.index)
+    )
+    statuses.loc[cancelled] = "Cancelled"
+
+    still_operating = statuses.eq("Operating")
+    if not pd.isna(max_sced_timestamp):
+        planned_retirement_year = pd.to_numeric(
+            sb_df.get("eia_planned_retirement_year", pd.Series(index=sb_df.index)),
+            errors="coerce",
+        )
+        retired = still_operating & planned_retirement_year.lt(max_sced_timestamp.year)
+        statuses.loc[retired] = "Retired"
+
+        still_operating = statuses.eq("Operating")
+        cdr_sync_date = pd.to_datetime(sb_df.get("cdr_sync_date", pd.Series(index=sb_df.index)), errors="coerce")
+        gis_projected_cod = pd.to_datetime(sb_df.get("gis_projected_cod", pd.Series(index=sb_df.index)), errors="coerce")
+        eia_operating_year = pd.to_numeric(
+            sb_df.get("eia_operating_year", pd.Series(index=sb_df.index)),
+            errors="coerce",
+        )
+        in_progress = still_operating & (
+            cdr_sync_date.gt(max_sced_timestamp)
+            | gis_projected_cod.gt(max_sced_timestamp)
+            | eia_operating_year.gt(max_sced_timestamp.year)
+        )
+    else:
+        in_progress = pd.Series(False, index=sb_df.index)
+
+    still_operating = statuses.eq("Operating")
+    inactive = pd.Series(False, index=sb_df.index)
+    for column in ["cnl_inactive", "cnl_inactive_date"]:
+        if column in sb_df.columns:
+            inactive = inactive | sb_df[column].fillna("").astype(str).str.strip().ne("")
+    statuses.loc[still_operating & inactive] = "Inactive"
+
+    still_operating = statuses.eq("Operating")
+    statuses.loc[still_operating & in_progress] = "In progress"
+    return statuses
+
+
+def build_sb_input_by_cdr_fuel(sb_df: pd.DataFrame, sced_prepared_df: pd.DataFrame) -> pd.DataFrame:
     df = sb_df.copy()
     df["cdr_fuel_group"] = df["cdr_fuel"].fillna("").astype(str).str.strip().replace("", "UNKNOWN")
     df["cdr_capacity_mw_numeric"] = parse_numeric(df["cdr_capacity_mw"]).fillna(0)
+    df["sb_lifecycle_status"] = classify_sb_lifecycle_status(df, sced_prepared_df)
+
     grouped = (
-        df.groupby("cdr_fuel_group", dropna=False)
+        df.groupby(["cdr_fuel_group", "sb_lifecycle_status"], dropna=False)
         .agg(
-            rows=("cdr_fuel_group", "size"),
+            rows=("sb_lifecycle_status", "size"),
             capacity_mw=("cdr_capacity_mw_numeric", "sum"),
         )
         .reset_index()
     )
-    return grouped.sort_values(["capacity_mw", "rows", "cdr_fuel_group"], ascending=[False, False, True]).reset_index(drop=True)
+    full_index = pd.MultiIndex.from_product(
+        [sorted(df["cdr_fuel_group"].unique()), SB_LIFECYCLE_STATUS_ORDER],
+        names=["cdr_fuel_group", "sb_lifecycle_status"],
+    )
+    grouped = (
+        grouped.set_index(["cdr_fuel_group", "sb_lifecycle_status"])
+        .reindex(full_index, fill_value=0)
+        .reset_index()
+    )
+    grouped["fuel_rows_total"] = grouped.groupby("cdr_fuel_group")["rows"].transform("sum")
+    grouped["fuel_capacity_mw_total"] = grouped.groupby("cdr_fuel_group")["capacity_mw"].transform("sum")
+    grouped["pct_rows_of_fuel"] = (
+        grouped["rows"].div(grouped["fuel_rows_total"].where(grouped["fuel_rows_total"].ne(0))).fillna(0).round(4)
+    )
+    grouped["pct_capacity_of_fuel"] = (
+        grouped["capacity_mw"].div(grouped["fuel_capacity_mw_total"].where(grouped["fuel_capacity_mw_total"].ne(0))).fillna(0).round(4)
+    )
+    grouped["sb_lifecycle_status"] = pd.Categorical(
+        grouped["sb_lifecycle_status"],
+        categories=SB_LIFECYCLE_STATUS_ORDER,
+        ordered=True,
+    )
+    return grouped.sort_values(
+        ["fuel_capacity_mw_total", "cdr_fuel_group", "sb_lifecycle_status"],
+        ascending=[False, True, True],
+    ).reset_index(drop=True)
 
 
 def save_sb_input_by_cdr_fuel_plot(sb_input_by_fuel_df: pd.DataFrame, output_dir: str = OUTPUT_DIR) -> Path:
@@ -1338,21 +1416,49 @@ def save_sb_input_by_cdr_fuel_plot(sb_input_by_fuel_df: pd.DataFrame, output_dir
     output_path = ensure_output_dir(output_dir)
     plot_path = output_path / SB_INPUT_BY_CDR_FUEL_PLOT_FILE_NAME
     plot_df = sb_input_by_fuel_df.copy()
+    pivot_df = (
+        plot_df.pivot(index="cdr_fuel_group", columns="sb_lifecycle_status", values="capacity_mw")
+        .fillna(0)
+    )
+    fuel_order = (
+        plot_df[["cdr_fuel_group", "fuel_capacity_mw_total"]]
+        .drop_duplicates()
+        .sort_values(["fuel_capacity_mw_total", "cdr_fuel_group"], ascending=[False, True])["cdr_fuel_group"]
+    )
+    pivot_df = pivot_df.reindex(index=fuel_order, columns=SB_LIFECYCLE_STATUS_ORDER, fill_value=0)
+    count_series = (
+        plot_df[["cdr_fuel_group", "fuel_rows_total"]]
+        .drop_duplicates()
+        .set_index("cdr_fuel_group")
+        .reindex(fuel_order)["fuel_rows_total"]
+    )
 
-    fig, ax_capacity = plt.subplots(figsize=(12, 7))
-    ax_capacity.bar(plot_df["cdr_fuel_group"], plot_df["capacity_mw"], color="#4c78a8", alpha=0.85)
-    ax_capacity.set_title("SB Input Capacity and Count by CDR Fuel")
+    ax_capacity = pivot_df.plot(
+        kind="bar",
+        stacked=True,
+        figsize=(12, 7),
+        width=0.82,
+        color={
+            "Operating": "#4c78a8",
+            "Cancelled": "#7b3294",
+            "Retired": "#b35806",
+            "Inactive": "#d95f02",
+            "In progress": "#1b9e77",
+        },
+    )
+    fig = ax_capacity.get_figure()
+    ax_capacity.set_title("SB Input Capacity and Count by CDR Fuel and Lifecycle Status")
     ax_capacity.set_xlabel("SB CDR fuel")
     ax_capacity.set_ylabel("Capacity (MW)")
     ax_capacity.grid(axis="y", alpha=0.25)
 
     ax_count = ax_capacity.twinx()
-    ax_count.scatter(plot_df["cdr_fuel_group"], plot_df["rows"], color="#d95f02", s=56, zorder=5)
+    ax_count.scatter(range(len(count_series)), count_series.values, color="#111111", s=56, zorder=5)
     ax_count.set_ylabel("Row count")
 
-    capacity_proxy = plt.Line2D([0], [0], color="#4c78a8", lw=8, label="Capacity (MW)")
-    count_proxy = plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="#d95f02", markersize=8, label="Count")
-    ax_capacity.legend(handles=[capacity_proxy, count_proxy], loc="upper right")
+    count_proxy = plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="#111111", markersize=8, label="Count")
+    handles, labels = ax_capacity.get_legend_handles_labels()
+    ax_capacity.legend(handles + [count_proxy], labels + ["Count"], title="Lifecycle status", loc="upper right")
 
     plt.xticks(rotation=35, ha="right")
     plt.tight_layout()
@@ -1567,7 +1673,7 @@ def main():
     pun_df = load_csv(PUN_GENERATION_REPORT_PATH, PUN_REQUIRED_COLUMNS)
 
     sced_prepared_df = prepare_sced_resource_df(sced_resource_df)
-    sb_input_by_cdr_fuel_df = build_sb_input_by_cdr_fuel(sb_df)
+    sb_input_by_cdr_fuel_df = build_sb_input_by_cdr_fuel(sb_df, sced_prepared_df)
     generated_sb_matches_df, sb_candidates_df = build_sb_matches(sb_df, sced_prepared_df)
     sb_matches_df = apply_sb_match_overrides(generated_sb_matches_df, sced_prepared_df)
     sb_matches_df = replace_storage_pwrstr_matches_with_esr(sb_matches_df, sced_prepared_df)

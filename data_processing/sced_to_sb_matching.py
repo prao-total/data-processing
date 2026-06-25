@@ -40,6 +40,8 @@ SB_CONFIDENCE_BAND_BY_FUEL_FILE_NAME = "sb_to_sced_confidence_band_by_fuel.csv"
 SB_CONFIDENCE_BAND_BY_FUEL_PLOT_FILE_NAME = "sb_to_sced_confidence_band_by_fuel.png"
 SB_UNMATCHED_BY_CDR_FUEL_FILE_NAME = "sb_to_sced_unmatched_by_cdr_fuel.csv"
 SB_UNMATCHED_BY_CDR_FUEL_PLOT_FILE_NAME = "sb_to_sced_unmatched_by_cdr_fuel.png"
+SB_INPUT_BY_CDR_FUEL_FILE_NAME = "sb_input_by_cdr_fuel.csv"
+SB_INPUT_BY_CDR_FUEL_PLOT_FILE_NAME = "sb_input_by_cdr_fuel_capacity_count.png"
 SCED_COVERAGE_DETAIL_FILE_NAME = "sced_coverage_from_sb_detail.csv"
 SCED_COVERAGE_SUMMARY_FILE_NAME = "sced_coverage_from_sb_summary.csv"
 SCED_COVERAGE_PLOT_FILE_NAME = "sced_coverage_from_sb_by_resource_type.png"
@@ -1314,6 +1316,51 @@ def save_sb_unmatched_by_cdr_fuel_plot(unmatched_df: pd.DataFrame, output_dir: s
     return plot_path
 
 
+def build_sb_input_by_cdr_fuel(sb_df: pd.DataFrame) -> pd.DataFrame:
+    df = sb_df.copy()
+    df["cdr_fuel_group"] = df["cdr_fuel"].fillna("").astype(str).str.strip().replace("", "UNKNOWN")
+    df["cdr_capacity_mw_numeric"] = parse_numeric(df["cdr_capacity_mw"]).fillna(0)
+    grouped = (
+        df.groupby("cdr_fuel_group", dropna=False)
+        .agg(
+            rows=("cdr_fuel_group", "size"),
+            capacity_mw=("cdr_capacity_mw_numeric", "sum"),
+        )
+        .reset_index()
+    )
+    return grouped.sort_values(["capacity_mw", "rows", "cdr_fuel_group"], ascending=[False, False, True]).reset_index(drop=True)
+
+
+def save_sb_input_by_cdr_fuel_plot(sb_input_by_fuel_df: pd.DataFrame, output_dir: str = OUTPUT_DIR) -> Path:
+    if plt is None:
+        raise RuntimeError("matplotlib is required to save the SB input by CDR fuel plot")
+
+    output_path = ensure_output_dir(output_dir)
+    plot_path = output_path / SB_INPUT_BY_CDR_FUEL_PLOT_FILE_NAME
+    plot_df = sb_input_by_fuel_df.copy()
+
+    fig, ax_capacity = plt.subplots(figsize=(12, 7))
+    ax_capacity.bar(plot_df["cdr_fuel_group"], plot_df["capacity_mw"], color="#4c78a8", alpha=0.85)
+    ax_capacity.set_title("SB Input Capacity and Count by CDR Fuel")
+    ax_capacity.set_xlabel("SB CDR fuel")
+    ax_capacity.set_ylabel("Capacity (MW)")
+    ax_capacity.grid(axis="y", alpha=0.25)
+
+    ax_count = ax_capacity.twinx()
+    ax_count.scatter(plot_df["cdr_fuel_group"], plot_df["rows"], color="#d95f02", s=56, zorder=5)
+    ax_count.set_ylabel("Row count")
+
+    capacity_proxy = plt.Line2D([0], [0], color="#4c78a8", lw=8, label="Capacity (MW)")
+    count_proxy = plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="#d95f02", markersize=8, label="Count")
+    ax_capacity.legend(handles=[capacity_proxy, count_proxy], loc="upper right")
+
+    plt.xticks(rotation=35, ha="right")
+    plt.tight_layout()
+    plt.savefig(plot_path, dpi=200)
+    plt.close(fig)
+    return plot_path
+
+
 def build_sced_coverage_outputs(
     sced_prepared_df: pd.DataFrame,
     sb_matches_df: pd.DataFrame,
@@ -1469,11 +1516,12 @@ def save_sb_outputs(
     sb_summary_df: pd.DataFrame,
     sb_confidence_band_by_fuel_df: pd.DataFrame,
     sb_unmatched_by_cdr_fuel_df: pd.DataFrame,
+    sb_input_by_cdr_fuel_df: pd.DataFrame,
     sced_coverage_detail_df: pd.DataFrame,
     sced_coverage_summary_df: pd.DataFrame,
     pun_presence_df: pd.DataFrame,
     output_dir: str = OUTPUT_DIR,
-) -> tuple[Path, Path, Path, Path, Path, Path, Path, Path, Path, Path]:
+) -> tuple[Path, Path, Path, Path, Path, Path, Path, Path, Path, Path, Path]:
     output_path = ensure_output_dir(output_dir)
     sced_price_matches_path = output_path / SCED_PRICE_SIMPLE_MATCHES_FILE_NAME
     sced_price_summary_path = output_path / SCED_PRICE_SUMMARY_FILE_NAME
@@ -1482,6 +1530,7 @@ def save_sb_outputs(
     sb_summary_path = output_path / SB_SUMMARY_FILE_NAME
     sb_confidence_band_by_fuel_path = output_path / SB_CONFIDENCE_BAND_BY_FUEL_FILE_NAME
     sb_unmatched_by_cdr_fuel_path = output_path / SB_UNMATCHED_BY_CDR_FUEL_FILE_NAME
+    sb_input_by_cdr_fuel_path = output_path / SB_INPUT_BY_CDR_FUEL_FILE_NAME
     sced_coverage_detail_path = output_path / SCED_COVERAGE_DETAIL_FILE_NAME
     sced_coverage_summary_path = output_path / SCED_COVERAGE_SUMMARY_FILE_NAME
     pun_presence_path = output_path / PUN_SB_PRESENCE_FILE_NAME
@@ -1493,6 +1542,7 @@ def save_sb_outputs(
     sb_summary_df.to_csv(sb_summary_path, index=False)
     sb_confidence_band_by_fuel_df.to_csv(sb_confidence_band_by_fuel_path, index=False)
     sb_unmatched_by_cdr_fuel_df.to_csv(sb_unmatched_by_cdr_fuel_path, index=False)
+    sb_input_by_cdr_fuel_df.to_csv(sb_input_by_cdr_fuel_path, index=False)
     sced_coverage_detail_df.to_csv(sced_coverage_detail_path, index=False)
     sced_coverage_summary_df.to_csv(sced_coverage_summary_path, index=False)
     pun_presence_df.to_csv(pun_presence_path, index=False)
@@ -1504,6 +1554,7 @@ def save_sb_outputs(
         sb_summary_path,
         sb_confidence_band_by_fuel_path,
         sb_unmatched_by_cdr_fuel_path,
+        sb_input_by_cdr_fuel_path,
         sced_coverage_detail_path,
         sced_coverage_summary_path,
         pun_presence_path,
@@ -1516,6 +1567,7 @@ def main():
     pun_df = load_csv(PUN_GENERATION_REPORT_PATH, PUN_REQUIRED_COLUMNS)
 
     sced_prepared_df = prepare_sced_resource_df(sced_resource_df)
+    sb_input_by_cdr_fuel_df = build_sb_input_by_cdr_fuel(sb_df)
     generated_sb_matches_df, sb_candidates_df = build_sb_matches(sb_df, sced_prepared_df)
     sb_matches_df = apply_sb_match_overrides(generated_sb_matches_df, sced_prepared_df)
     sb_matches_df = replace_storage_pwrstr_matches_with_esr(sb_matches_df, sced_prepared_df)
@@ -1541,6 +1593,7 @@ def main():
         sb_summary_path,
         sb_confidence_band_by_fuel_path,
         sb_unmatched_by_cdr_fuel_path,
+        sb_input_by_cdr_fuel_path,
         sced_coverage_detail_path,
         sced_coverage_summary_path,
         pun_presence_path,
@@ -1552,12 +1605,14 @@ def main():
         sb_summary_df,
         sb_confidence_band_by_fuel_df,
         sb_unmatched_by_cdr_fuel_df,
+        sb_input_by_cdr_fuel_df,
         sced_coverage_detail_df,
         sced_coverage_summary_df,
         pun_presence_df,
     )
     sb_confidence_band_by_fuel_plot_path = save_sb_confidence_band_plot(sb_confidence_band_by_fuel_df)
     sb_unmatched_by_cdr_fuel_plot_path = save_sb_unmatched_by_cdr_fuel_plot(sb_unmatched_by_cdr_fuel_df)
+    sb_input_by_cdr_fuel_plot_path = save_sb_input_by_cdr_fuel_plot(sb_input_by_cdr_fuel_df)
     sced_coverage_plot_path = save_sced_coverage_plot(sced_coverage_summary_df)
 
     print(f"Saved SCED price matches to {sced_price_matches_path}")
@@ -1569,6 +1624,8 @@ def main():
     print(f"Saved SB confidence band by fuel plot to {sb_confidence_band_by_fuel_plot_path}")
     print(f"Saved SB unmatched by CDR fuel data to {sb_unmatched_by_cdr_fuel_path}")
     print(f"Saved SB unmatched by CDR fuel plot to {sb_unmatched_by_cdr_fuel_plot_path}")
+    print(f"Saved SB input by CDR fuel data to {sb_input_by_cdr_fuel_path}")
+    print(f"Saved SB input by CDR fuel plot to {sb_input_by_cdr_fuel_plot_path}")
     print(f"Saved SCED coverage detail to {sced_coverage_detail_path}")
     print(f"Saved SCED coverage summary to {sced_coverage_summary_path}")
     print(f"Saved SCED coverage plot to {sced_coverage_plot_path}")

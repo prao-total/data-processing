@@ -1470,6 +1470,7 @@ def save_sb_input_by_cdr_fuel_plot(sb_input_by_fuel_df: pd.DataFrame, output_dir
 def build_sced_coverage_outputs(
     sced_prepared_df: pd.DataFrame,
     sb_matches_df: pd.DataFrame,
+    pun_df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     used_sced_keys = set()
     for column in ["matched_sced_node", "alternative_sced_node"]:
@@ -1485,6 +1486,8 @@ def build_sced_coverage_outputs(
         [
             "resource_name",
             "resource_type",
+            "sced_plant_descriptor",
+            "sced_plant_descriptor_key",
             "final_sced_time_stamp",
             "avg_base_point",
             "avg_start_up_cold_offer",
@@ -1496,22 +1499,97 @@ def build_sced_coverage_outputs(
     detail_df["sced_resource_key"] = detail_df["resource_name"].map(normalize_key)
     detail_df["is_used_by_sb"] = detail_df["sced_resource_key"].isin(used_sced_keys)
     detail_df["sced_to_sb_status"] = detail_df["is_used_by_sb"].map(lambda used: "used" if used else "missing")
+    pun_substation_keys = {
+        normalize_key(value)
+        for value in pun_df["SubstationName"].dropna().astype(str)
+        if normalize_key(value)
+    }
+    detail_df["is_pun_plant"] = detail_df["sced_plant_descriptor_key"].isin(pun_substation_keys)
+
+    matched_main = sb_matches_df[
+        sb_matches_df["matched_sced_node"].fillna("").astype(str).str.strip().ne("")
+    ].copy()
+    if not matched_main.empty:
+        matched_main["matched_sced_plant_descriptor_key"] = matched_main["matched_sced_plant_descriptor"].map(normalize_key)
+        sb_plant_counts = (
+            matched_main.groupby("matched_sced_plant_descriptor_key", dropna=False)
+            .size()
+            .rename("sb_rows_matched_to_sced_plant")
+            .reset_index()
+        )
+    else:
+        sb_plant_counts = pd.DataFrame(columns=["matched_sced_plant_descriptor_key", "sb_rows_matched_to_sced_plant"])
+
+    plant_counts = (
+        detail_df.groupby("sced_plant_descriptor_key", dropna=False)
+        .agg(
+            sced_plant_unit_count=("resource_name", "size"),
+            sced_used_in_plant_count=("is_used_by_sb", "sum"),
+        )
+        .reset_index()
+    )
+    plant_counts["sced_missing_in_plant_count"] = (
+        plant_counts["sced_plant_unit_count"] - plant_counts["sced_used_in_plant_count"]
+    )
+    plant_counts = plant_counts.merge(
+        sb_plant_counts,
+        left_on="sced_plant_descriptor_key",
+        right_on="matched_sced_plant_descriptor_key",
+        how="left",
+    )
+    plant_counts["sb_rows_matched_to_sced_plant"] = plant_counts["sb_rows_matched_to_sced_plant"].fillna(0).astype(int)
+    plant_counts["has_extra_sced_units"] = (
+        (plant_counts["sb_rows_matched_to_sced_plant"] > 0)
+        & (plant_counts["sced_plant_unit_count"] > plant_counts["sb_rows_matched_to_sced_plant"])
+    )
+    detail_df = detail_df.merge(
+        plant_counts[
+            [
+                "sced_plant_descriptor_key",
+                "sced_plant_unit_count",
+                "sb_rows_matched_to_sced_plant",
+                "sced_used_in_plant_count",
+                "sced_missing_in_plant_count",
+                "has_extra_sced_units",
+            ]
+        ],
+        on="sced_plant_descriptor_key",
+        how="left",
+    )
+    detail_df.loc[
+        detail_df["sced_to_sb_status"].eq("missing") & detail_df["has_extra_sced_units"].fillna(False),
+        "sced_to_sb_status",
+    ] = "missing_extra_sced"
+    detail_df.loc[
+        detail_df["sced_to_sb_status"].isin(["missing", "missing_extra_sced"]) & detail_df["is_pun_plant"],
+        "sced_to_sb_status",
+    ] = "missing_pun"
 
     summary_df = (
         detail_df.groupby("resource_type", dropna=False)
         .agg(
             sced_rows_total=("resource_name", "size"),
             sced_rows_used=("is_used_by_sb", "sum"),
-            sced_rows_missing=("is_used_by_sb", lambda values: int((~values).sum())),
+            sced_rows_missing=("sced_to_sb_status", lambda values: int((values == "missing").sum())),
+            sced_rows_missing_pun=("sced_to_sb_status", lambda values: int((values == "missing_pun").sum())),
+            sced_rows_missing_extra_sced=("sced_to_sb_status", lambda values: int((values == "missing_extra_sced").sum())),
         )
         .reset_index()
     )
     summary_df["pct_used"] = summary_df["sced_rows_used"].div(summary_df["sced_rows_total"]).fillna(0).round(4)
     summary_df["pct_missing"] = summary_df["sced_rows_missing"].div(summary_df["sced_rows_total"]).fillna(0).round(4)
+    summary_df["pct_missing_pun"] = (
+        summary_df["sced_rows_missing_pun"].div(summary_df["sced_rows_total"]).fillna(0).round(4)
+    )
+    summary_df["pct_missing_extra_sced"] = (
+        summary_df["sced_rows_missing_extra_sced"].div(summary_df["sced_rows_total"]).fillna(0).round(4)
+    )
 
     total_rows = len(detail_df)
     total_used = int(detail_df["is_used_by_sb"].sum())
-    total_missing = total_rows - total_used
+    total_missing = int(detail_df["sced_to_sb_status"].eq("missing").sum())
+    total_missing_pun = int(detail_df["sced_to_sb_status"].eq("missing_pun").sum())
+    total_missing_extra_sced = int(detail_df["sced_to_sb_status"].eq("missing_extra_sced").sum())
     total_df = pd.DataFrame(
         [
             {
@@ -1519,8 +1597,12 @@ def build_sced_coverage_outputs(
                 "sced_rows_total": total_rows,
                 "sced_rows_used": total_used,
                 "sced_rows_missing": total_missing,
+                "sced_rows_missing_pun": total_missing_pun,
+                "sced_rows_missing_extra_sced": total_missing_extra_sced,
                 "pct_used": round(total_used / total_rows, 4) if total_rows else 0.0,
                 "pct_missing": round(total_missing / total_rows, 4) if total_rows else 0.0,
+                "pct_missing_pun": round(total_missing_pun / total_rows, 4) if total_rows else 0.0,
+                "pct_missing_extra_sced": round(total_missing_extra_sced / total_rows, 4) if total_rows else 0.0,
             }
         ]
     )
@@ -1541,7 +1623,9 @@ def save_sced_coverage_plot(sced_coverage_summary_df: pd.DataFrame, output_dir: 
     plot_path = output_path / SCED_COVERAGE_PLOT_FILE_NAME
     plot_df = sced_coverage_summary_df[sced_coverage_summary_df["resource_type"].ne("ALL")].copy()
     plot_df = plot_df.sort_values(["sced_rows_total", "resource_type"], ascending=[False, True])
-    plot_df = plot_df.set_index("resource_type")[["sced_rows_used", "sced_rows_missing"]]
+    plot_df = plot_df.set_index("resource_type")[
+        ["sced_rows_used", "sced_rows_missing", "sced_rows_missing_pun", "sced_rows_missing_extra_sced"]
+    ]
 
     ax = plot_df.plot(
         kind="bar",
@@ -1550,12 +1634,14 @@ def save_sced_coverage_plot(sced_coverage_summary_df: pd.DataFrame, output_dir: 
         color={
             "sced_rows_used": "#2f7d32",
             "sced_rows_missing": "#777777",
+            "sced_rows_missing_pun": "#6a51a3",
+            "sced_rows_missing_extra_sced": "#f0a202",
         },
     )
     ax.set_title("SCED Resources Used vs Missing from SB Matches by Resource Type")
     ax.set_xlabel("SCED resource type")
     ax.set_ylabel("SCED rows")
-    ax.legend(["Used", "Missing"], title="SCED coverage")
+    ax.legend(["Used", "Missing", "Missing PUN", "Missing extra SCED"], title="SCED coverage")
     ax.grid(axis="y", alpha=0.25)
     plt.xticks(rotation=35, ha="right")
     plt.tight_layout()
@@ -1689,6 +1775,7 @@ def main():
     sced_coverage_detail_df, sced_coverage_summary_df = build_sced_coverage_outputs(
         sced_prepared_df,
         sb_matches_df,
+        pun_df,
     )
 
     (

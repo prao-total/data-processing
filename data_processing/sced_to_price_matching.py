@@ -5,8 +5,12 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher, get_close_matches
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import pandas as pd
+
+try:
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:
+    plt = None
 
 
 SCED_PLANT_LIST_PATH = "/Users/pradyrao/Downloads/sced_plant_list_extracted.csv"
@@ -18,6 +22,7 @@ RESOURCE_NODE_MAPPING_PATH = "/Users/pradyrao/Downloads/SP_List_EB_Mapping 2/Res
 PLEXOS_LIST_PATH = "/Users/pradyrao/Downloads/plexos_list.csv"
 ERCOT_CDR_PATH = "/Users/pradyrao/Downloads/ercot_cdr_july.csv"
 PUN_GENERATION_REPORT_PATH = "/Users/pradyrao/Downloads/PUN_Generation_Report/PUN_Generation_Report.csv"
+SB_TO_SCED_MATCHES_PATH = "/Users/pradyrao/VSCode/data-processing/data_processing/output/sced_to_sb_matching/sb_to_sced_matches.csv"
 FINAL_SIMPLE_MATCHES_PATH = None
 FINAL_PLEXOS_MATCHES_PATH = None
 
@@ -57,6 +62,15 @@ RESOURCE_NODE_MAPPING_REQUIRED_COLUMNS = ["RESOURCE_NODE", "UNIT_SUBSTATION", "U
 PLEXOS_REQUIRED_COLUMNS = ["Class", "Name", "CDR Name", "ERCOT_UnitCode", "County", "Fuel Reporting"]
 ERCOT_CDR_REQUIRED_COLUMNS = ["UNIT NAME", "UNIT CODE", "COUNTY", "FUEL"]
 PUN_REQUIRED_COLUMNS = ["SubstationName", "UnitName"]
+SB_TO_SCED_REQUIRED_COLUMNS = [
+    "unit_name",
+    "cdr_unit_code",
+    "county",
+    "cdr_fuel",
+    "matched_sced_node",
+    "sb_to_sced_match_method",
+    "sb_to_sced_match_status",
+]
 FINAL_PLEXOS_MATCHES_REQUIRED_COLUMNS = [
     "Class",
     "Name",
@@ -1607,6 +1621,41 @@ def build_yes_plexos_lookups(yes_df: pd.DataFrame) -> dict[str, object]:
     }
 
 
+def build_sb_plexos_lookups(sb_matches_df: pd.DataFrame) -> dict[str, object]:
+    sb_df = sb_matches_df.copy()
+    sb_df = sb_df[
+        sb_df["sb_to_sced_match_status"].eq("matched")
+        & sb_df["matched_sced_node"].fillna("").astype(str).str.strip().ne("")
+    ].copy()
+    sb_df["cdr_unit_code_norm"] = sb_df["cdr_unit_code"].map(normalize_text)
+    sb_df["cdr_unit_code_key"] = sb_df["cdr_unit_code"].map(normalize_key)
+    sb_df["unit_name_norm"] = sb_df["unit_name"].map(normalize_text)
+    sb_df["unit_name_key"] = sb_df["unit_name"].map(normalize_key)
+    sb_df["county_norm"] = sb_df["county"].map(normalize_text)
+    sb_df["cdr_fuel_norm"] = sb_df["cdr_fuel"].map(fuel_key)
+
+    rows = sb_df.to_dict("records")
+    by_cdr_unit_code: dict[str, list[dict]] = {}
+    by_cdr_unit_code_key: dict[str, list[dict]] = {}
+    by_unit_name: dict[str, list[dict]] = {}
+    by_unit_name_key: dict[str, list[dict]] = {}
+    for row in rows:
+        if row["cdr_unit_code_norm"]:
+            by_cdr_unit_code.setdefault(row["cdr_unit_code_norm"], []).append(row)
+        if row["cdr_unit_code_key"]:
+            by_cdr_unit_code_key.setdefault(row["cdr_unit_code_key"], []).append(row)
+        if row["unit_name_norm"]:
+            by_unit_name.setdefault(row["unit_name_norm"], []).append(row)
+        if row["unit_name_key"]:
+            by_unit_name_key.setdefault(row["unit_name_key"], []).append(row)
+    return {
+        "by_cdr_unit_code": by_cdr_unit_code,
+        "by_cdr_unit_code_key": by_cdr_unit_code_key,
+        "by_unit_name": by_unit_name,
+        "by_unit_name_key": by_unit_name_key,
+    }
+
+
 def choose_best_plexos_match(candidate_rows: list[dict]) -> dict:
     if not candidate_rows:
         return {
@@ -1768,6 +1817,73 @@ def collect_plexos_candidates(
     return candidates
 
 
+def collect_plexos_sb_candidates(
+    plexos_row: dict,
+    sced_lookups: dict[str, object],
+    sb_lookups: dict[str, object],
+) -> list[dict]:
+    candidates: list[dict] = []
+    seen_nodes: set[tuple[str, str]] = set()
+
+    def add_sb_rows(sb_rows: list[dict], base_score: int, method: str, require_alignment: bool = False):
+        for sb_row in sb_rows:
+            matched_node = normalize_text(sb_row.get("matched_sced_node", ""))
+            if not matched_node:
+                continue
+            sced_rows = sced_lookups["by_resource_name"].get(matched_node, [])
+            if not sced_rows:
+                continue
+            if require_alignment:
+                county_match = (
+                    plexos_row.get("plexos_county_norm", "")
+                    and sb_row.get("county_norm", "")
+                    and plexos_row.get("plexos_county_norm", "") == sb_row.get("county_norm", "")
+                )
+                fuel_match = (
+                    plexos_row.get("plexos_fuel_norm", "")
+                    and sb_row.get("cdr_fuel_norm", "")
+                    and plexos_row.get("plexos_fuel_norm", "") == sb_row.get("cdr_fuel_norm", "")
+                )
+                if not (county_match or fuel_match):
+                    continue
+            for sced_row in sced_rows:
+                key = (method, sced_row["resource_name"])
+                if key in seen_nodes:
+                    continue
+                seen_nodes.add(key)
+                candidates.append(score_plexos_candidate(plexos_row, sced_row, base_score, method))
+
+    ercot_unit_norm = plexos_row.get("plexos_ercot_unit_norm", "")
+    if ercot_unit_norm:
+        add_sb_rows(
+            sb_lookups["by_cdr_unit_code"].get(ercot_unit_norm, []),
+            205,
+            "sb_cdr_unit_code_exact",
+        )
+        add_sb_rows(
+            sb_lookups["by_cdr_unit_code_key"].get(normalize_key(ercot_unit_norm), []),
+            198,
+            "sb_cdr_unit_code_key_exact",
+        )
+
+    name_norm = plexos_row.get("plexos_name_norm", "")
+    if name_norm:
+        add_sb_rows(
+            sb_lookups["by_unit_name"].get(name_norm, []),
+            185,
+            "sb_unit_name_exact",
+            require_alignment=True,
+        )
+        add_sb_rows(
+            sb_lookups["by_unit_name_key"].get(normalize_key(name_norm), []),
+            178,
+            "sb_unit_name_key_exact",
+            require_alignment=True,
+        )
+
+    return candidates
+
+
 def collect_plexos_yes_price_candidates(
     plexos_row: dict,
     sced_lookups: dict[str, object],
@@ -1843,10 +1959,12 @@ def build_plexos_matches(
     plexos_df: pd.DataFrame,
     sced_reference_df: pd.DataFrame,
     yes_df: pd.DataFrame,
+    sb_matches_df: pd.DataFrame,
 ) -> pd.DataFrame:
     plexos_prepared = prepare_plexos_df(plexos_df)
     sced_lookups = build_plexos_reference_lookups(sced_reference_df)
     yes_lookups = build_yes_plexos_lookups(yes_df)
+    sb_lookups = build_sb_plexos_lookups(sb_matches_df)
 
     appended_rows = []
     for row in plexos_prepared.to_dict("records"):
@@ -1856,6 +1974,10 @@ def build_plexos_matches(
             fallback_candidates = collect_plexos_yes_price_candidates(row, sced_lookups, yes_lookups)
             if fallback_candidates:
                 match = choose_best_plexos_match(fallback_candidates)
+        if match["plexos_to_sced_match_status"] == "unmatched":
+            sb_candidates = collect_plexos_sb_candidates(row, sced_lookups, sb_lookups)
+            if sb_candidates:
+                match = choose_best_plexos_match(sb_candidates)
         appended_rows.append(match)
 
     match_df = pd.DataFrame(appended_rows)
@@ -2125,6 +2247,64 @@ def add_duplicate_sced_node_reference(
         return node_text
 
     output_df["duplicate_matched_sced_node_reference"] = output_df["matched_sced_node"].map(build_duplicate_reference)
+    return output_df
+
+
+def add_sb_reference_cdr_unit_code(
+    sb_matches_df: pd.DataFrame,
+    plexos_matches_df: pd.DataFrame,
+) -> pd.DataFrame:
+    sb_df = sb_matches_df.copy()
+    sb_df["cdr_unit_code_norm"] = sb_df["cdr_unit_code"].map(normalize_text)
+    sb_df["cdr_unit_code_key"] = sb_df["cdr_unit_code"].map(normalize_key)
+    sb_df["unit_name_norm"] = sb_df["unit_name"].map(normalize_text)
+    sb_df["unit_name_key"] = sb_df["unit_name"].map(normalize_key)
+
+    by_cdr_unit_code = (
+        sb_df[sb_df["cdr_unit_code_norm"].ne("")]
+        .drop_duplicates(subset="cdr_unit_code_norm", keep="first")
+        .set_index("cdr_unit_code_norm")["cdr_unit_code"]
+        .to_dict()
+    )
+    by_cdr_unit_code_key = (
+        sb_df[sb_df["cdr_unit_code_key"].ne("")]
+        .drop_duplicates(subset="cdr_unit_code_key", keep="first")
+        .set_index("cdr_unit_code_key")["cdr_unit_code"]
+        .to_dict()
+    )
+    by_unit_name = (
+        sb_df[sb_df["unit_name_norm"].ne("")]
+        .drop_duplicates(subset="unit_name_norm", keep="first")
+        .set_index("unit_name_norm")["cdr_unit_code"]
+        .to_dict()
+    )
+    by_unit_name_key = (
+        sb_df[sb_df["unit_name_key"].ne("")]
+        .drop_duplicates(subset="unit_name_key", keep="first")
+        .set_index("unit_name_key")["cdr_unit_code"]
+        .to_dict()
+    )
+
+    output_df = plexos_matches_df.copy()
+
+    def resolve_sb_reference(row: pd.Series) -> str:
+        if str(row.get("plexos_to_sced_match_status", "")).strip() != "unmatched":
+            return ""
+        ercot_unit = normalize_text(row.get("ERCOT_UnitCode", ""))
+        ercot_key = normalize_key(row.get("ERCOT_UnitCode", ""))
+        name_norm = normalize_text(row.get("Name", ""))
+        name_key = normalize_key(row.get("Name", ""))
+        if ercot_unit and ercot_unit in by_cdr_unit_code:
+            return str(by_cdr_unit_code[ercot_unit])
+        if ercot_key and ercot_key in by_cdr_unit_code_key:
+            return str(by_cdr_unit_code_key[ercot_key])
+        if name_norm and name_norm in by_unit_name:
+            return str(by_unit_name[name_norm])
+        if name_key and name_key in by_unit_name_key:
+            return str(by_unit_name_key[name_key])
+        return ""
+
+    output_df["sb_reference_cdr_unit_code"] = output_df.apply(resolve_sb_reference, axis=1)
     return output_df
 
 
@@ -2407,6 +2587,7 @@ def main():
     plexos_df = load_csv(PLEXOS_LIST_PATH, PLEXOS_REQUIRED_COLUMNS)
     ercot_cdr_df = load_csv(ERCOT_CDR_PATH, ERCOT_CDR_REQUIRED_COLUMNS)
     pun_df = load_csv(PUN_GENERATION_REPORT_PATH, PUN_REQUIRED_COLUMNS)
+    sb_matches_df = load_csv(SB_TO_SCED_MATCHES_PATH, SB_TO_SCED_REQUIRED_COLUMNS)
 
     best_matches_df, candidates_df, summary_df = build_match_tables(
         sced_plant_df,
@@ -2419,11 +2600,12 @@ def main():
     simple_matches_df = build_simple_matches(best_matches_df)
     simple_matches_for_plexos_df = choose_simple_matches_source(simple_matches_df)
     sced_reference_df = build_sced_reference_df(best_matches_df, simple_matches_for_plexos_df, ercot_cdr_df)
-    generated_plexos_matches_df = build_plexos_matches(plexos_df, sced_reference_df, yes_df)
+    generated_plexos_matches_df = build_plexos_matches(plexos_df, sced_reference_df, yes_df, sb_matches_df)
     plexos_matches_df = apply_plexos_match_overrides(generated_plexos_matches_df)
     plexos_matches_df = add_pun_presence_flag_to_plexos_matches(pun_df, plexos_matches_df)
     plexos_matches_df = add_sced_plant_units_to_plexos_matches(sced_plant_df, plexos_matches_df)
     plexos_matches_df = add_duplicate_sced_node_reference(sced_plant_df, plexos_matches_df)
+    plexos_matches_df = add_sb_reference_cdr_unit_code(sb_matches_df, plexos_matches_df)
     pun_presence_df = build_pun_presence_output(pun_df, plexos_matches_df)
     plexos_tech_summary_df = build_plexos_technology_summary(plexos_matches_df)
     (

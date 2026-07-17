@@ -1,40 +1,44 @@
-"""Enrich HCA cluster assignments with SB metadata and explain the clusters.
+"""Match HCA cluster resources to the SB generator list.
 
-The clustering input file contains standardized (``z_``) behavioral features.
-This script joins those resources to the SB list using ``resource_name`` and
-``cdr_unit_code``, then produces:
-
-* an enriched row-level cluster assignment file;
-* an audit file for all non-unique or unmatched joins;
-* per-cluster match coverage and capacity statistics;
-* fuel/technology/zone/status enrichment tables;
-* behavioral feature profiles and cluster-vs-rest contrasts; and
-* a compact Markdown interpretation report.
-
-Capacity and asset metadata are descriptive variables. Unless they were also
-used in the original clustering feature matrix, they should not be described
-as causes of the cluster assignments.
+Cluster assignments use SCED resource codes.  This script adapts those resources
+to the input expected by :mod:`sced_to_sb_matching`, reuses that module's
+matching engine, and turns the SB-to-SCED result back into cluster-centric
+outputs.  It intentionally does not interpret or describe the clusters.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import re
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 import pandas as pd
 
+import sced_to_sb_matching as sb_matching
+
 
 DEFAULT_CLUSTERS = Path("/Users/pradyrao/Downloads/cluster_assignments.csv")
-DEFAULT_SB_LIST = Path("/Users/pradyrao/Downloads/sb_list.csv")
-DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "hca_cluster_analysis"
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "hca_cluster_matching"
 
 CLUSTER_REQUIRED_COLUMNS = {"resource_name", "cluster_id"}
-SB_REQUIRED_COLUMNS = {"cdr_unit_code", "cdr_capacity_mw"}
-SB_METADATA_COLUMNS = [
+MATCHED_STATUSES = {"matched", "ambiguous"}
+RESOURCE_ATTRIBUTES = [
+    "cdr_fuel",
+    "cdr_technology",
+    "cdr_zone",
+    "cdr_status",
+    "type",
+]
+MIN_GEN_FEATURE = "z_median_min_gen_cost"
+STARTUP_FEATURES = {
+    "hot": "z_median_hot_startup_cost",
+    "inter": "z_median_inter_startup_cost",
+    "cold": "z_median_cold_startup_cost",
+}
+CURVE_FEATURES = [f"z_median_normalized_offer_curve_{point:02d}" for point in range(21)]
+
+MATCH_COLUMNS = [
     "unit_name",
     "cdr_unit_code",
     "cdr_gen_id",
@@ -46,567 +50,475 @@ SB_METADATA_COLUMNS = [
     "cdr_status",
     "county",
     "type",
+    "matched_sced_node",
+    "matched_sced_resource_type",
+    "matched_sced_plant_descriptor",
+    "matched_sced_unit_descriptor",
+    "plant_match_method",
+    "plant_match_score",
+    "unit_assignment_method",
+    "unit_assignment_score",
+    "sb_to_sced_match_method",
+    "sb_to_sced_match_score",
+    "sb_to_sced_match_status",
 ]
-CATEGORY_COLUMNS = ["cdr_fuel", "cdr_technology", "cdr_zone", "cdr_status"]
-
-FEATURE_FAMILIES = {
-    "operating range": (
-        "base_point",
-        "normalized_base_point",
-        "normalized_hsl",
-        "normalized_lsl",
-    ),
-    "offer-price level": (
-        "average_weighted_offer_price",
-        "10th_percentile_offer_price",
-        "90th_percentile_offer_price",
-    ),
-    "offer-price volatility": (
-        "weighted_stdev_offer_price",
-        "normalized_curve_std",
-    ),
-    "scarcity-price behavior": ("fraction_intervals_at_5000",),
-    "commitment economics": (
-        "min_gen_cost",
-        "hot_startup_cost",
-        "cold_startup_cost",
-        "inter_startup_cost",
-    ),
-    "offer-curve shape": ("normalized_offer_curve",),
-}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Join HCA clusters to the SB list and profile each cluster."
+        description="Match SCED-coded HCA cluster assignments to the SB list."
     )
     parser.add_argument("--clusters", type=Path, default=DEFAULT_CLUSTERS)
-    parser.add_argument("--sb-list", type=Path, default=DEFAULT_SB_LIST)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument(
-        "--top-features",
-        type=int,
-        default=8,
-        help="Number of cluster-vs-rest feature contrasts included in the report.",
-    )
     return parser.parse_args()
 
 
-def normalize_text(value: object) -> str:
-    if pd.isna(value):
-        return ""
-    return re.sub(r"\s+", " ", str(value).strip().strip('"').upper())
-
-
-def normalize_code(value: object) -> str:
-    """Normalize harmless separators while preserving the identifier's content."""
-    return re.sub(r"[^A-Z0-9]+", "", normalize_text(value))
-
-
-def load_csv(path: Path, required: set[str]) -> pd.DataFrame:
+def load_csv(path: Path, required_columns: set[str]) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"Input file not found: {path}")
     frame = pd.read_csv(path, low_memory=False)
     frame.columns = [str(column).lstrip("\ufeff").strip() for column in frame.columns]
-    missing = sorted(required - set(frame.columns))
+    missing = sorted(required_columns - set(frame.columns))
     if missing:
         raise ValueError(f"{path} is missing required columns: {missing}")
     return frame
 
 
-def clean_metadata_value(value: object) -> str:
-    return "" if pd.isna(value) else str(value).strip()
+def validate_clusters(clusters: pd.DataFrame) -> None:
+    normalized = clusters["resource_name"].map(sb_matching.normalize_text)
+    if normalized.eq("").any():
+        raise ValueError("cluster_assignments contains blank resource_name values")
+    if normalized.duplicated().any():
+        duplicates = clusters.loc[normalized.duplicated(False), "resource_name"].tolist()
+        raise ValueError(f"Duplicate cluster resource names: {duplicates[:10]}")
 
 
-def canonical_identity(row: pd.Series) -> tuple[str, ...]:
-    """Core CDR identity used to decide whether duplicate SB rows are equivalent."""
-    fields = ["unit_name", "cdr_unit_code", "cdr_gen_id", "cdr_capacity_mw"]
-    return tuple(normalize_text(row.get(field, "")) for field in fields)
+def adapt_clusters_for_matcher(clusters: pd.DataFrame) -> pd.DataFrame:
+    """Build the minimal SCED frame required by the shared matching engine.
+
+    The HCA output has no raw resource type, timestamp, or offer averages.  Blank
+    or missing values are supplied so these unavailable fields cannot influence
+    candidate scoring.  Resource-code, plant-name, and unit-token matching remain
+    active.
+    """
+    return pd.DataFrame(
+        {
+            "Resource Name": clusters["resource_name"],
+            "Resource Type": "",
+            "final_sced_time_stamp": "",
+            "Base Point_avg": pd.NA,
+            "Start Up Cold Offer_avg": pd.NA,
+            "Start Up Hot Offer_avg": pd.NA,
+            "Start Up Inter Offer_avg": pd.NA,
+            "Min Gen Cost_avg": pd.NA,
+        }
+    )
 
 
-def choose_capacity(row: pd.Series) -> float:
-    cdr = pd.to_numeric(row.get("cdr_capacity_mw"), errors="coerce")
-    if pd.notna(cdr):
-        return float(cdr)
-    resolved = pd.to_numeric(row.get("resolved_capacity_mw"), errors="coerce")
-    return float(resolved) if pd.notna(resolved) else np.nan
-
-
-def prepare_sb_lookup(sb: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    prepared = sb.copy()
-    prepared["_code_text"] = prepared["cdr_unit_code"].map(normalize_text)
-    prepared["_code_key"] = prepared["cdr_unit_code"].map(normalize_code)
-    prepared["_capacity_mw"] = prepared.apply(choose_capacity, axis=1)
-    prepared = prepared[prepared["_code_key"] != ""].copy()
-    return {
-        key: group.copy()
-        for key, group in prepared.groupby("_code_key", sort=False, dropna=False)
-    }
-
-
-def resolve_candidate_group(
-    resource_name: str, candidates: pd.DataFrame
-) -> tuple[dict[str, object], list[dict[str, object]]]:
-    exact_text = candidates[
-        candidates["_code_text"] == normalize_text(resource_name)
-    ].copy()
-    considered = exact_text if not exact_text.empty else candidates.copy()
-    method = "exact_code" if not exact_text.empty else "normalized_code"
-
-    identities = considered.apply(canonical_identity, axis=1)
-    unique_identity_count = identities.nunique(dropna=False)
-    capacities = considered["_capacity_mw"].dropna().round(6).unique()
-    equivalent = unique_identity_count == 1 and len(capacities) <= 1
-
-    audit_rows = []
-    for _, candidate in considered.iterrows():
-        audit_rows.append(
-            {
-                "resource_name": resource_name,
-                "candidate_cdr_unit_code": candidate.get("cdr_unit_code", ""),
-                "candidate_unit_name": candidate.get("unit_name", ""),
-                "candidate_cdr_gen_id": candidate.get("cdr_gen_id", ""),
-                "candidate_capacity_mw": candidate.get("_capacity_mw", np.nan),
-                "candidate_cdr_fuel": candidate.get("cdr_fuel", ""),
-                "candidate_cdr_technology": candidate.get("cdr_technology", ""),
-            }
-        )
-
-    if len(considered) == 1:
-        status = "matched"
-    elif equivalent:
-        status = "matched_duplicate_equivalent"
-    else:
-        return (
-            {
-                "capacity_match_status": "ambiguous",
-                "capacity_match_method": method,
-                "capacity_candidate_count": int(len(considered)),
-                "capacity_needs_review": True,
-            },
-            audit_rows,
-        )
-
-    selected = considered.iloc[0]
-    result: dict[str, object] = {
-        "capacity_match_status": status,
-        "capacity_match_method": method,
-        "capacity_candidate_count": int(len(considered)),
-        "capacity_needs_review": False,
-        "matched_cdr_capacity_mw": selected["_capacity_mw"],
-    }
-    for column in SB_METADATA_COLUMNS:
-        if column in selected.index:
-            output_column = f"sb_{column}" if column != "cdr_capacity_mw" else "sb_cdr_capacity_mw"
-            result[output_column] = selected[column]
-    return result, audit_rows if len(considered) > 1 else []
-
-
-def enrich_clusters(
+def run_shared_matcher(
     clusters: pd.DataFrame, sb: pd.DataFrame
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if clusters["resource_name"].map(normalize_text).duplicated().any():
-        duplicates = clusters.loc[
-            clusters["resource_name"].map(normalize_text).duplicated(False),
-            "resource_name",
-        ].tolist()
-        raise ValueError(f"Duplicate resource_name values in cluster file: {duplicates[:10]}")
+    sced_input = adapt_clusters_for_matcher(clusters)
+    sced_prepared = sb_matching.prepare_sced_resource_df(sced_input)
+    sb_filtered = sb_matching.filter_sb_rows_for_matching(sb)
+    return sb_matching.build_sb_matches(sb_filtered, sced_prepared)
 
-    lookup = prepare_sb_lookup(sb)
-    enriched_rows: list[dict[str, object]] = []
-    audit_rows: list[dict[str, object]] = []
 
-    for cluster_record in clusters.to_dict("records"):
-        row = dict(cluster_record)
-        resource_name = clean_metadata_value(cluster_record["resource_name"])
-        candidates = lookup.get(normalize_code(resource_name))
-        if candidates is None:
-            row.update(
-                {
-                    "capacity_match_status": "unmatched",
-                    "capacity_match_method": "none",
-                    "capacity_candidate_count": 0,
-                    "capacity_needs_review": True,
-                    "matched_cdr_capacity_mw": np.nan,
-                }
-            )
-        else:
-            match, candidate_audit = resolve_candidate_group(resource_name, candidates)
-            row.update(match)
-            for audit in candidate_audit:
-                audit["cluster_id"] = cluster_record["cluster_id"]
-                audit["final_match_status"] = match["capacity_match_status"]
-            audit_rows.extend(candidate_audit)
-        enriched_rows.append(row)
-
-    enriched = pd.DataFrame(enriched_rows)
-    audit = pd.DataFrame(audit_rows)
-    unmatched = enriched[enriched["capacity_match_status"] == "unmatched"][
-        ["resource_name", "cluster_id", "capacity_match_status"]
+def accepted_matches(sb_matches: pd.DataFrame, clusters: pd.DataFrame) -> pd.DataFrame:
+    accepted = sb_matches[
+        sb_matches["sb_to_sced_match_status"].isin(MATCHED_STATUSES)
+        & sb_matches["matched_sced_node"].fillna("").astype(str).str.strip().ne("")
     ].copy()
-    if not unmatched.empty:
-        audit = pd.concat([audit, unmatched], ignore_index=True, sort=False)
-    return enriched, audit
 
-
-def matched_mask(frame: pd.DataFrame) -> pd.Series:
-    return frame["capacity_match_status"].isin(
-        ["matched", "matched_duplicate_equivalent"]
+    available_columns = [column for column in MATCH_COLUMNS if column in accepted.columns]
+    accepted = accepted[available_columns]
+    cluster_metadata = clusters[["resource_name", "cluster_id"]].rename(
+        columns={"resource_name": "matched_sced_node"}
     )
+    accepted = cluster_metadata.merge(accepted, on="matched_sced_node", how="inner")
+    accepted["match_rank"] = (
+        accepted.groupby("matched_sced_node")["sb_to_sced_match_score"]
+        .rank(method="first", ascending=False, na_option="bottom")
+        .astype("Int64")
+    )
+    accepted["accepted_match_count"] = accepted.groupby("matched_sced_node")[
+        "matched_sced_node"
+    ].transform("size")
+    return accepted.sort_values(
+        ["cluster_id", "matched_sced_node", "match_rank"], kind="stable"
+    ).reset_index(drop=True)
 
 
-def cluster_coverage(enriched: pd.DataFrame) -> pd.DataFrame:
-    working = enriched.assign(_matched=matched_mask(enriched))
-    summary = (
-        working.groupby("cluster_id", dropna=False)
-        .agg(
-            resource_count=("resource_name", "size"),
-            capacity_matched_count=("_matched", "sum"),
-            capacity_ambiguous_count=(
-                "capacity_match_status",
-                lambda values: int((values == "ambiguous").sum()),
-            ),
-            capacity_unmatched_count=(
-                "capacity_match_status",
-                lambda values: int((values == "unmatched").sum()),
-            ),
+def build_primary_matches(
+    clusters: pd.DataFrame, accepted: pd.DataFrame
+) -> pd.DataFrame:
+    """Amend each cluster row with its primary and complete set of SB matches."""
+    if accepted.empty:
+        primary = pd.DataFrame(columns=["matched_sced_node"])
+        aggregated = pd.DataFrame(columns=["matched_sced_node"])
+    else:
+        primary = accepted[accepted["match_rank"].eq(1)].copy()
+        primary = primary.drop(columns=["cluster_id", "match_rank"], errors="ignore")
+        aggregated = (
+            accepted.groupby("matched_sced_node", sort=False)
+            .agg(
+                matched_sb_unit_names=("unit_name", join_distinct),
+                matched_sb_cdr_unit_codes=("cdr_unit_code", join_distinct),
+                matched_sb_capacities_mw=("cdr_capacity_mw", join_distinct),
+                matched_sb_resolved_capacities_mw=(
+                    "resolved_capacity_mw",
+                    join_distinct,
+                ),
+            )
+            .reset_index()
         )
-        .reset_index()
+
+    output = clusters.merge(
+        primary,
+        left_on="resource_name",
+        right_on="matched_sced_node",
+        how="left",
+        validate="one_to_one",
     )
-    summary["capacity_match_rate"] = (
-        summary["capacity_matched_count"] / summary["resource_count"]
+    output = output.merge(
+        aggregated,
+        on="matched_sced_node",
+        how="left",
+        validate="many_to_one",
     )
+    output["cluster_to_sb_match_status"] = "unmatched"
+    has_match = output["matched_sced_node"].notna()
+    output.loc[has_match, "cluster_to_sb_match_status"] = "matched"
+    multiple = output["accepted_match_count"].fillna(0).gt(1)
+    output.loc[multiple, "cluster_to_sb_match_status"] = "multiple_sb_matches"
+    output["accepted_match_count"] = output["accepted_match_count"].fillna(0).astype(int)
+    return output
+
+
+def join_distinct(values: pd.Series) -> str:
+    """Join distinct nonblank values while preserving their source order."""
+    result: list[str] = []
+    for value in values:
+        if pd.isna(value):
+            continue
+        text = str(value).strip()
+        if text and text not in result:
+            result.append(text)
+    return " | ".join(result)
+
+
+def cluster_population_stats(amended: pd.DataFrame) -> pd.DataFrame:
+    total_resources = len(amended)
+    grouped = amended.groupby("cluster_id", dropna=False)
+    summary = grouped.agg(
+        resource_count=("resource_name", "size"),
+        matched_resource_count=(
+            "cluster_to_sb_match_status",
+            lambda values: int(values.ne("unmatched").sum()),
+        ),
+        unmatched_resource_count=(
+            "cluster_to_sb_match_status",
+            lambda values: int(values.eq("unmatched").sum()),
+        ),
+    ).reset_index()
+    summary["cluster_share"] = summary["resource_count"] / total_resources
+    summary["matched_resource_share"] = (
+        summary["matched_resource_count"] / summary["resource_count"]
+    )
+
+    if "dendrogram_leaf_order" in amended.columns:
+        leaf_order = (
+            grouped["dendrogram_leaf_order"]
+            .agg(dendrogram_leaf_order_min="min", dendrogram_leaf_order_max="max")
+            .reset_index()
+        )
+        summary = summary.merge(leaf_order, on="cluster_id", how="left")
     return summary
 
 
-def capacity_summary(enriched: pd.DataFrame) -> pd.DataFrame:
-    matched = enriched[matched_mask(enriched)].copy()
-    matched["matched_cdr_capacity_mw"] = pd.to_numeric(
-        matched["matched_cdr_capacity_mw"], errors="coerce"
+def cluster_capacity_stats(amended: pd.DataFrame) -> pd.DataFrame:
+    working = amended[["cluster_id", "cdr_capacity_mw"]].copy()
+    working["cdr_capacity_mw"] = pd.to_numeric(
+        working["cdr_capacity_mw"], errors="coerce"
     )
-    summary = (
-        matched.groupby("cluster_id")["matched_cdr_capacity_mw"]
-        .agg(
-            capacity_observation_count="count",
-            capacity_mw_mean="mean",
-            capacity_mw_median="median",
-            capacity_mw_min="min",
-            capacity_mw_max="max",
-            capacity_mw_total="sum",
-        )
-        .reset_index()
-    )
+    grouped = working.groupby("cluster_id", dropna=False)["cdr_capacity_mw"]
+    summary = grouped.agg(
+        capacity_observation_count="count",
+        capacity_mean_mw="mean",
+        capacity_median_mw="median",
+        capacity_std_mw="std",
+        capacity_min_mw="min",
+        capacity_max_mw="max",
+        capacity_total_mw="sum",
+    ).reset_index()
     quartiles = (
-        matched.groupby("cluster_id")["matched_cdr_capacity_mw"]
-        .quantile([0.25, 0.75])
+        grouped.quantile([0.25, 0.75])
         .unstack()
-        .rename(columns={0.25: "capacity_mw_q1", 0.75: "capacity_mw_q3"})
+        .rename(columns={0.25: "capacity_q1_mw", 0.75: "capacity_q3_mw"})
         .reset_index()
     )
     return summary.merge(quartiles, on="cluster_id", how="left")
 
 
-def feature_columns(frame: pd.DataFrame) -> list[str]:
-    columns = [column for column in frame.columns if column.startswith("z_")]
-    if not columns:
-        raise ValueError("No standardized clustering feature columns beginning with 'z_'")
-    return columns
+def normalized_category(values: pd.Series) -> pd.Series:
+    normalized = values.fillna("UNKNOWN").astype(str).str.strip()
+    return normalized.mask(normalized.eq(""), "UNKNOWN")
 
 
-def feature_profiles(
-    enriched: pd.DataFrame, features: list[str]
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    numeric = enriched[features].apply(pd.to_numeric, errors="coerce")
-    working = pd.concat([enriched[["cluster_id"]], numeric], axis=1)
-
-    profile_rows: list[dict[str, object]] = []
-    for cluster_id, group in working.groupby("cluster_id", dropna=False):
-        for feature in features:
-            values = group[feature]
-            profile_rows.append(
-                {
-                    "cluster_id": cluster_id,
-                    "feature": feature,
-                    "mean": values.mean(),
-                    "median": values.median(),
-                    "std": values.std(),
-                    "count": int(values.count()),
-                }
-            )
-    profiles = pd.DataFrame(profile_rows)
-
-    contrasts: list[dict[str, object]] = []
-    for cluster_id, group in working.groupby("cluster_id", dropna=False):
-        outside = working[working["cluster_id"] != cluster_id]
-        for feature in features:
-            cluster_median = group[feature].median()
-            outside_median = outside[feature].median()
-            contrast = cluster_median - outside_median
-            contrasts.append(
-                {
-                    "cluster_id": cluster_id,
-                    "feature": feature,
-                    "cluster_median": cluster_median,
-                    "outside_cluster_median": outside_median,
-                    "median_contrast": contrast,
-                    "absolute_median_contrast": abs(contrast),
-                    "feature_family": classify_feature(feature),
-                }
-            )
-    contrast_frame = pd.DataFrame(contrasts).sort_values(
-        ["cluster_id", "absolute_median_contrast"],
-        ascending=[True, False],
-    )
-    return profiles, contrast_frame
-
-
-def classify_feature(feature: str) -> str:
-    normalized = feature[2:] if feature.startswith("z_") else feature
-    for family, tokens in FEATURE_FAMILIES.items():
-        if any(token in normalized for token in tokens):
-            return family
-    return "other"
-
-
-def category_enrichment(
-    enriched: pd.DataFrame, category_columns: Iterable[str]
-) -> pd.DataFrame:
-    matched = enriched[matched_mask(enriched)].copy()
+def cluster_resource_distribution(amended: pd.DataFrame) -> pd.DataFrame:
+    """Return complete matched-resource distributions for SB attributes."""
+    matched = amended[amended["cluster_to_sb_match_status"].ne("unmatched")].copy()
     rows: list[dict[str, object]] = []
-    for column in category_columns:
-        sb_column = f"sb_{column}"
-        if sb_column not in matched.columns:
+    for attribute in RESOURCE_ATTRIBUTES:
+        if attribute not in matched.columns:
             continue
-        values = matched[sb_column].fillna("UNKNOWN").astype(str).str.strip()
-        values = values.mask(values == "", "UNKNOWN")
-        overall = values.value_counts(normalize=True)
-        for cluster_id, indexes in matched.groupby("cluster_id").groups.items():
-            cluster_values = values.loc[indexes]
-            counts = cluster_values.value_counts()
-            for category, count in counts.items():
-                cluster_share = count / len(cluster_values)
-                overall_share = float(overall.get(category, 0))
-                rows.append(
-                    {
-                        "cluster_id": cluster_id,
-                        "attribute": column,
-                        "category": category,
-                        "resource_count": int(count),
-                        "cluster_share": cluster_share,
-                        "overall_share": overall_share,
-                        "enrichment_ratio": (
-                            cluster_share / overall_share if overall_share else np.nan
-                        ),
-                    }
-                )
-    return pd.DataFrame(rows).sort_values(
-        ["cluster_id", "attribute", "enrichment_ratio"],
-        ascending=[True, True, False],
+        values = normalized_category(matched[attribute])
+        attribute_frame = matched[["cluster_id"]].copy()
+        attribute_frame["category"] = values
+        counts = (
+            attribute_frame.groupby(["cluster_id", "category"], dropna=False)
+            .size()
+            .rename("resource_count")
+            .reset_index()
+        )
+        totals = counts.groupby("cluster_id")["resource_count"].transform("sum")
+        counts["matched_cluster_share"] = counts["resource_count"] / totals
+        counts["attribute"] = attribute
+        rows.extend(counts.to_dict("records"))
+    columns = [
+        "cluster_id",
+        "attribute",
+        "category",
+        "resource_count",
+        "matched_cluster_share",
+    ]
+    return pd.DataFrame(rows, columns=columns).sort_values(
+        ["cluster_id", "attribute", "resource_count", "category"],
+        ascending=[True, True, False, True],
+        kind="stable",
     )
 
 
-def fmt_number(value: object, digits: int = 2) -> str:
-    return "n/a" if pd.isna(value) else f"{float(value):,.{digits}f}"
-
-
-def humanize_feature(feature: str) -> str:
-    normalized = feature[2:] if feature.startswith("z_") else feature
-    return normalized.replace("_", " ")
-
-
-def direction(value: float) -> str:
-    return "higher" if value > 0 else "lower"
-
-
-def write_report(
-    output_path: Path,
-    enriched: pd.DataFrame,
-    coverage: pd.DataFrame,
-    capacities: pd.DataFrame,
-    contrasts: pd.DataFrame,
-    enrichments: pd.DataFrame,
-    top_features: int,
-) -> None:
-    capacity_lookup = capacities.set_index("cluster_id").to_dict("index")
-    lines = [
-        "# HCA cluster interpretation",
-        "",
-        (
-            "Behavioral `z_` features explain why resources were grouped. Capacity, "
-            "fuel, technology, zone, and status describe which assets landed in each "
-            "group; they are not treated as clustering causes."
-        ),
-        "",
-        "## Join quality",
-        "",
-        (
-            f"- Clustered resources: {len(enriched):,}; confidently capacity-matched: "
-            f"{int(matched_mask(enriched).sum()):,} "
-            f"({matched_mask(enriched).mean():.1%})."
-        ),
-        (
-            "- Capacity totals can double-count physical equipment when multiple SCED "
-            "configurations refer to the same plant equipment."
-        ),
-        "",
-    ]
-
-    for _, cov in coverage.sort_values("cluster_id").iterrows():
-        cluster_id = cov["cluster_id"]
-        cluster_contrasts = contrasts[contrasts["cluster_id"] == cluster_id].head(
-            top_features
+def dominant_resource_stats(distribution: pd.DataFrame) -> pd.DataFrame:
+    """Pivot the most common value and its share for every SB attribute."""
+    if distribution.empty:
+        return pd.DataFrame(columns=["cluster_id"])
+    dominant = (
+        distribution.sort_values(
+            ["cluster_id", "attribute", "resource_count", "category"],
+            ascending=[True, True, False, True],
+            kind="stable",
         )
-        cap = capacity_lookup.get(cluster_id, {})
-        lines.extend(
-            [
-                f"## Cluster {cluster_id}",
-                "",
-                (
-                    f"{int(cov['resource_count']):,} resources; "
-                    f"{int(cov['capacity_matched_count']):,} confidently matched "
-                    f"({cov['capacity_match_rate']:.1%}), "
-                    f"{int(cov['capacity_ambiguous_count']):,} ambiguous, and "
-                    f"{int(cov['capacity_unmatched_count']):,} unmatched."
-                ),
-                "",
-            ]
+        .groupby(["cluster_id", "attribute"], as_index=False)
+        .first()
+    )
+    rows: list[dict[str, object]] = []
+    for cluster_id, group in dominant.groupby("cluster_id", dropna=False):
+        row: dict[str, object] = {"cluster_id": cluster_id}
+        for _, item in group.iterrows():
+            attribute = item["attribute"]
+            row[f"dominant_{attribute}"] = item["category"]
+            row[f"dominant_{attribute}_count"] = item["resource_count"]
+            row[f"dominant_{attribute}_share"] = item["matched_cluster_share"]
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def safe_column_token(value: object) -> str:
+    token = re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower()).strip("_")
+    return token or "unknown"
+
+
+def wide_resource_stats(distribution: pd.DataFrame) -> pd.DataFrame:
+    """Put every resource category count and share on the cluster summary row."""
+    if distribution.empty:
+        return pd.DataFrame(columns=["cluster_id"])
+    rows: list[dict[str, object]] = []
+    for cluster_id, group in distribution.groupby("cluster_id", dropna=False):
+        row: dict[str, object] = {"cluster_id": cluster_id}
+        used_names: set[str] = set()
+        for _, item in group.iterrows():
+            prefix = safe_column_token(item["attribute"])
+            category = safe_column_token(item["category"])
+            base_name = f"{prefix}_{category}"
+            if base_name in used_names:
+                raise ValueError(
+                    "Resource categories produce duplicate summary columns: "
+                    f"{item['attribute']}={item['category']}"
+                )
+            used_names.add(base_name)
+            row[f"{base_name}_count"] = item["resource_count"]
+            row[f"{base_name}_share"] = item["matched_cluster_share"]
+        rows.append(row)
+    return pd.DataFrame(rows).fillna(0)
+
+
+def validate_feature_columns(amended: pd.DataFrame) -> None:
+    required = {MIN_GEN_FEATURE, *STARTUP_FEATURES.values(), *CURVE_FEATURES}
+    missing = sorted(required - set(amended.columns))
+    if missing:
+        raise ValueError(f"Cluster assignments are missing feature columns: {missing}")
+
+
+def rms(values: np.ndarray) -> float:
+    finite = values[np.isfinite(values)]
+    return float(np.sqrt(np.mean(np.square(finite)))) if finite.size else np.nan
+
+
+def residual_rms(values: np.ndarray, centroid: np.ndarray) -> float:
+    residuals = values - centroid
+    return rms(residuals)
+
+
+def resource_distances(values: np.ndarray, centroid: np.ndarray) -> np.ndarray:
+    """Normalized Euclidean distance from each resource to a family centroid."""
+    distances = []
+    for row in values:
+        valid = np.isfinite(row) & np.isfinite(centroid)
+        if not valid.any():
+            distances.append(np.nan)
+        else:
+            distances.append(float(np.sqrt(np.mean(np.square(row[valid] - centroid[valid])))))
+    return np.asarray(distances, dtype=float)
+
+
+def cluster_feature_stats(amended: pd.DataFrame) -> pd.DataFrame:
+    validate_feature_columns(amended)
+    rows: list[dict[str, object]] = []
+
+    for cluster_id, group in amended.groupby("cluster_id", dropna=False):
+        row: dict[str, object] = {"cluster_id": cluster_id}
+
+        min_gen = pd.to_numeric(group[MIN_GEN_FEATURE], errors="coerce")
+        row["min_gen_valid_count"] = int(min_gen.count())
+        row["min_gen_centroid"] = min_gen.mean()
+        row["min_gen_dispersion"] = min_gen.std(ddof=1)
+
+        startup = group[list(STARTUP_FEATURES.values())].apply(
+            pd.to_numeric, errors="coerce"
         )
-        if cap:
-            lines.append(
-                "Matched-resource capacity: median "
-                f"{fmt_number(cap.get('capacity_mw_median'))} MW "
-                f"(IQR {fmt_number(cap.get('capacity_mw_q1'))}–"
-                f"{fmt_number(cap.get('capacity_mw_q3'))} MW)."
-            )
-            lines.append("")
+        startup_values = startup.to_numpy(dtype=float)
+        startup_centroid = np.nanmean(startup_values, axis=0)
+        for index, label in enumerate(STARTUP_FEATURES):
+            row[f"{label}_startup_centroid"] = startup_centroid[index]
+        row["startup_valid_resource_count"] = int(
+            np.isfinite(startup_values).any(axis=1).sum()
+        )
+        row["startup_level"] = float(np.nanmean(startup_centroid))
+        row["startup_distinctiveness"] = rms(startup_centroid)
+        row["startup_dispersion"] = residual_rms(
+            startup_values, startup_centroid
+        )
 
-        lines.append("Strongest behavioral contrasts against all other clusters:")
-        lines.append("")
-        for _, item in cluster_contrasts.iterrows():
-            lines.append(
-                f"- {humanize_feature(item['feature'])}: "
-                f"{direction(item['median_contrast'])} by "
-                f"{abs(item['median_contrast']):.2f} standardized units "
-                f"({item['feature_family']})."
-            )
+        curve = group[CURVE_FEATURES].apply(pd.to_numeric, errors="coerce")
+        curve_values = curve.to_numpy(dtype=float)
+        curve_centroid = np.nanmean(curve_values, axis=0)
+        for point, value in enumerate(curve_centroid):
+            row[f"curve_centroid_{point:02d}"] = value
 
-        if not enrichments.empty:
-            distinctive = enrichments[
-                (enrichments["cluster_id"] == cluster_id)
-                & (enrichments["resource_count"] >= 2)
-                & (enrichments["cluster_share"] >= 0.10)
-                & (enrichments["enrichment_ratio"] > 1.0)
-            ].nlargest(5, "enrichment_ratio")
-            if not distinctive.empty:
-                lines.extend(["", "Overrepresented matched-resource metadata:", ""])
-                for _, item in distinctive.iterrows():
-                    lines.append(
-                        f"- {item['attribute']} = {item['category']}: "
-                        f"{item['cluster_share']:.1%} of matched cluster resources, "
-                        f"{item['enrichment_ratio']:.2f}× the matched fleet share."
-                    )
-        if cov["capacity_match_rate"] < 0.70:
-            lines.extend(
-                [
-                    "",
-                    (
-                        "Capacity and asset-composition conclusions are provisional "
-                        "because fewer than 70% of this cluster's resources matched."
-                    ),
-                ]
-            )
-        if int(cov["resource_count"]) < 5:
-            lines.extend(
-                [
-                    "",
-                    (
-                        "This is a very small cluster and should be interpreted as an "
-                        "outlier group rather than a broad fleet archetype."
-                    ),
-                ]
-            )
-        lines.append("")
+        curve_distances = resource_distances(curve_values, curve_centroid)
+        valid_distances = curve_distances[np.isfinite(curve_distances)]
+        row["curve_valid_resource_count"] = int(len(valid_distances))
+        row["curve_level"] = float(np.nanmean(curve_centroid))
+        row["curve_distinctiveness"] = rms(curve_centroid)
+        row["curve_dispersion"] = (
+            float(np.mean(valid_distances)) if valid_distances.size else np.nan
+        )
+        row["curve_dispersion_stdev"] = (
+            float(np.std(valid_distances, ddof=1))
+            if valid_distances.size > 1
+            else np.nan
+        )
+        row["curve_start"] = curve_centroid[0]
+        row["curve_middle"] = curve_centroid[10]
+        row["curve_end"] = curve_centroid[20]
+        row["curve_slope"] = curve_centroid[20] - curve_centroid[0]
+        row["curve_upper_end_slope"] = curve_centroid[20] - curve_centroid[15]
+        if np.isfinite(curve_centroid).any():
+            peak_position = int(np.nanargmax(np.abs(curve_centroid)))
+            row["curve_peak"] = abs(curve_centroid[peak_position])
+            row["curve_peak_value"] = curve_centroid[peak_position]
+            row["curve_peak_position"] = peak_position
+        else:
+            row["curve_peak"] = np.nan
+            row["curve_peak_value"] = np.nan
+            row["curve_peak_position"] = pd.NA
+        rows.append(row)
 
-    output_path.write_text("\n".join(lines), encoding="utf-8")
+    return pd.DataFrame(rows)
 
 
-def write_outputs(
+def build_cluster_summary(amended: pd.DataFrame) -> pd.DataFrame:
+    population = cluster_population_stats(amended)
+    capacity = cluster_capacity_stats(amended)
+    distribution = cluster_resource_distribution(amended)
+    dominant = dominant_resource_stats(distribution)
+    resource_stats = wide_resource_stats(distribution)
+    feature_stats = cluster_feature_stats(amended)
+    summary = population.merge(capacity, on="cluster_id", how="left")
+    summary = summary.merge(dominant, on="cluster_id", how="left")
+    summary = summary.merge(resource_stats, on="cluster_id", how="left")
+    summary = summary.merge(feature_stats, on="cluster_id", how="left")
+    return summary.sort_values("cluster_id")
+
+
+def filter_candidate_audit(
+    candidates: pd.DataFrame, clusters: pd.DataFrame
+) -> pd.DataFrame:
+    if candidates.empty or "matched_sced_node" not in candidates.columns:
+        return candidates.copy()
+    cluster_names = set(clusters["resource_name"].astype(str))
+    return candidates[
+        candidates["matched_sced_node"].astype(str).isin(cluster_names)
+    ].sort_values(
+        ["matched_sced_node", "sb_to_sced_match_score"],
+        ascending=[True, False],
+        kind="stable",
+    )
+
+
+def save_outputs(
     output_dir: Path,
-    enriched: pd.DataFrame,
-    audit: pd.DataFrame,
-    top_features: int,
+    primary: pd.DataFrame,
+    accepted: pd.DataFrame,
+    candidates: pd.DataFrame,
 ) -> dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    features = feature_columns(enriched)
-    coverage = cluster_coverage(enriched)
-    capacities = capacity_summary(enriched)
-    profiles, contrasts = feature_profiles(enriched, features)
-    enrichments = category_enrichment(enriched, CATEGORY_COLUMNS)
-
-    outputs = {
-        "enriched": output_dir / "cluster_assignments_enriched.csv",
-        "match_audit": output_dir / "capacity_match_audit.csv",
-        "coverage": output_dir / "cluster_match_coverage.csv",
-        "capacity": output_dir / "cluster_capacity_summary.csv",
-        "feature_profiles": output_dir / "cluster_feature_profiles.csv",
-        "feature_contrasts": output_dir / "cluster_feature_contrasts.csv",
-        "metadata_enrichment": output_dir / "cluster_metadata_enrichment.csv",
-        "report": output_dir / "cluster_interpretation.md",
-        "run_summary": output_dir / "run_summary.json",
+    cluster_summary = build_cluster_summary(primary)
+    paths = {
+        "amended_clusters": output_dir / "cluster_assignments_with_sb_matches.csv",
+        "cluster_summary": output_dir / "cluster_summary.csv",
+        "all_accepted_matches": output_dir / "cluster_to_sb_all_accepted_matches.csv",
+        "candidate_audit": output_dir / "cluster_to_sb_candidate_audit.csv",
     }
-    enriched.to_csv(outputs["enriched"], index=False)
-    audit.to_csv(outputs["match_audit"], index=False)
-    coverage.to_csv(outputs["coverage"], index=False)
-    capacities.to_csv(outputs["capacity"], index=False)
-    profiles.to_csv(outputs["feature_profiles"], index=False)
-    contrasts.to_csv(outputs["feature_contrasts"], index=False)
-    enrichments.to_csv(outputs["metadata_enrichment"], index=False)
-    write_report(
-        outputs["report"],
-        enriched,
-        coverage,
-        capacities,
-        contrasts,
-        enrichments,
-        top_features,
-    )
-
-    summary = {
-        "clustered_resources": int(len(enriched)),
-        "confident_matches": int(matched_mask(enriched).sum()),
-        "ambiguous_matches": int(
-            (enriched["capacity_match_status"] == "ambiguous").sum()
-        ),
-        "unmatched_resources": int(
-            (enriched["capacity_match_status"] == "unmatched").sum()
-        ),
-        "overall_match_rate": float(matched_mask(enriched).mean()),
-        "cluster_count": int(enriched["cluster_id"].nunique(dropna=False)),
-        "feature_count": len(features),
-    }
-    outputs["run_summary"].write_text(
-        json.dumps(summary, indent=2), encoding="utf-8"
-    )
-    return outputs
+    primary.to_csv(paths["amended_clusters"], index=False)
+    cluster_summary.to_csv(paths["cluster_summary"], index=False)
+    accepted.to_csv(paths["all_accepted_matches"], index=False)
+    candidates.to_csv(paths["candidate_audit"], index=False)
+    return paths
 
 
 def main() -> None:
     args = parse_args()
     clusters = load_csv(args.clusters.expanduser(), CLUSTER_REQUIRED_COLUMNS)
-    sb = load_csv(args.sb_list.expanduser(), SB_REQUIRED_COLUMNS)
-    enriched, audit = enrich_clusters(clusters, sb)
-    outputs = write_outputs(
-        args.output_dir.expanduser(), enriched, audit, args.top_features
-    )
+    validate_clusters(clusters)
+    sb_path = Path(sb_matching.SB_LIST_PATH).expanduser()
+    sb = load_csv(sb_path, set(sb_matching.SB_REQUIRED_COLUMNS))
 
-    print(f"Loaded {len(clusters):,} clustered resources and {len(sb):,} SB rows.")
-    print(
-        f"Confident capacity matches: {matched_mask(enriched).sum():,}/"
-        f"{len(enriched):,} ({matched_mask(enriched).mean():.1%})."
-    )
-    print(f"Wrote analysis outputs to {args.output_dir.expanduser().resolve()}:")
-    for name, path in outputs.items():
-        print(f"  {name}: {path.resolve()}")
+    sb_matches, candidate_rows = run_shared_matcher(clusters, sb)
+    accepted = accepted_matches(sb_matches, clusters)
+    primary = build_primary_matches(clusters, accepted)
+    candidates = filter_candidate_audit(candidate_rows, clusters)
+    paths = save_outputs(args.output_dir.expanduser(), primary, accepted, candidates)
+
+    matched = primary["cluster_to_sb_match_status"].ne("unmatched")
+    multiple = primary["cluster_to_sb_match_status"].eq("multiple_sb_matches")
+    print(f"Loaded {len(clusters):,} clustered SCED resources and {len(sb):,} SB rows.")
+    print(f"Matched {matched.sum():,}/{len(primary):,} cluster resources ({matched.mean():.1%}).")
+    print(f"Resources with multiple accepted SB rows: {multiple.sum():,}.")
+    print(f"Wrote matching outputs to {args.output_dir.expanduser().resolve()}:")
+    for label, path in paths.items():
+        print(f"  {label}: {path.resolve()}")
 
 
 if __name__ == "__main__":

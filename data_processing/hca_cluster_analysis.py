@@ -19,6 +19,7 @@ import sced_to_sb_matching as sb_matching
 
 
 DEFAULT_CLUSTERS = Path("/Users/pradyrao/Downloads/cluster_assignments.csv")
+DEFAULT_FEATURE_TABLE = Path("/Users/pradyrao/Downloads/feature_table.csv")
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "hca_cluster_matching"
 
 CLUSTER_REQUIRED_COLUMNS = {"resource_name", "cluster_id"}
@@ -37,6 +38,16 @@ STARTUP_FEATURES = {
     "cold": "z_median_cold_startup_cost",
 }
 CURVE_FEATURES = [f"z_median_normalized_offer_curve_{point:02d}" for point in range(21)]
+RAW_COST_FEATURES = [
+    "median_min_gen_cost",
+    "median_hot_startup_cost",
+    "median_inter_startup_cost",
+    "median_cold_startup_cost",
+]
+RAW_CURVE_FEATURES = [
+    f"median_normalized_offer_curve_{point:02d}" for point in range(21)
+]
+RAW_FEATURES = RAW_COST_FEATURES + RAW_CURVE_FEATURES
 
 MATCH_COLUMNS = [
     "unit_name",
@@ -69,6 +80,7 @@ def parse_args() -> argparse.Namespace:
         description="Match SCED-coded HCA cluster assignments to the SB list."
     )
     parser.add_argument("--clusters", type=Path, default=DEFAULT_CLUSTERS)
+    parser.add_argument("--feature-table", type=Path, default=DEFAULT_FEATURE_TABLE)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     return parser.parse_args()
 
@@ -435,17 +447,77 @@ def cluster_feature_stats(amended: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def build_cluster_summary(amended: pd.DataFrame) -> pd.DataFrame:
+def raw_feature_stats(
+    amended: pd.DataFrame, feature_table: pd.DataFrame
+) -> pd.DataFrame:
+    """Summarize selected original-scale features within each cluster."""
+    required = {"resource_name", *RAW_FEATURES}
+    missing = sorted(required - set(feature_table.columns))
+    if missing:
+        raise ValueError(f"Feature table is missing required columns: {missing}")
+
+    prepared = feature_table[["resource_name", *RAW_FEATURES]].copy()
+    prepared["_resource_key"] = prepared["resource_name"].map(
+        sb_matching.normalize_text
+    )
+    if prepared["_resource_key"].eq("").any():
+        raise ValueError("Feature table contains blank resource_name values")
+    if prepared["_resource_key"].duplicated().any():
+        duplicates = prepared.loc[
+            prepared["_resource_key"].duplicated(False), "resource_name"
+        ].tolist()
+        raise ValueError(f"Duplicate feature-table resource names: {duplicates[:10]}")
+
+    cluster_keys = amended[["resource_name", "cluster_id"]].copy()
+    cluster_keys["_resource_key"] = cluster_keys["resource_name"].map(
+        sb_matching.normalize_text
+    )
+    working = cluster_keys[["cluster_id", "_resource_key"]].merge(
+        prepared.drop(columns="resource_name"),
+        on="_resource_key",
+        how="left",
+        validate="one_to_one",
+        indicator=True,
+    )
+    unmatched = working.loc[working["_merge"].ne("both"), "_resource_key"].tolist()
+    if unmatched:
+        raise ValueError(
+            f"Feature table did not match {len(unmatched)} cluster resources: "
+            f"{unmatched[:10]}"
+        )
+
+    rows: list[dict[str, object]] = []
+    for cluster_id, group in working.groupby("cluster_id", dropna=False):
+        row: dict[str, object] = {"cluster_id": cluster_id}
+        for feature in RAW_FEATURES:
+            values = pd.to_numeric(group[feature], errors="coerce")
+            prefix = f"raw_{feature}"
+            row[f"{prefix}_mean"] = values.mean()
+            row[f"{prefix}_median"] = values.median()
+            row[f"{prefix}_stdev"] = values.std(ddof=1)
+            row[f"{prefix}_min"] = values.min()
+            row[f"{prefix}_max"] = values.max()
+            row[f"{prefix}_q1"] = values.quantile(0.25)
+            row[f"{prefix}_q3"] = values.quantile(0.75)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_cluster_summary(
+    amended: pd.DataFrame, feature_table: pd.DataFrame
+) -> pd.DataFrame:
     population = cluster_population_stats(amended)
     capacity = cluster_capacity_stats(amended)
     distribution = cluster_resource_distribution(amended)
     dominant = dominant_resource_stats(distribution)
     resource_stats = wide_resource_stats(distribution)
     feature_stats = cluster_feature_stats(amended)
+    original_scale_stats = raw_feature_stats(amended, feature_table)
     summary = population.merge(capacity, on="cluster_id", how="left")
     summary = summary.merge(dominant, on="cluster_id", how="left")
     summary = summary.merge(resource_stats, on="cluster_id", how="left")
     summary = summary.merge(feature_stats, on="cluster_id", how="left")
+    summary = summary.merge(original_scale_stats, on="cluster_id", how="left")
     return summary.sort_values("cluster_id")
 
 
@@ -469,9 +541,10 @@ def save_outputs(
     primary: pd.DataFrame,
     accepted: pd.DataFrame,
     candidates: pd.DataFrame,
+    feature_table: pd.DataFrame,
 ) -> dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    cluster_summary = build_cluster_summary(primary)
+    cluster_summary = build_cluster_summary(primary, feature_table)
     paths = {
         "amended_clusters": output_dir / "cluster_assignments_with_sb_matches.csv",
         "cluster_summary": output_dir / "cluster_summary.csv",
@@ -489,6 +562,9 @@ def main() -> None:
     args = parse_args()
     clusters = load_csv(args.clusters.expanduser(), CLUSTER_REQUIRED_COLUMNS)
     validate_clusters(clusters)
+    feature_table = load_csv(
+        args.feature_table.expanduser(), {"resource_name", *RAW_FEATURES}
+    )
     sb_path = Path(sb_matching.SB_LIST_PATH).expanduser()
     sb = load_csv(sb_path, set(sb_matching.SB_REQUIRED_COLUMNS))
 
@@ -496,7 +572,13 @@ def main() -> None:
     accepted = accepted_matches(sb_matches, clusters)
     primary = build_primary_matches(clusters, accepted)
     candidates = filter_candidate_audit(candidate_rows, clusters)
-    paths = save_outputs(args.output_dir.expanduser(), primary, accepted, candidates)
+    paths = save_outputs(
+        args.output_dir.expanduser(),
+        primary,
+        accepted,
+        candidates,
+        feature_table,
+    )
 
     matched = primary["cluster_to_sb_match_status"].ne("unmatched")
     multiple = primary["cluster_to_sb_match_status"].eq("multiple_sb_matches")

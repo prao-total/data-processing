@@ -47,6 +47,9 @@ RAW_COST_FEATURES = [
 RAW_CURVE_FEATURES = [
     f"median_normalized_offer_curve_{point:02d}" for point in range(21)
 ]
+RAW_CURVE_STD_FEATURES = [
+    f"median_normalized_curve_std_{point:02d}" for point in range(21)
+]
 RAW_FEATURES = RAW_COST_FEATURES + RAW_CURVE_FEATURES
 
 MATCH_COLUMNS = [
@@ -521,8 +524,39 @@ def build_cluster_summary(
     return summary.sort_values("cluster_id")
 
 
-def save_median_curve_plot(cluster_summary: pd.DataFrame, path: Path) -> None:
-    """Plot each cluster's raw median offer curve with +/- one stdev bars."""
+def cluster_curve_error_bars(
+    amended: pd.DataFrame, feature_table: pd.DataFrame
+) -> pd.DataFrame:
+    """Median feature-table curve stdev at each point for every cluster."""
+    prepared = feature_table[["resource_name", *RAW_CURVE_STD_FEATURES]].copy()
+    prepared["_resource_key"] = prepared["resource_name"].map(
+        sb_matching.normalize_text
+    )
+    cluster_keys = amended[["resource_name", "cluster_id"]].copy()
+    cluster_keys["_resource_key"] = cluster_keys["resource_name"].map(
+        sb_matching.normalize_text
+    )
+    working = cluster_keys[["cluster_id", "_resource_key"]].merge(
+        prepared.drop(columns="resource_name"),
+        on="_resource_key",
+        how="left",
+        validate="one_to_one",
+    )
+    for feature in RAW_CURVE_STD_FEATURES:
+        working[feature] = pd.to_numeric(working[feature], errors="coerce")
+    return (
+        working.groupby("cluster_id", dropna=False)[RAW_CURVE_STD_FEATURES]
+        .median()
+        .reset_index()
+    )
+
+
+def save_median_curve_plot(
+    cluster_summary: pd.DataFrame,
+    curve_error_bars: pd.DataFrame,
+    path: Path,
+) -> None:
+    """Plot raw median curves with median feature-table curve-stdev bars."""
     if sb_matching.plt is None:
         raise RuntimeError("matplotlib is required to create the median curve plot")
 
@@ -533,6 +567,9 @@ def save_median_curve_plot(cluster_summary: pd.DataFrame, path: Path) -> None:
     for color_index, (_, cluster) in enumerate(
         cluster_summary.sort_values("cluster_id").iterrows()
     ):
+        error_row = curve_error_bars[
+            curve_error_bars["cluster_id"].eq(cluster["cluster_id"])
+        ].iloc[0]
         medians = np.asarray(
             [
                 cluster[f"raw_median_normalized_offer_curve_{point:02d}_median"]
@@ -542,7 +579,7 @@ def save_median_curve_plot(cluster_summary: pd.DataFrame, path: Path) -> None:
         )
         standard_deviations = np.asarray(
             [
-                cluster[f"raw_median_normalized_offer_curve_{point:02d}_stdev"]
+                error_row[f"median_normalized_curve_std_{point:02d}"]
                 for point in curve_points
             ],
             dtype=float,
@@ -562,7 +599,10 @@ def save_median_curve_plot(cluster_summary: pd.DataFrame, path: Path) -> None:
         )
 
     axis.axhline(0, color="#555555", linewidth=0.8, alpha=0.6)
-    axis.set_title("Median Offer Curve by Cluster (Error Bars = +/- 1 Stdev)")
+    axis.set_title(
+        "Median Offer Curve by Cluster "
+        "(Error Bars = Median Feature-Table Curve Stdev)"
+    )
     axis.set_xlabel("Normalized offer-curve point")
     axis.set_ylabel("Offer price")
     axis.set_xticks(curve_points)
@@ -597,6 +637,7 @@ def save_outputs(
 ) -> dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     cluster_summary = build_cluster_summary(primary, feature_table)
+    curve_error_bars = cluster_curve_error_bars(primary, feature_table)
     paths = {
         "amended_clusters": output_dir / "cluster_assignments_with_sb_matches.csv",
         "cluster_summary": output_dir / "cluster_summary.csv",
@@ -606,7 +647,9 @@ def save_outputs(
     }
     primary.to_csv(paths["amended_clusters"], index=False)
     cluster_summary.to_csv(paths["cluster_summary"], index=False)
-    save_median_curve_plot(cluster_summary, paths["median_curve_plot"])
+    save_median_curve_plot(
+        cluster_summary, curve_error_bars, paths["median_curve_plot"]
+    )
     accepted.to_csv(paths["all_accepted_matches"], index=False)
     candidates.to_csv(paths["candidate_audit"], index=False)
     return paths
@@ -617,7 +660,8 @@ def main() -> None:
     clusters = load_csv(args.clusters.expanduser(), CLUSTER_REQUIRED_COLUMNS)
     validate_clusters(clusters)
     feature_table = load_csv(
-        args.feature_table.expanduser(), {"resource_name", *RAW_FEATURES}
+        args.feature_table.expanduser(),
+        {"resource_name", *RAW_FEATURES, *RAW_CURVE_STD_FEATURES},
     )
     sb_path = Path(sb_matching.SB_LIST_PATH).expanduser()
     sb = load_csv(sb_path, set(sb_matching.SB_REQUIRED_COLUMNS))

@@ -521,6 +521,58 @@ def build_cluster_summary(
     return summary.sort_values("cluster_id")
 
 
+def save_median_curve_plot(cluster_summary: pd.DataFrame, path: Path) -> None:
+    """Plot each cluster's raw median offer curve with +/- one stdev bars."""
+    if sb_matching.plt is None:
+        raise RuntimeError("matplotlib is required to create the median curve plot")
+
+    figure, axis = sb_matching.plt.subplots(figsize=(14, 8))
+    curve_points = np.arange(21)
+    colors = sb_matching.plt.get_cmap("tab10")
+
+    for color_index, (_, cluster) in enumerate(
+        cluster_summary.sort_values("cluster_id").iterrows()
+    ):
+        medians = np.asarray(
+            [
+                cluster[f"raw_median_normalized_offer_curve_{point:02d}_median"]
+                for point in curve_points
+            ],
+            dtype=float,
+        )
+        standard_deviations = np.asarray(
+            [
+                cluster[f"raw_median_normalized_offer_curve_{point:02d}_stdev"]
+                for point in curve_points
+            ],
+            dtype=float,
+        )
+        axis.errorbar(
+            curve_points,
+            medians,
+            yerr=standard_deviations,
+            label=f"Cluster {cluster['cluster_id']:g}",
+            color=colors(color_index % 10),
+            linewidth=2,
+            marker="o",
+            markersize=4,
+            elinewidth=1,
+            capsize=2,
+            alpha=0.85,
+        )
+
+    axis.axhline(0, color="#555555", linewidth=0.8, alpha=0.6)
+    axis.set_title("Median Offer Curve by Cluster (Error Bars = +/- 1 Stdev)")
+    axis.set_xlabel("Normalized offer-curve point")
+    axis.set_ylabel("Offer price")
+    axis.set_xticks(curve_points)
+    axis.grid(True, alpha=0.2)
+    axis.legend(title="Cluster", loc="best")
+    figure.tight_layout()
+    figure.savefig(path, dpi=200, bbox_inches="tight")
+    sb_matching.plt.close(figure)
+
+
 def filter_candidate_audit(
     candidates: pd.DataFrame, clusters: pd.DataFrame
 ) -> pd.DataFrame:
@@ -548,11 +600,13 @@ def save_outputs(
     paths = {
         "amended_clusters": output_dir / "cluster_assignments_with_sb_matches.csv",
         "cluster_summary": output_dir / "cluster_summary.csv",
+        "median_curve_plot": output_dir / "cluster_median_curves_with_stdev.png",
         "all_accepted_matches": output_dir / "cluster_to_sb_all_accepted_matches.csv",
         "candidate_audit": output_dir / "cluster_to_sb_candidate_audit.csv",
     }
     primary.to_csv(paths["amended_clusters"], index=False)
     cluster_summary.to_csv(paths["cluster_summary"], index=False)
+    save_median_curve_plot(cluster_summary, paths["median_curve_plot"])
     accepted.to_csv(paths["all_accepted_matches"], index=False)
     candidates.to_csv(paths["candidate_audit"], index=False)
     return paths

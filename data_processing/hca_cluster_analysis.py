@@ -564,9 +564,10 @@ def save_median_curve_plot(
     curve_points = np.arange(21)
     colors = sb_matching.plt.get_cmap("tab10")
 
-    for color_index, (_, cluster) in enumerate(
-        cluster_summary.sort_values("cluster_id").iterrows()
-    ):
+    plotted_clusters = cluster_summary[
+        cluster_summary["cluster_id"].ne(1)
+    ].sort_values("cluster_id")
+    for color_index, (_, cluster) in enumerate(plotted_clusters.iterrows()):
         error_row = curve_error_bars[
             curve_error_bars["cluster_id"].eq(cluster["cluster_id"])
         ].iloc[0]

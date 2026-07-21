@@ -365,11 +365,6 @@ def rms(values: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.square(finite)))) if finite.size else np.nan
 
 
-def residual_rms(values: np.ndarray, centroid: np.ndarray) -> float:
-    residuals = values - centroid
-    return rms(residuals)
-
-
 def resource_distances(values: np.ndarray, centroid: np.ndarray) -> np.ndarray:
     """Normalized Euclidean distance from each resource to a family centroid."""
     distances = []
@@ -394,21 +389,13 @@ def cluster_feature_stats(amended: pd.DataFrame) -> pd.DataFrame:
         row["min_gen_centroid"] = min_gen.mean()
         row["min_gen_dispersion"] = min_gen.std(ddof=1)
 
-        startup = group[list(STARTUP_FEATURES.values())].apply(
-            pd.to_numeric, errors="coerce"
-        )
-        startup_values = startup.to_numpy(dtype=float)
-        startup_centroid = np.nanmean(startup_values, axis=0)
-        for index, label in enumerate(STARTUP_FEATURES):
-            row[f"{label}_startup_centroid"] = startup_centroid[index]
-        row["startup_valid_resource_count"] = int(
-            np.isfinite(startup_values).any(axis=1).sum()
-        )
-        row["startup_level"] = float(np.nanmean(startup_centroid))
-        row["startup_distinctiveness"] = rms(startup_centroid)
-        row["startup_dispersion"] = residual_rms(
-            startup_values, startup_centroid
-        )
+        for label, feature in STARTUP_FEATURES.items():
+            values = pd.to_numeric(group[feature], errors="coerce")
+            centroid = values.mean()
+            row[f"{label}_startup_valid_count"] = int(values.count())
+            row[f"{label}_startup_centroid"] = centroid
+            row[f"{label}_startup_distinctiveness"] = abs(centroid)
+            row[f"{label}_startup_dispersion"] = values.std(ddof=1)
 
         curve = group[CURVE_FEATURES].apply(pd.to_numeric, errors="coerce")
         curve_values = curve.to_numpy(dtype=float)

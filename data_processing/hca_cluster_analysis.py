@@ -715,23 +715,13 @@ def save_startup_cost_boxplot(cluster_summary: pd.DataFrame, path: Path) -> None
     axis.set_xticklabels([label for label, _ in startup_types])
     axis.grid(axis="y", alpha=0.2)
     axis.legend(title="Cluster", loc="best")
-    axis.text(
-        0.01,
-        0.99,
-        "Box: Q1-Q3 | center: median | whiskers: min-max | diamond/bar: mean +/- 1 stdev",
-        transform=axis.transAxes,
-        ha="left",
-        va="top",
-        fontsize=9,
-        color="#444444",
-    )
     figure.tight_layout()
     figure.savefig(path, dpi=200, bbox_inches="tight")
     sb_matching.plt.close(figure)
 
 
 def save_min_gen_cost_barplot(cluster_summary: pd.DataFrame, path: Path) -> None:
-    """Plot mean minimum-generation cost by cluster with stdev error bars."""
+    """Plot mean minimum-generation cost with per-cluster median lines."""
     if sb_matching.plt is None:
         raise RuntimeError("matplotlib is required to create the min-gen-cost plot")
 
@@ -741,19 +731,14 @@ def save_min_gen_cost_barplot(cluster_summary: pd.DataFrame, path: Path) -> None
     positions = np.arange(len(plotted))
     colors = [sb_matching.plt.get_cmap("tab10")(index % 10) for index in positions]
     means = plotted["raw_median_min_gen_cost_mean"].to_numpy(dtype=float)
-    standard_deviations = plotted[
-        "raw_median_min_gen_cost_stdev"
-    ].to_numpy(dtype=float)
     medians = plotted["raw_median_min_gen_cost_median"].to_numpy(dtype=float)
 
     figure, axis = sb_matching.plt.subplots(figsize=(10, 7))
     bars = axis.bar(
         positions,
         means,
-        yerr=standard_deviations,
         color=colors,
         alpha=0.72,
-        capsize=5,
         edgecolor="#333333",
         linewidth=0.8,
     )
@@ -767,6 +752,14 @@ def save_min_gen_cost_barplot(cluster_summary: pd.DataFrame, path: Path) -> None
     axis.grid(axis="y", alpha=0.2)
 
     for bar, median in zip(bars, medians):
+        axis.hlines(
+            median,
+            bar.get_x(),
+            bar.get_x() + bar.get_width(),
+            colors="#111111",
+            linewidth=2,
+            zorder=4,
+        )
         axis.annotate(
             f"Median: {median:,.1f}",
             xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
@@ -776,16 +769,6 @@ def save_min_gen_cost_barplot(cluster_summary: pd.DataFrame, path: Path) -> None
             va="bottom",
             fontsize=9,
         )
-    axis.text(
-        0.01,
-        0.99,
-        "Bar: mean | error bar: +/- 1 stdev",
-        transform=axis.transAxes,
-        ha="left",
-        va="top",
-        fontsize=9,
-        color="#444444",
-    )
     figure.tight_layout()
     figure.savefig(path, dpi=200, bbox_inches="tight")
     sb_matching.plt.close(figure)

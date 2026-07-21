@@ -638,6 +638,159 @@ def save_median_curve_plot(
     sb_matching.plt.close(figure)
 
 
+def save_startup_cost_boxplot(cluster_summary: pd.DataFrame, path: Path) -> None:
+    """Plot grouped startup-cost boxes and mean +/- stdev markers by cluster."""
+    if sb_matching.plt is None:
+        raise RuntimeError("matplotlib is required to create the startup-cost plot")
+
+    startup_types = [
+        ("Hot", "median_hot_startup_cost"),
+        ("Cold", "median_cold_startup_cost"),
+        ("Intermediate", "median_inter_startup_cost"),
+    ]
+    plotted_clusters = cluster_summary[
+        cluster_summary["cluster_id"].ne(1)
+    ].sort_values("cluster_id")
+    figure, axis = sb_matching.plt.subplots(figsize=(14, 8))
+    colors = sb_matching.plt.get_cmap("tab10")
+    category_positions = np.arange(len(startup_types), dtype=float)
+    cluster_count = len(plotted_clusters)
+    box_width = min(0.18, 0.72 / max(cluster_count, 1))
+    offsets = (
+        np.arange(cluster_count, dtype=float) - (cluster_count - 1) / 2
+    ) * box_width
+
+    for color_index, (_, cluster) in enumerate(plotted_clusters.iterrows()):
+        color = colors(color_index % 10)
+        for type_index, (_, feature) in enumerate(startup_types):
+            prefix = f"raw_{feature}"
+            position = category_positions[type_index] + offsets[color_index]
+            box_stats = {
+                "med": cluster[f"{prefix}_median"],
+                "q1": cluster[f"{prefix}_q1"],
+                "q3": cluster[f"{prefix}_q3"],
+                "whislo": cluster[f"{prefix}_min"],
+                "whishi": cluster[f"{prefix}_max"],
+                "fliers": [],
+            }
+            axis.bxp(
+                [box_stats],
+                positions=[position],
+                widths=box_width * 0.8,
+                showfliers=False,
+                patch_artist=True,
+                manage_ticks=False,
+                boxprops={"facecolor": color, "edgecolor": color, "alpha": 0.45},
+                whiskerprops={"color": color, "linewidth": 1.4},
+                capprops={"color": color, "linewidth": 1.4},
+                medianprops={"color": "#111111", "linewidth": 1.6},
+            )
+            axis.errorbar(
+                position,
+                cluster[f"{prefix}_mean"],
+                yerr=cluster[f"{prefix}_stdev"],
+                fmt="D",
+                markersize=5,
+                color=color,
+                markeredgecolor="#111111",
+                markeredgewidth=0.6,
+                elinewidth=1.4,
+                capsize=3,
+                zorder=5,
+            )
+
+        axis.plot(
+            [],
+            [],
+            color=color,
+            linewidth=8,
+            alpha=0.55,
+            label=f"Cluster {cluster['cluster_id']:g}",
+        )
+
+    axis.set_title("Startup Cost Distribution by Cluster")
+    axis.set_xlabel("Startup cost type")
+    axis.set_ylabel("Startup cost")
+    axis.set_xticks(category_positions)
+    axis.set_xticklabels([label for label, _ in startup_types])
+    axis.grid(axis="y", alpha=0.2)
+    axis.legend(title="Cluster", loc="best")
+    axis.text(
+        0.01,
+        0.99,
+        "Box: Q1-Q3 | center: median | whiskers: min-max | diamond/bar: mean +/- 1 stdev",
+        transform=axis.transAxes,
+        ha="left",
+        va="top",
+        fontsize=9,
+        color="#444444",
+    )
+    figure.tight_layout()
+    figure.savefig(path, dpi=200, bbox_inches="tight")
+    sb_matching.plt.close(figure)
+
+
+def save_min_gen_cost_barplot(cluster_summary: pd.DataFrame, path: Path) -> None:
+    """Plot mean minimum-generation cost by cluster with stdev error bars."""
+    if sb_matching.plt is None:
+        raise RuntimeError("matplotlib is required to create the min-gen-cost plot")
+
+    plotted = cluster_summary[cluster_summary["cluster_id"].ne(1)].sort_values(
+        "cluster_id"
+    )
+    positions = np.arange(len(plotted))
+    colors = [sb_matching.plt.get_cmap("tab10")(index % 10) for index in positions]
+    means = plotted["raw_median_min_gen_cost_mean"].to_numpy(dtype=float)
+    standard_deviations = plotted[
+        "raw_median_min_gen_cost_stdev"
+    ].to_numpy(dtype=float)
+    medians = plotted["raw_median_min_gen_cost_median"].to_numpy(dtype=float)
+
+    figure, axis = sb_matching.plt.subplots(figsize=(10, 7))
+    bars = axis.bar(
+        positions,
+        means,
+        yerr=standard_deviations,
+        color=colors,
+        alpha=0.72,
+        capsize=5,
+        edgecolor="#333333",
+        linewidth=0.8,
+    )
+    axis.set_title("Minimum-Generation Cost by Cluster")
+    axis.set_xlabel("Cluster")
+    axis.set_ylabel("Minimum-generation cost")
+    axis.set_xticks(positions)
+    axis.set_xticklabels(
+        [f"Cluster {cluster_id:g}" for cluster_id in plotted["cluster_id"]]
+    )
+    axis.grid(axis="y", alpha=0.2)
+
+    for bar, median in zip(bars, medians):
+        axis.annotate(
+            f"Median: {median:,.1f}",
+            xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
+            xytext=(0, 5),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+        )
+    axis.text(
+        0.01,
+        0.99,
+        "Bar: mean | error bar: +/- 1 stdev",
+        transform=axis.transAxes,
+        ha="left",
+        va="top",
+        fontsize=9,
+        color="#444444",
+    )
+    figure.tight_layout()
+    figure.savefig(path, dpi=200, bbox_inches="tight")
+    sb_matching.plt.close(figure)
+
+
 def filter_candidate_audit(
     candidates: pd.DataFrame, clusters: pd.DataFrame
 ) -> pd.DataFrame:
@@ -667,12 +820,16 @@ def save_outputs(
         "amended_clusters": output_dir / "cluster_assignments_with_sb_matches.csv",
         "cluster_summary": output_dir / "cluster_summary.csv",
         "median_curve_plot": output_dir / "cluster_median_curves_with_stdev.png",
+        "startup_cost_plot": output_dir / "cluster_startup_cost_boxplots.png",
+        "min_gen_cost_plot": output_dir / "cluster_min_gen_cost_barplot.png",
         "all_accepted_matches": output_dir / "cluster_to_sb_all_accepted_matches.csv",
         "candidate_audit": output_dir / "cluster_to_sb_candidate_audit.csv",
     }
     primary.to_csv(paths["amended_clusters"], index=False)
     cluster_summary.to_csv(paths["cluster_summary"], index=False)
     save_median_curve_plot(curve_plot_data, paths["median_curve_plot"])
+    save_startup_cost_boxplot(cluster_summary, paths["startup_cost_plot"])
+    save_min_gen_cost_barplot(cluster_summary, paths["min_gen_cost_plot"])
     accepted.to_csv(paths["all_accepted_matches"], index=False)
     candidates.to_csv(paths["candidate_audit"], index=False)
     return paths

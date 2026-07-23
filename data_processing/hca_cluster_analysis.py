@@ -609,13 +609,22 @@ def save_median_curve_plot(
             ],
             dtype=float,
         )
+        step_x = np.repeat(curve_points, 2)[1:]
+        step_y = np.repeat(medians, 2)[:-1]
+        axis.plot(
+            step_x,
+            step_y,
+            label=f"Cluster {cluster['cluster_id']:g}",
+            color=colors(color_index % 10),
+            linewidth=2,
+            alpha=0.85,
+        )
         axis.errorbar(
             curve_points,
             medians,
             yerr=standard_deviations,
-            label=f"Cluster {cluster['cluster_id']:g}",
             color=colors(color_index % 10),
-            linewidth=2,
+            linestyle="none",
             marker="o",
             markersize=4,
             elinewidth=1,
